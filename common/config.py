@@ -38,8 +38,12 @@ DISEASE_RELEVANT_TISSUES = {
 }
 
 # Agent 4: disease -> ICD-10 code prefixes matched against MIMIC-IV's diagnoses_icd.icd_code (icd_version==10 rows only).
+# CAD uses the full ischemic-heart-disease range I20-I25 (angina, acute/subsequent MI, other acute
+# ischemic disease, chronic ischemic heart disease) -- I25 alone was checked against the real MIMIC-IV
+# data and undercounts by ~2,755 patients (~10%), mostly from I21 (acute MI). See
+# claude/agent4_mimic_real_run.md for the verification.
 DISEASE_ICD10_PREFIXES = {
     "Type 2 Diabetes Mellitus": ["E11"],
     "Alzheimer's Disease": ["G30"],
-    "Coronary Artery Disease": ["I25"],
+    "Coronary Artery Disease": ["I20", "I21", "I22", "I23", "I24", "I25"],
 }
