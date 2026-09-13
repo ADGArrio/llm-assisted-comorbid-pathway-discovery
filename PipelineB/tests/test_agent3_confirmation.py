@@ -32,6 +32,40 @@ def _two_hop_chain():
     return ChainCandidate(edges=[edge1, edge2], rationale="bridge rationale")
 
 
+def _metabolite_bridge_chain():
+    # INSR --produces--> Cholesterol (metabolite middle hop) --activates--> APP.
+    # Endpoints are still real genes (INSR, APP); only the middle node is metabolite-kind.
+    edge1 = ChainEdge(
+        "INSR",
+        "P06213",
+        "Cholesterol",
+        None,
+        "produces",
+        "INSR->Cholesterol",
+        0.7,
+        None,
+        source_kind="gene",
+        target_kind="metabolite",
+        source_hmdb_id=None,
+        target_hmdb_id="HMDB0000067",
+    )
+    edge2 = ChainEdge(
+        "Cholesterol",
+        None,
+        "APP",
+        "P05067",
+        "activates",
+        "Cholesterol->APP",
+        None,
+        0.6,
+        source_kind="metabolite",
+        target_kind="gene",
+        source_hmdb_id="HMDB0000067",
+        target_hmdb_id=None,
+    )
+    return ChainCandidate(edges=[edge1, edge2], rationale="metabolite bridge rationale")
+
+
 def _agent2_result(chains):
     return Agent2ChainResult(disease1=DISEASE1, disease2=DISEASE2, chains=chains, candidate_path_count=len(chains), shared_genes=[])
 
@@ -86,6 +120,28 @@ def test_multi_hop_chain_checks_middle_gene_against_both_diseases_tissues():
     assert ("MID", "Brain_Cortex") in tissues_checked  # AD tissue
     # endpoints are still INSR (disease1) and APP (disease2), not MID
     endpoint_genes = {e.gene_symbol for e in results[0].endpoint_checks}
+    assert endpoint_genes == {"INSR", "APP"}
+
+
+def test_metabolite_middle_hop_excluded_from_tissue_checks_and_listed_in_chain_metabolites():
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_metabolite_bridge_chain()])
+    gtex = StubGTExClient({})
+    hpa = StubHPAClient({})
+    gwas = StubGWASCatalogClient({})
+
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, hpa_client=hpa, gwas_client=gwas)
+
+    assert len(results) == 1
+    confirmation = results[0]
+    # the metabolite middle hop is never gene-centric tissue-checked -- only the two real genes are
+    checked_genes = {t.gene_symbol for t in confirmation.tissue_checks}
+    assert "Cholesterol" not in checked_genes
+    assert checked_genes == {"INSR", "APP"}
+    # it's surfaced separately instead
+    assert confirmation.chain_metabolites == ["Cholesterol"]
+    # endpoints are still the two real genes, cross-db checked as usual
+    endpoint_genes = {e.gene_symbol for e in confirmation.endpoint_checks}
     assert endpoint_genes == {"INSR", "APP"}
 
 

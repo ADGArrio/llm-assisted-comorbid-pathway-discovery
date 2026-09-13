@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+
+# MetalinksDB local SQLite cache (liana.resource.get_metalinks download)
+*.db

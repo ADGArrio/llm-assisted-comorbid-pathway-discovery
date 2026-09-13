@@ -1,5 +1,6 @@
 from PipelineB.agent1_discovery import Agent1DiscoveryResult
 from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
+from PipelineB.metalinks_client import MetaboliteEdge, StubMetalinksClient
 from PipelineB.omnipath_client import Interaction, StubOmniPathClient
 from PipelineB.opentargets_client import GeneAssociation
 from PipelineB.pubmed_client import Citation
@@ -50,6 +51,8 @@ def test_single_shortest_path_skips_llm_entirely():
     assert edges[0].interaction_type == "inhibits"
     assert edges[0].source_disease_assoc_score == 0.71
     assert edges[0].target_disease_assoc_score == 0.44
+    assert edges[0].source_kind == "gene"
+    assert edges[0].target_kind == "gene"
 
 
 def test_single_shortest_path_with_unknown_direction_gets_a_caveat_even_without_llm():
@@ -282,4 +285,119 @@ def test_to_dict_is_json_serializable():
     )
     omnipath = StubOmniPathClient([Interaction("TCF7L2", "Q9NQB0", "APP", "P05067", "inhibits", "Q9NQB0->P05067")])
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=RaisingLLMClient())
+    json.dumps(result.to_dict())
+
+
+# --- Metabolite (MetalinksDB) integration ---
+
+
+def test_no_metalinks_client_means_protein_only_search_even_if_a_bridge_would_exist():
+    """Without metalinks_client (the default), Agent 2 must behave
+    exactly like the pre-metabolite pipeline -- metabolite support is
+    opt-in, not a silent default that could change results for every
+    existing caller."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8)],
+    )
+    omnipath = StubOmniPathClient([])  # no protein-only path at all
+
+    try:
+        run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=RaisingLLMClient())
+        assert False, "expected NoChainFoundError"
+    except NoChainFoundError:
+        pass
+
+
+def test_metabolite_bridge_found_when_metalinks_client_is_given():
+    """A -> Glucose -> X: no protein-only path exists in OmniPath at
+    all, but MetalinksDB provides a gene->metabolite->gene bridge. Single
+    candidate at this depth, so the LLM is bypassed just like a pure
+    protein single-candidate chain would be."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8)],
+    )
+    omnipath = StubOmniPathClient([])
+    metalinks = StubMetalinksClient(
+        gene_to_metabolite=[MetaboliteEdge("gene", "A", "metabolite", "Glucose", "produces", "HMDB0000122", "PA", "A->Glucose")],
+        metabolite_to_gene=[MetaboliteEdge("metabolite", "Glucose", "gene", "X", "activates", "HMDB0000122", "PX", "Glucose->X")],
+    )
+
+    result = run_agent2_chain(
+        agent1_result, omnipath_client=omnipath, metalinks_client=metalinks, llm_client=RaisingLLMClient()
+    )
+
+    assert result.candidate_path_count == 1
+    edges = result.chains[0].edges
+    assert len(edges) == 2
+    assert edges[0].source_gene == "A"
+    assert edges[0].source_kind == "gene"
+    assert edges[0].target_gene == "Glucose"
+    assert edges[0].target_kind == "metabolite"
+    assert edges[0].interaction_type == "produces"
+    assert edges[0].source_disease_assoc_score == 0.6
+    assert edges[0].target_disease_assoc_score is None  # metabolite end never gets a disease score
+    assert edges[1].source_gene == "Glucose"
+    assert edges[1].source_kind == "metabolite"
+    assert edges[1].target_gene == "X"
+    assert edges[1].target_kind == "gene"
+    assert edges[1].interaction_type == "activates"
+    assert edges[1].target_disease_assoc_score == 0.8
+
+
+def test_metabolite_bridge_and_protein_path_of_equal_length_both_surface_as_candidates():
+    """A 2-hop metabolite bridge (A->Cholesterol->X) and a 2-hop
+    protein-only path (B->MID->Y) are both discovered at the same BFS
+    depth, so both go to the LLM as separate candidates -- exactly like
+    two competing protein-only paths would."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6), GeneAssociation("B", "ENSGB", "PB", 0.5)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8), GeneAssociation("Y", "ENSGY", "PY", 0.7)],
+    )
+    omnipath = StubOmniPathClient(
+        [
+            Interaction("B", "PB", "MID", "PM", "activates", "PB->PM"),
+            Interaction("MID", "PM", "Y", "PY", "inhibits", "PM->PY"),
+        ]
+    )
+    metalinks = StubMetalinksClient(
+        gene_to_metabolite=[MetaboliteEdge("gene", "A", "metabolite", "Cholesterol", "produces", "HMDB1", "PA", "A->Chol")],
+        metabolite_to_gene=[MetaboliteEdge("metabolite", "Cholesterol", "gene", "X", "activates", "HMDB1", "PX", "Chol->X")],
+    )
+    llm = StubLLMClient(fixed_response="1: The metabolite route is well supported.")
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, metalinks_client=metalinks, llm_client=llm)
+
+    assert result.candidate_path_count == 2
+    assert "[metabolite] Cholesterol" in llm.last_prompt
+    assert len(result.chains) == 1
+    edges = result.chains[0].edges
+    assert edges[0].source_gene == "A"
+    assert edges[0].target_gene == "Cholesterol"
+    assert edges[0].target_kind == "metabolite"
+    assert edges[1].source_kind == "metabolite"
+    assert edges[1].target_gene == "X"
+
+
+def test_metabolite_edge_to_dict_includes_kind_and_hmdb_fields():
+    import json
+
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8)],
+    )
+    omnipath = StubOmniPathClient([])
+    metalinks = StubMetalinksClient(
+        gene_to_metabolite=[MetaboliteEdge("gene", "A", "metabolite", "Glucose", "produces", "HMDB0000122", "PA", "A->Glucose")],
+        metabolite_to_gene=[MetaboliteEdge("metabolite", "Glucose", "gene", "X", "activates", "HMDB0000122", "PX", "Glucose->X")],
+    )
+
+    result = run_agent2_chain(
+        agent1_result, omnipath_client=omnipath, metalinks_client=metalinks, llm_client=RaisingLLMClient()
+    )
+    edge_dict = result.chains[0].edges[0].to_dict()
+
+    assert edge_dict["target_kind"] == "metabolite"
+    assert edge_dict["target_hmdb_id"] == "HMDB0000122"
     json.dumps(result.to_dict())

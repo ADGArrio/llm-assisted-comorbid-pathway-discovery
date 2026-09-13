@@ -9,11 +9,18 @@ gene-disease association checks; see those modules for each service's
 data shape. Output is a list of Agent3ConfirmationResult, one per chain.
 Used by: the top-level pipeline, after Agent 2.
 
-Which genes get which check: a chain's first gene (disease1-associated
+Which nodes get which check: a chain's first gene (disease1-associated
 per Agent 1) and last gene (disease2-associated) get both tissue and
 cross-db checks. Every gene in between is a BFS bridge Agent 1 never
 claimed was disease-associated, so it only gets tissue-checked, against
-the union of both diseases' relevant tissues.
+the union of both diseases' relevant tissues. Since Agent 2 can now
+route a chain through a metabolite (metalinks_client.py), a middle hop
+may be metabolite-kind rather than gene-kind -- GTEx/HPA/GWAS/DisGeNET
+are all gene-centric with no meaningful check for a metabolite name, so
+metabolite middle hops are excluded from tissue/cross-db checks entirely
+and instead just listed in `chain_metabolites` for visibility. Chain
+endpoints are always genes by construction (see agent2_chain.py's module
+docstring), so endpoint handling is unaffected by this.
 
 Findings are reported per-check, not collapsed into one pass/fail
 verdict -- non-expression or no cross-db hit is real negative evidence,
@@ -23,7 +30,7 @@ registering in a genetics-only database).
 import argparse
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from common.config import DISEASE_RELEVANT_TISSUES, DISEASE_PAIRS, get_pair
 from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
@@ -34,6 +41,7 @@ from PipelineB.crossdb_client import (
     GwasAssociation,
     GWASCatalogClient,
 )
+from PipelineB.metalinks_client import MetalinksClient
 from PipelineB.tissue_client import GTExClient, HPAClient, TissueExpressionResult, check_tissue_expression
 
 
@@ -64,6 +72,7 @@ class EndpointCrossDbCheck:
 class Agent3ConfirmationResult:
     tissue_checks: List[TissueExpressionResult]
     endpoint_checks: List[EndpointCrossDbCheck]  # exactly 2: [disease1-endpoint, disease2-endpoint]
+    chain_metabolites: List[str]  # metabolite-kind middle hops in this chain; never tissue/cross-db checked
 
     @property
     def tissue_expressed_count(self) -> int:
@@ -80,6 +89,7 @@ class Agent3ConfirmationResult:
             "tissue_expressed_count": self.tissue_expressed_count,
             "tissue_checked_count": self.tissue_checked_count,
             "tissue_total_count": len(self.tissue_checks),
+            "chain_metabolites": self.chain_metabolites,
         }
 
 
@@ -92,25 +102,39 @@ def _ensembl_id_lookup(agent1_result: Agent1DiscoveryResult) -> Dict[str, str]:
 
 
 def _chain_gene_roles(chain: ChainCandidate) -> Dict[str, List[str]]:
-    # Input: a chain. Output: {"disease1_endpoint": gene, "disease2_endpoint": gene, "middle": [genes]}.
-    # A single-edge chain has no middle genes -- its one gene pair are both endpoints.
+    # Input: a chain. Output: {"disease1_endpoint": gene, "disease2_endpoint": gene,
+    # "middle": [gene,...], "middle_metabolites": [name,...]}.
+    # Chain endpoints are always gene-kind by construction (BFS starts and stops at genes --
+    # see agent2_chain.py's module docstring); only middle hops can be metabolite-kind, which
+    # are split out separately since gene-centric checks don't apply to them. A single-edge
+    # chain has no middle nodes at all -- its one gene pair are both endpoints.
     edges = chain.edges
     disease1_endpoint = edges[0].source_gene
     disease2_endpoint = edges[-1].target_gene
 
-    all_genes_in_order: List[str] = [edges[0].source_gene]
+    nodes_in_order: List[Tuple[str, str]] = [(edges[0].source_kind, edges[0].source_gene)]
     for edge in edges:
-        all_genes_in_order.append(edge.target_gene)
+        nodes_in_order.append((edge.target_kind, edge.target_gene))
 
-    middle = [g for g in all_genes_in_order[1:-1]]
-    seen = set()
-    deduped_middle = []
-    for g in middle:
-        if g not in seen and g not in (disease1_endpoint, disease2_endpoint):
-            seen.add(g)
-            deduped_middle.append(g)
+    seen_genes = set()
+    seen_metabolites = set()
+    middle_genes: List[str] = []
+    middle_metabolites: List[str] = []
+    for kind, node_id in nodes_in_order[1:-1]:
+        if kind == "metabolite":
+            if node_id not in seen_metabolites:
+                seen_metabolites.add(node_id)
+                middle_metabolites.append(node_id)
+        elif node_id not in seen_genes and node_id not in (disease1_endpoint, disease2_endpoint):
+            seen_genes.add(node_id)
+            middle_genes.append(node_id)
 
-    return {"disease1_endpoint": disease1_endpoint, "disease2_endpoint": disease2_endpoint, "middle": deduped_middle}
+    return {
+        "disease1_endpoint": disease1_endpoint,
+        "disease2_endpoint": disease2_endpoint,
+        "middle": middle_genes,
+        "middle_metabolites": middle_metabolites,
+    }
 
 
 def _confirm_chain(
@@ -124,7 +148,8 @@ def _confirm_chain(
     disgenet_client,
 ) -> Agent3ConfirmationResult:
     # Input: one chain + both disease names + clients. Output: its Agent3ConfirmationResult
-    # (tissue checks for every gene, cross-db checks for the two endpoint genes only).
+    # (tissue checks for every gene, cross-db checks for the two endpoint genes only;
+    # metabolite middle hops are skipped for both and listed in chain_metabolites instead).
     roles = _chain_gene_roles(chain)
     tissue_checks: List[TissueExpressionResult] = []
 
@@ -158,7 +183,9 @@ def _confirm_chain(
             )
         )
 
-    return Agent3ConfirmationResult(tissue_checks=tissue_checks, endpoint_checks=endpoint_checks)
+    return Agent3ConfirmationResult(
+        tissue_checks=tissue_checks, endpoint_checks=endpoint_checks, chain_metabolites=roles["middle_metabolites"]
+    )
 
 
 def run_agent3_confirmation(
@@ -194,8 +221,11 @@ def _cli():
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
     parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Agent 1")
-    parser.add_argument("--max-hops", type=int, default=None, help="Max PPI hops, passed to Agent 2 (defaults to agent2_chain's own default)")
+    parser.add_argument("--max-hops", type=int, default=None, help="Max PPI/metabolite hops, passed to Agent 2 (defaults to agent2_chain's own default)")
     parser.add_argument("--use-disgenet", action="store_true", help="Also query DisGeNET (requires DISGENET_API_KEY in .env)")
+    parser.add_argument(
+        "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops in Agent 2"
+    )
     args = parser.parse_args()
 
     if args.pair:
@@ -211,7 +241,8 @@ def _cli():
 
     print("Running Agent 2 (Chain Construction)...", flush=True)
     agent2_kwargs = {"max_hops": args.max_hops} if args.max_hops else {}
-    agent2_result = run_agent2_chain(agent1_result, **agent2_kwargs)
+    metalinks_client = None if args.no_metabolites else MetalinksClient()
+    agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **agent2_kwargs)
 
     print("Running Agent 3 (Independent Confirmation)...", flush=True)
     disgenet_client = DisGeNETClient() if args.use_disgenet else None

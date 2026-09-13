@@ -1,41 +1,53 @@
 """
 Agent 2 -- Chain Construction.
 
-Service: OmniPathClient (omnipath_client.py) for real PPI edges, LLMClient
-(common/llm_client.py) to judge between multiple candidate paths.
-Data: BFS over live OmniPath edges finds every real shortest directed
-path from a disease1-associated gene to a disease2-associated gene
-(<= max_hops). The LLM never invents edges -- it only selects which of
-the code-found real candidates are biologically plausible (zero, one, or
+Service: OmniPathClient (omnipath_client.py) for real PPI edges,
+MetalinksClient (metalinks_client.py, optional) for real gene<->metabolite
+edges, LLMClient (common/llm_client.py) to judge between multiple
+candidate paths.
+Data: BFS over live OmniPath (gene->gene) and MetalinksDB (gene<->metabolite)
+edges finds every real shortest directed path from a disease1-associated
+gene to a disease2-associated gene (<= max_hops). A path's first and last
+node are always genes (BFS starts from genes and only stops at a goal
+gene); a metabolite can only appear as a middle hop, e.g.
+GeneA --produces--> Cholesterol --activates--> GeneB. Passing
+metalinks_client=None (the default for library/test callers) restricts
+the search to protein-only chains, matching the pre-metabolite behavior
+exactly; `_cli()` passes a real MetalinksClient() so real runs include
+metabolites. The LLM never invents edges -- it only selects which of the
+code-found real candidates are biologically plausible (zero, one, or
 several), and is skipped entirely when there's only one candidate.
 Used by: PipelineB.agent3_confirmation, and the top-level pipeline.
 
 Edge score fields (schema per project_architecture.md):
 source_disease_assoc_score = source gene's Open Targets score vs disease1;
-target_disease_assoc_score = target gene's score vs disease2. Either can
-be None for a middle hop not itself disease-associated in that direction.
+target_disease_assoc_score = target gene's score vs disease2. Both are
+always None for a metabolite-kind end (Open Targets scores genes, not
+metabolites), and can also be None for a gene-kind middle hop not itself
+disease-associated in that direction.
 
-BFS note: when two branches reach the same gene at the same depth, only
-the first-found path through it is kept (marked visited) -- affects which
-specific path is reported through a shared node, not whether the
-shortest depth is found. `_MAX_FRONTIER_SIZE` caps genes queried per BFS
-layer (logs a warning + truncates deterministically if exceeded) to keep
-request size/runtime bounded; a truncated gene could in theory miss a
-legitimate longer path through it.
+BFS note: when two branches reach the same node (gene or metabolite) at
+the same depth, only the first-found path through it is kept (marked
+visited) -- affects which specific path is reported through a shared
+node, not whether the shortest depth is found. `_MAX_FRONTIER_SIZE` caps
+nodes queried per BFS layer (logs a warning + truncates deterministically
+if exceeded) to keep request size/runtime bounded; a truncated node
+could in theory miss a legitimate longer path through it.
 
 DEFAULT_MAX_HOPS = 5: deep enough to usually surface more than one
 candidate for the LLM to actually adjudicate between, per a real
 max_hops=10 run that returned 10 candidates but 100% LLM endorsement
 (see claude/agent2_findings_maxhops10_run.md). `--max-hops` overrides.
 
-Unknown-direction handling: OmniPath edges with no curated
-activation/inhibition flag (interaction_type == "unknown") are marked as
-such in the LLM's candidate text and prompted to be treated with
-skepticism. Independent of what the LLM says, `_with_unknown_direction_caveat`
-appends a fixed caveat sentence to any returned chain containing an
-unknown-direction edge (including the single-candidate bypass, which
-skips the LLM). `ChainCandidate.has_unconfirmed_direction` exposes this
-as a boolean so it doesn't need to be re-parsed from the rationale text.
+Unknown-direction handling: an edge with no curated activation/inhibition
+mode (interaction_type == "unknown") -- from OmniPath OR MetalinksDB's
+mor==0 -- is marked as such in the LLM's candidate text and prompted to
+be treated with skepticism. Independent of what the LLM says,
+`_with_unknown_direction_caveat` appends a fixed caveat sentence to any
+returned chain containing an unknown-direction edge (including the
+single-candidate bypass, which skips the LLM). `ChainCandidate.has_unconfirmed_direction`
+exposes this as a boolean so it doesn't need to be re-parsed from the
+rationale text.
 """
 import argparse
 import json
@@ -46,6 +58,7 @@ from typing import Dict, List, Optional, Tuple
 from common.config import DISEASE_PAIRS, get_pair
 from common.llm_client import LLMClient
 from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
+from PipelineB.metalinks_client import MetaboliteEdge, MetalinksClient
 from PipelineB.omnipath_client import Interaction, OmniPathClient
 from PipelineB.pubmed_client import Citation
 
@@ -56,14 +69,18 @@ _MAX_FRONTIER_SIZE = 300  # safety cap per BFS layer; see module docstring
 
 @dataclass
 class ChainEdge:
-    source_gene: str
-    source_protein: str
-    target_gene: str
-    target_protein: str
-    interaction_type: str
+    source_gene: str  # gene symbol, or a metabolite name when source_kind == "metabolite"
+    source_protein: Optional[str]
+    target_gene: str  # gene symbol, or a metabolite name when target_kind == "metabolite"
+    target_protein: Optional[str]
+    interaction_type: str  # activates | inhibits | unknown (OmniPath); also produces | degrades (MetalinksDB "pd")
     omnipath_edge_id: str
     source_disease_assoc_score: Optional[float]
     target_disease_assoc_score: Optional[float]
+    source_kind: str = "gene"  # "gene" | "metabolite"
+    target_kind: str = "gene"
+    source_hmdb_id: Optional[str] = None
+    target_hmdb_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -75,6 +92,10 @@ class ChainEdge:
             "omnipath_edge_id": self.omnipath_edge_id,
             "source_disease_assoc_score": self.source_disease_assoc_score,
             "target_disease_assoc_score": self.target_disease_assoc_score,
+            "source_kind": self.source_kind,
+            "target_kind": self.target_kind,
+            "source_hmdb_id": self.source_hmdb_id,
+            "target_hmdb_id": self.target_hmdb_id,
         }
 
 
@@ -88,7 +109,7 @@ class ChainCandidate:
 
     @property
     def has_unconfirmed_direction(self) -> bool:
-        # True if any edge has no curated OmniPath direction flag. See module docstring.
+        # True if any edge has no curated direction flag. See module docstring.
         return any(edge.interaction_type == "unknown" for edge in self.edges)
 
     def to_dict(self) -> dict:
@@ -124,6 +145,63 @@ class NoChainFoundError(RuntimeError):
     candidates but the LLM judged none of them plausible."""
 
 
+@dataclass
+class _RawEdge:
+    """Internal, source-agnostic edge shape BFS operates on -- OmniPath
+    Interactions and MetalinksDB MetaboliteEdges are both converted into
+    this before BFS sees them, so BFS itself doesn't need to know which
+    client produced an edge."""
+
+    source_kind: str
+    source_id: str
+    source_protein: Optional[str]
+    source_hmdb_id: Optional[str]
+    target_kind: str
+    target_id: str
+    target_protein: Optional[str]
+    target_hmdb_id: Optional[str]
+    interaction_type: str
+    edge_id: str
+
+
+def _omnipath_to_raw(interactions: List[Interaction]) -> List[_RawEdge]:
+    # Input: OmniPath Interactions (always gene->gene). Output: _RawEdge list.
+    return [
+        _RawEdge(
+            source_kind="gene",
+            source_id=i.source_gene,
+            source_protein=i.source_uniprot,
+            source_hmdb_id=None,
+            target_kind="gene",
+            target_id=i.target_gene,
+            target_protein=i.target_uniprot,
+            target_hmdb_id=None,
+            interaction_type=i.interaction_type,
+            edge_id=i.omnipath_edge_id,
+        )
+        for i in interactions
+    ]
+
+
+def _metalinks_to_raw(edges: List[MetaboliteEdge]) -> List[_RawEdge]:
+    # Input: MetalinksDB MetaboliteEdges (always gene<->metabolite, one end each). Output: _RawEdge list.
+    return [
+        _RawEdge(
+            source_kind=e.source_kind,
+            source_id=e.source_id,
+            source_protein=e.uniprot_id if e.source_kind == "gene" else None,
+            source_hmdb_id=e.hmdb_id if e.source_kind == "metabolite" else None,
+            target_kind=e.target_kind,
+            target_id=e.target_id,
+            target_protein=e.uniprot_id if e.target_kind == "gene" else None,
+            target_hmdb_id=e.hmdb_id if e.target_kind == "metabolite" else None,
+            interaction_type=e.interaction_type,
+            edge_id=e.edge_id,
+        )
+        for e in edges
+    ]
+
+
 def _score_maps(agent1_result: Agent1DiscoveryResult) -> Tuple[Dict[str, float], Dict[str, float]]:
     # Input: Agent1DiscoveryResult. Output: (disease1 gene->score dict, disease2 gene->score dict).
     d1 = {t.gene_symbol: t.disease_assoc_score for t in agent1_result.disease1_targets}
@@ -133,16 +211,19 @@ def _score_maps(agent1_result: Agent1DiscoveryResult) -> Tuple[Dict[str, float],
 
 def _bfs_shortest_paths(
     omnipath_client,
+    metalinks_client,
     start_genes: List[str],
     goal_genes: set,
     max_hops: int,
     max_paths: int,
-) -> List[List[Interaction]]:
-    # Input: client, start gene pool, goal gene set, hop limit, max paths to collect.
-    # Output: list of shortest paths (each a list of Interaction edges), each >= 1 edge long.
-    visited = set(start_genes)
-    frontier: List[Tuple[str, List[Interaction]]] = [(gene, []) for gene in start_genes]
-    found: List[List[Interaction]] = []
+) -> List[List[_RawEdge]]:
+    # Input: OmniPath client, MetalinksDB client (None = protein-only search, no metabolite hops),
+    # start gene pool, goal gene set, hop limit, max paths to collect.
+    # Output: shortest paths (each a list of _RawEdge, >= 1 edge long). A path's first and last
+    # node are always genes; a metabolite (when metalinks_client is given) can only be a middle hop.
+    visited = {("gene", g) for g in start_genes}
+    frontier: List[Tuple[Tuple[str, str], List[_RawEdge]]] = [(("gene", g), []) for g in start_genes]
+    found: List[List[_RawEdge]] = []
     depth = 0
 
     while frontier and depth < max_hops and not found:
@@ -150,50 +231,59 @@ def _bfs_shortest_paths(
 
         if len(frontier) > _MAX_FRONTIER_SIZE:
             print(
-                f"WARNING: Agent 2 BFS depth {depth}: frontier of {len(frontier)} genes exceeds "
-                f"the {_MAX_FRONTIER_SIZE}-gene safety cap; truncating (sorted, deterministic).",
+                f"WARNING: Agent 2 BFS depth {depth}: frontier of {len(frontier)} nodes exceeds "
+                f"the {_MAX_FRONTIER_SIZE}-node safety cap; truncating (sorted, deterministic).",
                 flush=True,
             )
             frontier = sorted(frontier, key=lambda item: item[0])[:_MAX_FRONTIER_SIZE]
 
-        layer_genes = [gene for gene, _ in frontier]
-        paths_by_gene = dict(frontier)
+        gene_ids = [node_id for (kind, node_id), _ in frontier if kind == "gene"]
+        metabolite_ids = [node_id for (kind, node_id), _ in frontier if kind == "metabolite"]
+        paths_by_node = dict(frontier)
 
-        interactions = omnipath_client.get_outgoing_interactions(layer_genes)
-        by_source: Dict[str, List[Interaction]] = {}
-        for edge in interactions:
-            by_source.setdefault(edge.source_gene, []).append(edge)
+        raw_edges: List[_RawEdge] = []
+        if gene_ids:
+            raw_edges.extend(_omnipath_to_raw(omnipath_client.get_outgoing_interactions(gene_ids)))
+            if metalinks_client is not None:
+                raw_edges.extend(_metalinks_to_raw(metalinks_client.get_gene_to_metabolite(gene_ids)))
+        if metabolite_ids and metalinks_client is not None:
+            raw_edges.extend(_metalinks_to_raw(metalinks_client.get_metabolite_to_gene(metabolite_ids)))
 
-        next_frontier: List[Tuple[str, List[Interaction]]] = []
-        for gene in layer_genes:
-            path = paths_by_gene[gene]
-            for edge in by_source.get(gene, []):
-                if edge.target_gene in goal_genes:
+        by_source: Dict[Tuple[str, str], List[_RawEdge]] = {}
+        for edge in raw_edges:
+            by_source.setdefault((edge.source_kind, edge.source_id), []).append(edge)
+
+        next_frontier: List[Tuple[Tuple[str, str], List[_RawEdge]]] = []
+        for node in paths_by_node:
+            path = paths_by_node[node]
+            for edge in by_source.get(node, []):
+                target_node = (edge.target_kind, edge.target_id)
+                if edge.target_kind == "gene" and edge.target_id in goal_genes:
                     found.append(path + [edge])
                     if len(found) >= max_paths:
                         return found
-                elif edge.target_gene not in visited:
-                    visited.add(edge.target_gene)
-                    next_frontier.append((edge.target_gene, path + [edge]))
+                elif target_node not in visited:
+                    visited.add(target_node)
+                    next_frontier.append((target_node, path + [edge]))
         frontier = next_frontier
 
     return found
 
 
-def _has_unknown_direction(path: List[Interaction]) -> bool:
+def _has_unknown_direction(path: List[_RawEdge]) -> bool:
     # Input: a path (list of edges). Output: whether any edge lacks a curated direction flag.
     return any(edge.interaction_type == "unknown" for edge in path)
 
 
 _UNKNOWN_DIRECTION_CAVEAT = (
     "Caveat: at least one interaction in this pathway has no curated activation/inhibition "
-    "flag in OmniPath, so its causal direction is not established by curated evidence -- "
-    "treat that step's directionality as unconfirmed, not as a known activate/inhibit "
-    "relationship, pending further literature review."
+    "flag in OmniPath/MetalinksDB, so its causal direction is not established by curated "
+    "evidence -- treat that step's directionality as unconfirmed, not as a known "
+    "activate/inhibit relationship, pending further literature review."
 )
 
 
-def _with_unknown_direction_caveat(path: List[Interaction], rationale: Optional[str]) -> Optional[str]:
+def _with_unknown_direction_caveat(path: List[_RawEdge], rationale: Optional[str]) -> Optional[str]:
     # Input: path + its rationale (may be None). Output: rationale with the fixed caveat
     # sentence appended if the path has any unknown-direction edge; unchanged otherwise.
     if not _has_unknown_direction(path):
@@ -204,17 +294,19 @@ def _with_unknown_direction_caveat(path: List[Interaction], rationale: Optional[
 
 
 _SELECTION_PROMPT_TEMPLATE = """You are a skeptical biomedical researcher evaluating several \
-candidate molecular pathways, all independently confirmed to exist in a protein-protein \
-interaction database (OmniPath). Each pathway links a protein associated with {disease1} to a \
-protein associated with {disease2}, through the same number of intermediate steps.
+candidate molecular pathways, all independently confirmed to exist in real interaction \
+databases (OmniPath for protein-protein steps, MetalinksDB for gene<->metabolite steps -- a \
+step written as "[metabolite] <name>" is a small-molecule metabolite, not a protein). Each \
+pathway links a protein associated with {disease1} to a protein associated with {disease2}, \
+through the same number of intermediate steps.
 
 Some genes below have supporting literature citations; use them as evidence where available. \
 Where none are listed for a gene, rely on your own domain knowledge of it -- but if you are not \
 confident about a gene's identity, function, or any alternative name/alias for it, say so \
 explicitly rather than asserting a specific claim you are not sure of.
 
-Some edges below are marked "UNKNOWN DIRECTION": OmniPath has no curated activation/inhibition \
-flag for that interaction, meaning it is not established by curated evidence whether the source \
+Some edges below are marked "UNKNOWN DIRECTION": there is no curated activation/inhibition mode \
+for that interaction, meaning it is not established by curated evidence whether the source \
 activates or inhibits the target. Treat any candidate containing an UNKNOWN DIRECTION edge with \
 default skepticism -- only endorse it if you can either (a) supply independent evidence (a \
 citation above, or well-established domain knowledge) for that edge's direction, or (b) say \
@@ -224,12 +316,12 @@ be read as tentative.
 {candidates_text}
 
 A candidate is biologically plausible only if you can state a SPECIFIC, named mechanism for \
-EVERY step in it (e.g. "X phosphorylates Y, activating Y's kinase activity" -- not merely "X and \
-Y are known to interact"). If you cannot do that for every step, the candidate is not plausible \
--- reject it rather than guessing generously. It is expected and fine for zero, one, or only a \
-few of the candidates below to clear this bar; do not endorse a candidate just because it is \
-structurally present in the list. Do not invent any new steps or genes; judge only the \
-candidates given.
+EVERY step in it (e.g. "X phosphorylates Y, activating Y's kinase activity" or "X converts to \
+metabolite Y via enzyme Z" -- not merely "X and Y are known to interact"). If you cannot do that \
+for every step, the candidate is not plausible -- reject it rather than guessing generously. It \
+is expected and fine for zero, one, or only a few of the candidates below to clear this bar; do \
+not endorse a candidate just because it is structurally present in the list. Do not invent any \
+new steps, genes, or metabolites; judge only the candidates given.
 
 Respond with exactly one line per plausible candidate, in this format:
 <candidate number>: <one-sentence rationale naming the specific mechanism at each step, citing \
@@ -238,14 +330,23 @@ the evidence above or your own reasoning, and noting any UNKNOWN DIRECTION cavea
 If none of the candidates are plausible, respond with the single word: NONE"""
 
 
-def _format_candidate(index: int, path: List[Interaction], citations: Dict[str, List[Citation]]) -> str:
+def _node_label(kind: str, node_id: str) -> str:
+    # Input: a node's kind and id. Output: the string used to render it in the LLM prompt.
+    return node_id if kind == "gene" else f"[metabolite] {node_id}"
+
+
+def _format_candidate(index: int, path: List[_RawEdge], citations: Dict[str, List[Citation]]) -> str:
     # Input: candidate index, path edges, gene->citations dict. Output: prompt text block for this candidate.
-    def _step(e: Interaction) -> str:
+    def _step(e: _RawEdge) -> str:
         label = "UNKNOWN DIRECTION" if e.interaction_type == "unknown" else e.interaction_type
-        return f"{e.source_gene} --{label}--> {e.target_gene}"
+        return f"{_node_label(e.source_kind, e.source_id)} --{label}--> {_node_label(e.target_kind, e.target_id)}"
 
     steps = " -> ".join(_step(e) for e in path)
-    genes_in_path = sorted({e.source_gene for e in path} | {e.target_gene for e in path})
+    # Citations are keyed by gene symbol only -- metabolites never have PubMed lookups (Agent 1 only
+    # cites genes), so only gene-kind node ids are worth looking up here.
+    genes_in_path = sorted(
+        {e.source_id for e in path if e.source_kind == "gene"} | {e.target_id for e in path if e.target_kind == "gene"}
+    )
 
     lines = [f"{index}. {steps}"]
     for gene in genes_in_path:
@@ -257,12 +358,12 @@ def _format_candidate(index: int, path: List[Interaction], citations: Dict[str, 
 
 
 def _select_paths(
-    paths: List[List[Interaction]],
+    paths: List[List[_RawEdge]],
     disease1: str,
     disease2: str,
     citations: Dict[str, List[Citation]],
     llm_client,
-) -> List[Tuple[List[Interaction], Optional[str]]]:
+) -> List[Tuple[List[_RawEdge], Optional[str]]]:
     # Input: candidate paths, disease names, citations, LLM client.
     # Output: list of (path, rationale) tuples the LLM endorsed -- zero, one, or many.
     # Skips the LLM (returns the single path, rationale=None) when there's nothing to adjudicate.
@@ -277,7 +378,7 @@ def _select_paths(
     if response.strip().upper().startswith("NONE"):
         return []
 
-    selections: List[Tuple[List[Interaction], Optional[str]]] = []
+    selections: List[Tuple[List[_RawEdge], Optional[str]]] = []
     for line in response.strip().splitlines():
         match = re.match(r"\s*(\d+)\s*:\s*(.+)", line)
         if not match:
@@ -296,21 +397,26 @@ def _select_paths(
 
 
 def _to_chain_edges(
-    path: List[Interaction],
+    path: List[_RawEdge],
     disease1_scores: Dict[str, float],
     disease2_scores: Dict[str, float],
 ) -> List[ChainEdge]:
-    # Input: path edges + both diseases' gene->score maps. Output: ChainEdge list with scores attached.
+    # Input: path edges + both diseases' gene->score maps. Output: ChainEdge list with scores
+    # attached (gene-kind ends only -- metabolite ends never get a disease_assoc_score).
     return [
         ChainEdge(
-            source_gene=edge.source_gene,
-            source_protein=edge.source_uniprot,
-            target_gene=edge.target_gene,
-            target_protein=edge.target_uniprot,
+            source_gene=edge.source_id,
+            source_protein=edge.source_protein,
+            target_gene=edge.target_id,
+            target_protein=edge.target_protein,
             interaction_type=edge.interaction_type,
-            omnipath_edge_id=edge.omnipath_edge_id,
-            source_disease_assoc_score=disease1_scores.get(edge.source_gene),
-            target_disease_assoc_score=disease2_scores.get(edge.target_gene),
+            omnipath_edge_id=edge.edge_id,
+            source_disease_assoc_score=disease1_scores.get(edge.source_id) if edge.source_kind == "gene" else None,
+            target_disease_assoc_score=disease2_scores.get(edge.target_id) if edge.target_kind == "gene" else None,
+            source_kind=edge.source_kind,
+            target_kind=edge.target_kind,
+            source_hmdb_id=edge.source_hmdb_id,
+            target_hmdb_id=edge.target_hmdb_id,
         )
         for edge in path
     ]
@@ -319,12 +425,15 @@ def _to_chain_edges(
 def run_agent2_chain(
     agent1_result: Agent1DiscoveryResult,
     omnipath_client: Optional[object] = None,
+    metalinks_client: Optional[object] = None,
     llm_client: Optional[object] = None,
     max_hops: int = DEFAULT_MAX_HOPS,
     max_candidate_paths: int = DEFAULT_MAX_CANDIDATE_PATHS,
 ) -> Agent2ChainResult:
-    # Input: Agent 1's result, optional clients (default to real OmniPathClient/LLMClient; pass
-    # Stub* clients in tests), hop/candidate limits. Output: Agent2ChainResult.
+    # Input: Agent 1's result, optional clients (omnipath_client defaults to real OmniPathClient;
+    # metalinks_client defaults to None, meaning protein-only search -- pass a real MetalinksClient()
+    # or StubMetalinksClient to include gene<->metabolite hops; llm_client defaults to real LLMClient;
+    # pass Stub* clients in tests), hop/candidate limits. Output: Agent2ChainResult.
     # Raises NoChainFoundError if BFS finds nothing within max_hops.
     omnipath_client = omnipath_client or OmniPathClient()
 
@@ -333,13 +442,16 @@ def run_agent2_chain(
     disease2_genes = set(disease2_scores.keys())
     shared_genes = sorted(disease1_scores.keys() & disease2_scores.keys())
 
-    paths = _bfs_shortest_paths(omnipath_client, disease1_genes, disease2_genes, max_hops, max_candidate_paths)
+    paths = _bfs_shortest_paths(
+        omnipath_client, metalinks_client, disease1_genes, disease2_genes, max_hops, max_candidate_paths
+    )
     if not paths:
         raise NoChainFoundError(
-            f"Agent 2: no directed OmniPath path found between any {agent1_result.disease1}-associated "
+            f"Agent 2: no directed path found between any {agent1_result.disease1}-associated "
             f"protein and any {agent1_result.disease2}-associated protein, within {max_hops} hops, "
             f"starting from {len(disease1_genes)} disease1 genes and {len(disease2_genes)} disease2 genes "
-            f"Agent 1 surfaced (search could pass through other genes OmniPath connects them to)."
+            f"Agent 1 surfaced (search could pass through other genes OmniPath connects them to, and "
+            f"metabolites if a MetalinksDB client was provided)."
         )
 
     llm_client = llm_client or LLMClient()
@@ -368,7 +480,10 @@ def _cli():
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
     parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Agent 1")
-    parser.add_argument("--max-hops", type=int, default=DEFAULT_MAX_HOPS, help="Max PPI hops to search")
+    parser.add_argument("--max-hops", type=int, default=DEFAULT_MAX_HOPS, help="Max PPI/metabolite hops to search")
+    parser.add_argument(
+        "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops"
+    )
     args = parser.parse_args()
 
     if args.pair:
@@ -383,7 +498,8 @@ def _cli():
     agent1_result = run_agent1_discovery(disease1, disease2, min_score=args.min_score)
 
     print("Running Agent 2 (Chain Construction)...", flush=True)
-    agent2_result = run_agent2_chain(agent1_result, max_hops=args.max_hops)
+    metalinks_client = None if args.no_metabolites else MetalinksClient()
+    agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, max_hops=args.max_hops)
 
     if not agent2_result.chains:
         print(
