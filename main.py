@@ -101,11 +101,16 @@ def run_agent2(agent1_result, max_hops: int = None, include_metabolites: bool = 
         return None
 
     if not result.chains:
+        reason = (
+            f' LLM\'s stated reason: "{result.rejection_reason}"'
+            if result.rejection_reason
+            else " (no reason given)"
+        )
         print(
             f"Agent 2 found {result.candidate_path_count} structural candidate path(s) "
             f"(see shared_genes/candidate_path_count below), but the LLM did not judge any "
-            f"of them biologically plausible enough to endorse. This is a real, expected "
-            f"possible outcome -- not a bug -- see agent2_chain.py's module docstring."
+            f"of them biologically plausible enough to endorse.{reason} This is a real, "
+            f"expected possible outcome -- not a bug -- see agent2_chain.py's module docstring."
         )
     return result
 

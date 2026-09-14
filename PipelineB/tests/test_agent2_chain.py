@@ -150,7 +150,10 @@ def test_llm_endorsed_chain_with_unknown_edge_gets_caveat_appended():
     assert "not established" in chain.rationale
 
 
-def test_llm_selecting_none_returns_empty_chains_without_raising():
+def test_llm_selecting_bare_none_returns_empty_chains_with_no_reason():
+    """A bare "NONE" with no reason text (an older or non-compliant LLM
+    response) is tolerated, not treated as a formatting error --
+    rejection_reason is just None in that case."""
     agent1_result, omnipath = _two_path_setup()
     llm = StubLLMClient(fixed_response="NONE")
 
@@ -158,6 +161,29 @@ def test_llm_selecting_none_returns_empty_chains_without_raising():
 
     assert result.candidate_path_count == 2
     assert result.chains == []
+    assert result.rejection_reason is None
+
+
+def test_llm_none_response_with_reason_is_captured():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response="NONE: neither candidate names a specific enough mechanism for every step."
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.chains == []
+    assert result.rejection_reason == "neither candidate names a specific enough mechanism for every step."
+
+
+def test_rejection_reason_is_none_when_a_chain_is_endorsed():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response="1: Supported by direct literature evidence for A-X.")
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 1
+    assert result.rejection_reason is None
 
 
 def test_llm_response_with_no_parseable_lines_and_not_none_raises():

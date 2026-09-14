@@ -48,6 +48,12 @@ returned chain containing an unknown-direction edge (including the
 single-candidate bypass, which skips the LLM). `ChainCandidate.has_unconfirmed_direction`
 exposes this as a boolean so it doesn't need to be re-parsed from the
 rationale text.
+
+Rejection transparency (added 2026-09-14): when the LLM rejects every
+candidate (responds NONE), it's now asked to give one sentence saying why,
+so an empty `chains` list isn't a dead end -- `Agent2ChainResult.rejection_reason`
+carries that sentence (None if the LLM gave a bare "NONE" with no reason,
+which is tolerated rather than treated as a formatting error).
 """
 import argparse
 import json
@@ -127,6 +133,7 @@ class Agent2ChainResult:
     chains: List[ChainCandidate]
     candidate_path_count: int
     shared_genes: List[str]
+    rejection_reason: Optional[str] = None  # set when chains is empty and the LLM gave a reason for rejecting everything
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +142,7 @@ class Agent2ChainResult:
             "chains": [c.to_dict() for c in self.chains],
             "candidate_path_count": self.candidate_path_count,
             "shared_genes": self.shared_genes,
+            "rejection_reason": self.rejection_reason,
         }
 
 
@@ -327,7 +335,10 @@ Respond with exactly one line per plausible candidate, in this format:
 <candidate number>: <one-sentence rationale naming the specific mechanism at each step, citing \
 the evidence above or your own reasoning, and noting any UNKNOWN DIRECTION caveat>
 
-If none of the candidates are plausible, respond with the single word: NONE"""
+If none of the candidates are plausible, respond with a single line starting with the word NONE, \
+followed by a colon and one sentence explaining what was missing or unconvincing across the \
+candidates as a whole -- e.g. "NONE: none of the candidates named a specific enough mechanism for \
+every step." This reason is for transparency, not optional decoration -- always include it."""
 
 
 def _node_label(kind: str, node_id: str) -> str:
@@ -363,20 +374,26 @@ def _select_paths(
     disease2: str,
     citations: Dict[str, List[Citation]],
     llm_client,
-) -> List[Tuple[List[_RawEdge], Optional[str]]]:
+) -> Tuple[List[Tuple[List[_RawEdge], Optional[str]]], Optional[str]]:
     # Input: candidate paths, disease names, citations, LLM client.
-    # Output: list of (path, rationale) tuples the LLM endorsed -- zero, one, or many.
-    # Skips the LLM (returns the single path, rationale=None) when there's nothing to adjudicate.
-    # Callers must still run every returned tuple through _with_unknown_direction_caveat.
+    # Output: (selections, rejection_reason). selections is a list of (path, rationale) tuples the
+    # LLM endorsed -- zero, one, or many. rejection_reason is set only when selections is empty AND
+    # the LLM gave a reason for its blanket "NONE" (None if it didn't, or if selections is non-empty).
+    # Skips the LLM (returns the single path, rationale=None, reason=None) when there's nothing to
+    # adjudicate. Callers must still run every returned tuple through _with_unknown_direction_caveat.
     if len(paths) == 1:
-        return [(paths[0], None)]
+        return [(paths[0], None)], None
 
     candidates_text = "\n".join(_format_candidate(i + 1, p, citations) for i, p in enumerate(paths))
     prompt = _SELECTION_PROMPT_TEMPLATE.format(disease1=disease1, disease2=disease2, candidates_text=candidates_text)
     response = llm_client.generate(prompt, temperature=0.2)
 
-    if response.strip().upper().startswith("NONE"):
-        return []
+    stripped = response.strip()
+    if stripped.upper().startswith("NONE"):
+        reason = stripped[len("NONE"):].strip()
+        if reason.startswith(":"):
+            reason = reason[1:].strip()
+        return [], (reason or None)
 
     selections: List[Tuple[List[_RawEdge], Optional[str]]] = []
     for line in response.strip().splitlines():
@@ -393,7 +410,7 @@ def _select_paths(
             f"and wasn't 'NONE' either: {response!r}"
         )
 
-    return selections
+    return selections, None
 
 
 def _to_chain_edges(
@@ -455,7 +472,9 @@ def run_agent2_chain(
         )
 
     llm_client = llm_client or LLMClient()
-    selections = _select_paths(paths, agent1_result.disease1, agent1_result.disease2, agent1_result.citations, llm_client)
+    selections, rejection_reason = _select_paths(
+        paths, agent1_result.disease1, agent1_result.disease2, agent1_result.citations, llm_client
+    )
 
     chains = [
         ChainCandidate(
@@ -471,6 +490,7 @@ def run_agent2_chain(
         chains=chains,
         candidate_path_count=len(paths),
         shared_genes=shared_genes,
+        rejection_reason=rejection_reason if not chains else None,
     )
 
 
@@ -502,9 +522,10 @@ def _cli():
     agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, max_hops=args.max_hops)
 
     if not agent2_result.chains:
+        reason_text = f' LLM\'s stated reason: "{agent2_result.rejection_reason}"' if agent2_result.rejection_reason else " (no reason given)"
         print(
             f"Agent 2 found {agent2_result.candidate_path_count} structural candidate path(s), "
-            f"but the LLM did not judge any of them biologically plausible.",
+            f"but the LLM did not judge any of them biologically plausible.{reason_text}",
             flush=True,
         )
 
