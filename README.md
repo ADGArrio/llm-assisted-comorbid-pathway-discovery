@@ -1,4 +1,4 @@
-# Comorbidity Pathway Pipeline
+# LLM-Assisted Comorbid Mechanistic Pathway Discovery
 
 MS thesis project (Arrio Gonsalves, CMU, advisor Dr. Min Xu). Compares two
 approaches to deducing the mechanistic pathway connecting a pair of
@@ -77,9 +77,15 @@ diagram (inputs, the four-agent flow, and outputs).
 
 ```
 cd Code
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env   # then edit for your LLM endpoint, MIMIC_DATA_DIR, etc.
 ```
+
+Re-run `source .venv/bin/activate` at the start of every new terminal
+session before running anything below -- `.venv/` is gitignored, so it
+stays local to your machine and isn't part of the repo.
 
 Pipeline A and Agent 2 need a running LLM: defaults to a local Ollama
 server (`ollama serve`) with a model matching `LLM_MODEL` in `.env`, or

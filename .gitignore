@@ -5,3 +5,7 @@ __pycache__/
 
 # MetalinksDB local SQLite cache (liana.resource.get_metalinks download)
 *.db
+
+# local virtual environment
+.venv/
+venv/
