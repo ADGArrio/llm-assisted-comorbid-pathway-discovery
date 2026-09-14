@@ -55,6 +55,13 @@ class EndpointCrossDbCheck:
     gene_symbol: str
     disease_name: str
     gwas_associations: List[GwasAssociation]
+    # True if crossdb_client.py's GWASCatalogClient gave up on some part of this specific check
+    # (the search itself, or a per-SNP follow-up) after exhausting rate-limit retries -- see
+    # crossdb_client.py's bug-fix #3 note. When True, `confirmed=False` here means "not fully
+    # checked this run", not "checked and found no evidence" -- a real T2DM->AD run hit this
+    # for IRS1, a gene with strong, well-replicated GWAS evidence for T2DM, which is how this
+    # distinction was discovered to matter. Always False for StubGWASCatalogClient (see there).
+    possibly_incomplete: bool = False
 
     @property
     def confirmed(self) -> bool:
@@ -66,6 +73,7 @@ class EndpointCrossDbCheck:
             "disease_name": self.disease_name,
             "gwas_associations": [a.to_dict() for a in self.gwas_associations],
             "confirmed": self.confirmed,
+            "possibly_incomplete": self.possibly_incomplete,
         }
 
 
@@ -155,8 +163,17 @@ def _confirm_chain(
     endpoint_checks: List[EndpointCrossDbCheck] = []
     for gene, disease in ((roles["disease1_endpoint"], disease1), (roles["disease2_endpoint"], disease2)):
         gwas_associations = gwas_client.get_gene_disease_associations(gene, disease)
+        # getattr with a default: only GWASCatalogClient/StubGWASCatalogClient are known to
+        # define this (see crossdb_client.py's bug-fix #3 note); don't hard-fail against some
+        # other future client that doesn't.
+        possibly_incomplete = getattr(gwas_client, "last_check_rate_limited", False)
         endpoint_checks.append(
-            EndpointCrossDbCheck(gene_symbol=gene, disease_name=disease, gwas_associations=gwas_associations)
+            EndpointCrossDbCheck(
+                gene_symbol=gene,
+                disease_name=disease,
+                gwas_associations=gwas_associations,
+                possibly_incomplete=possibly_incomplete,
+            )
         )
 
     return Agent3ConfirmationResult(

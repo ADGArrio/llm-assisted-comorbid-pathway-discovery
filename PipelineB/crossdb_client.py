@@ -72,6 +72,62 @@ allowlist blocks it) -- if a real run logs many "still rate-limited
 after retries" warnings, GWAS Catalog's real limit is stricter than
 `_REQUEST_PACING_SECONDS` assumes; widen the pacing/backoff constants
 below rather than removing the retry logic.
+
+BUG FIX #3, 2026-09-14 (same day, after the GTEx fix in tissue_client.py
+was confirmed working live -- see that module's docstring's bug-fix #4):
+a full T2DM->AD run's console output showed exactly the warning sign
+flagged above -- a long run of "429 rate-limited... retrying... (attempt
+4/4)" messages across a dozen-plus distinct SNPs, not an isolated blip.
+GWAS Catalog's real sustained limit is clearly stricter than the ~3
+req/sec this module was pacing at. This matters beyond just wasted
+retries: `get_gene_disease_associations` returned `[]` for every one of
+6 endpoint checks that run, including IRS1 x Type 2 Diabetes Mellitus --
+IRS1 is one of the most heavily replicated common-variant T2DM GWAS loci
+in the literature (rs2943641 and related SNPs, first reported ~2009, a
+DIAGRAM-consortium-era finding since replicated many times over), so a
+clean "GWAS Catalog has zero matching evidence for IRS1 and T2DM" is
+biologically implausible. The far more likely explanation, given the
+log: some of IRS1's SNP follow-up requests (or the gene's own
+associations, if the true-hit SNP simply wasn't among the ones that
+happened to clear rate-limiting before `_MAX_RATE_LIMIT_RETRIES` ran
+out) were silently dropped by the existing graceful-degradation path --
+which is by design not an error, but was, until this fix, also
+indistinguishable downstream from "checked cleanly, found nothing."
+
+Two changes:
+  1. Pacing/backoff widened -- `_REQUEST_PACING_SECONDS` 0.34s -> 1.0s
+     (roughly matching the "be polite" defaults other public bio-data
+     APIs like NCBI E-utilities recommend), `_RATE_LIMIT_INITIAL_BACKOFF_SECONDS`
+     2.0s -> 5.0s, `_MAX_RATE_LIMIT_RETRIES` 4 -> 5 -- slower and more
+     patient, so fewer genuine associations get lost to a still-live
+     rate-limit window rather than a real absence of evidence. This is a
+     one-directional, safe change (a client is always allowed to go
+     slower than a server's real limit); it isn't a guess about the
+     exact number GWAS Catalog enforces, unlike the earlier param-name
+     rounds in tissue_client.py's history.
+  2. `GWASCatalogClient.last_check_rate_limited` -- a plain bool
+     attribute, reset to `False` at the start of every
+     `get_gene_disease_associations` call and set `True` if *any* part
+     of that check (the top-level search, or any per-SNP follow-up) gave
+     up after exhausting retries. Callers that care whether a `[]`/
+     `confirmed=False` result might actually be "not fully checked" now
+     have a way to tell -- see agent3_confirmation.py's
+     `EndpointCrossDbCheck.possibly_incomplete` and main.py's readable
+     report, which both surface this rather than silently reporting a
+     rate-limit artifact as if it were a real negative finding. This
+     matters specifically because the pipeline exits the per-SNP loop
+     early on a match (bug-fix #2's design) -- a gene with real evidence
+     usually finds it fast and never risks exhausting retries, but a
+     gene that's rate-limited into looking like it has *no* evidence
+     pays the full cost of checking every SNP, so this failure mode is
+     concentrated exactly on the negative results that most need to be
+     trustworthy.
+`StubGWASCatalogClient` also gets a `last_check_rate_limited` attribute
+(always `False`, since it never makes real requests) purely so code that
+reads it works the same against either client without an `isinstance`
+check or a `getattr` default at every call site outside
+agent3_confirmation.py (which still uses `getattr(..., False)` defensively
+for any third client that doesn't define the attribute at all).
 """
 import os
 import time
@@ -92,9 +148,9 @@ _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS = 20
 # Client-side pacing between requests, and 429 retry/backoff settings -- see bug-fix #2 note.
 # GWAS Catalog doesn't publish a documented rate limit, so these are conservative guesses, not
 # a verified real limit.
-_REQUEST_PACING_SECONDS = 0.34  # ~3 requests/sec
-_MAX_RATE_LIMIT_RETRIES = 4
-_RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 2.0
+_REQUEST_PACING_SECONDS = 1.0  # ~1 request/sec -- see bug-fix #3: 0.34s (~3/sec) was too fast in practice
+_MAX_RATE_LIMIT_RETRIES = 5
+_RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 5.0
 
 
 @dataclass
@@ -133,6 +189,10 @@ class GWASCatalogClient:
     def __init__(self, base_url: str = None, timeout: int = 30):
         self.base_url = base_url or os.environ.get("GWAS_CATALOG_BASE_URL", GWAS_DEFAULT_BASE_URL)
         self.timeout = timeout
+        # Set True if any part of the most recent get_gene_disease_associations call gave up
+        # after exhausting retries -- see bug-fix #3 in the module docstring. Reset to False at
+        # the start of every call, so it always reflects only the most recent check.
+        self.last_check_rate_limited = False
 
     def _get(self, url: str, params: dict = None):
         # Input: request url/params. Output: the requests.Response, after this client's own
@@ -164,7 +224,11 @@ class GWASCatalogClient:
     def get_gene_disease_associations(self, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
         # Input: gene symbol, disease name. Output: associations whose trait text matches the
         # disease (see _trait_matches_disease). [] means no hits, no match, or still rate-limited
-        # after retries -- none of these are treated as an error (see module docstring).
+        # after retries -- none of these are treated as an error (see module docstring). Check
+        # self.last_check_rate_limited right after calling this if you need to tell "checked,
+        # found nothing" apart from "gave up on some part of this check due to persistent rate
+        # limiting" -- see bug-fix #3 in the module docstring.
+        self.last_check_rate_limited = False
         resp = self._get(f"{self.base_url}{_ASSOCIATIONS_BY_GENE_PATH}", params={"geneName": gene_symbol})
         if resp.status_code == 404:
             raise RuntimeError(
@@ -179,6 +243,7 @@ class GWASCatalogClient:
                 f"not a real negative).",
                 flush=True,
             )
+            self.last_check_rate_limited = True
             return []
         resp.raise_for_status()
         payload = resp.json()
@@ -222,6 +287,7 @@ class GWASCatalogClient:
                     f"{href} -- skipping this SNP.",
                     flush=True,
                 )
+                self.last_check_rate_limited = True
                 return []
             assoc_resp.raise_for_status()
             raw_associations = assoc_resp.json().get("_embedded", {}).get("associations", [])
@@ -257,6 +323,11 @@ class StubGWASCatalogClient:
     def __init__(self, associations: Dict[tuple, List[GwasAssociation]]):
         self.associations = associations
         self.calls: List[tuple] = []
+        # Always False -- the stub never makes real requests, so it can never be rate-limited.
+        # Present purely so code reads the same attribute off either client without a getattr
+        # default at every call site -- see GWASCatalogClient's own attribute for what it means.
+        # Tests that want to exercise the "possibly incomplete" path can just set this directly.
+        self.last_check_rate_limited = False
 
     def get_gene_disease_associations(self, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
         self.calls.append((gene_symbol, disease_name))

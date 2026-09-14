@@ -175,6 +175,32 @@ def test_gwas_client_called_for_both_endpoints():
     assert len(gwas.calls) == 2  # both endpoints checked
 
 
+def test_endpoint_check_flags_possibly_incomplete_from_gwas_client():
+    """Regression test for crossdb_client.py's bug-fix #3: an endpoint check whose GWAS Catalog
+    lookup was rate-limited before it could finish must be flagged possibly_incomplete=True, so
+    'no hit' downstream (main.py's readable report, the saved JSON) isn't misread as a confirmed
+    negative -- see agent3_confirmation.py's EndpointCrossDbCheck docstring."""
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_single_edge_chain()])
+    gwas = StubGWASCatalogClient({})
+    gwas.last_check_rate_limited = True  # simulates the real client's post-call state
+
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=gwas)
+
+    assert all(e.possibly_incomplete is True for e in results[0].endpoint_checks)
+    assert all(e.confirmed is False for e in results[0].endpoint_checks)  # still no evidence -- just not final
+
+
+def test_endpoint_check_possibly_incomplete_defaults_to_false():
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_single_edge_chain()])
+    gwas = StubGWASCatalogClient({})
+
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=gwas)
+
+    assert all(e.possibly_incomplete is False for e in results[0].endpoint_checks)
+
+
 def test_to_dict_is_json_serializable():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])

@@ -238,6 +238,68 @@ def test_gwas_client_degrades_to_empty_list_after_exhausting_retries(monkeypatch
     assert client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus") == []
 
 
+def test_gwas_client_flags_last_check_rate_limited_when_search_exhausts_retries(monkeypatch):
+    """Regression test for bug-fix #3 (see crossdb_client.py's module docstring): a real run
+    reported '[] / not confirmed' for IRS1 x T2DM -- a gene with strong, well-replicated GWAS
+    evidence -- after a long run of 429s. last_check_rate_limited lets a caller tell that apart
+    from a clean negative."""
+    monkeypatch.setattr(
+        "PipelineB.crossdb_client.requests.get",
+        lambda url, params=None, timeout=None, headers=None: _FakeResponse({}, status_code=429),
+    )
+    client = GWASCatalogClient()
+
+    assert client.last_check_rate_limited is False  # nothing checked yet
+    client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+    assert client.last_check_rate_limited is True
+
+
+def test_gwas_client_flags_last_check_rate_limited_when_snp_followup_exhausts_retries(monkeypatch):
+    """Same as above, but the top-level search succeeds and the flag comes from a per-SNP
+    associations follow-up exhausting retries instead (see _associations_for_snp)."""
+    search_payload = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs1", "_links": {"associations": {"href": "https://api.example/snps/rs1/associations"}}}
+            ]
+        }
+    }
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            return _FakeResponse(search_payload)
+        return _FakeResponse({}, status_code=429)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+
+    assert results == []
+    assert client.last_check_rate_limited is True
+
+
+def test_gwas_client_resets_last_check_rate_limited_on_a_clean_later_call(monkeypatch):
+    """last_check_rate_limited must reflect only the most recent call -- a clean call after a
+    rate-limited one must not leave a stale True flag behind for the caller to misread."""
+    always_429 = {"on": True}  # every request 429s while True, so the first call exhausts retries
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if always_429["on"]:
+            return _FakeResponse({}, status_code=429)
+        return _FakeResponse({"_embedded": {"singleNucleotidePolymorphisms": []}})
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+    assert client.last_check_rate_limited is True
+
+    always_429["on"] = False
+    client.get_gene_disease_associations("APOE", "Alzheimer's Disease")
+    assert client.last_check_rate_limited is False
+
+
 def test_gwas_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
     class _RateLimitedResponse(_FakeResponse):
         def __init__(self):

@@ -102,6 +102,14 @@ def _format_confirmation_summary(confirmation: dict) -> str:
         if e.get("confirmed"):
             traits = ", ".join(sorted({a["trait_name"] for a in e.get("gwas_associations", [])}))
             lines.append(f"  {e['gene_symbol']} confirmed for {e['disease_name']} ({traits})")
+        elif e.get("possibly_incomplete"):
+            # crossdb_client.py's bug-fix #3: this check gave up on some part of itself after
+            # exhausting rate-limit retries -- "no hit" here is inconclusive, not a confirmed
+            # negative, and should not be read or reported as real absence of evidence.
+            lines.append(
+                f"  {e['gene_symbol']}: no GWAS Catalog hit for {e['disease_name']} "
+                f"(rate-limited before finishing this check -- inconclusive, not a confirmed negative)"
+            )
         else:
             lines.append(f"  {e['gene_symbol']}: no GWAS Catalog hit for {e['disease_name']}")
 
