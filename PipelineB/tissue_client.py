@@ -39,8 +39,25 @@ endpoint from this sandbox; if a real run still comes back with
 unexpectedly many "no GTEx record" results, check that resolution step
 first (e.g. print `GTExClient()._resolve_gencode_id("INSR")`) before
 assuming the genes really do lack data.
+
+RATE-LIMIT HARDENING, 2026-09-14 (same day): the equivalent fix in this
+module's sibling, crossdb_client.py (GWAS Catalog), made that client's
+own success its next problem -- more real HTTP requests per gene tripped
+GWAS Catalog's rate limit and crashed the whole pipeline with an
+uncaught 429. This module makes two requests per gene per tissue
+(gencodeId resolution + expression lookup, though resolution is cached
+per gene), which carries the same risk on a bigger run even though it
+hasn't actually failed this way yet. Applied proactively, before it did:
+`_get` paces every request and transparently retries a 429 (honoring a
+Retry-After header, else exponential backoff) up to
+_MAX_RATE_LIMIT_RETRIES times; if still rate-limited after retries, that
+gene/tissue check degrades to `None` ("no data this time") instead of
+raising and taking down the whole run -- same philosophy as GWAS
+Catalog's fix, see crossdb_client.py's bug-fix #2 note for the full
+reasoning.
 """
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -65,6 +82,13 @@ EXPRESSION_THRESHOLD = 1.0
 _GTEX_VALUE_FIELD_CANDIDATES = ("median", "value", "data")
 _GTEX_GENE_FIELD_CANDIDATES = ("geneSymbol", "gene_symbol", "symbol")
 _GTEX_GENCODE_ID_FIELD_CANDIDATES = ("gencodeId", "gencode_id")
+
+# Client-side pacing between requests, and 429 retry/backoff settings -- see module docstring's
+# rate-limit-hardening note. GTEx doesn't publish a documented rate limit, so these are
+# conservative guesses (matching crossdb_client.py's), not a verified real limit.
+_REQUEST_PACING_SECONDS = 0.34  # ~3 requests/sec
+_MAX_RATE_LIMIT_RETRIES = 4
+_RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 2.0
 
 
 @dataclass
@@ -111,19 +135,50 @@ class GTExClient:
         # since the same gene is looked up once per relevant tissue (see agent3_confirmation.py).
         self._gencode_id_cache: Dict[str, Optional[str]] = {}
 
+    def _get(self, url: str, params: dict):
+        # Input: request url/params. Output: the requests.Response, after this client's own
+        # pacing delay (_REQUEST_PACING_SECONDS) and after transparently retrying a 429 up to
+        # _MAX_RATE_LIMIT_RETRIES times (honoring a Retry-After header when the server sends
+        # one, else exponential backoff) -- see module docstring's rate-limit-hardening note.
+        # Callers get the response back even if it's still a 429 on the final attempt; both
+        # callers below treat that the same as "no data" rather than raising.
+        backoff = _RATE_LIMIT_INITIAL_BACKOFF_SECONDS
+        resp = None
+        for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+            time.sleep(_REQUEST_PACING_SECONDS)
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            if resp.status_code != 429:
+                return resp
+            if attempt == _MAX_RATE_LIMIT_RETRIES:
+                return resp
+            retry_after = resp.headers.get("Retry-After")
+            wait_seconds = float(retry_after) if retry_after and retry_after.strip().isdigit() else backoff
+            print(
+                f"GTEx: 429 rate-limited on {url} -- retrying in {wait_seconds:.1f}s "
+                f"(attempt {attempt + 1}/{_MAX_RATE_LIMIT_RETRIES})...",
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+            backoff *= 2
+        return resp
+
     def _resolve_gencode_id(self, gene_symbol: str) -> Optional[str]:
         # Input: gene symbol. Output: its versioned gencodeId for self.genome_build, or None if
-        # GTEx's own gene reference has no matching record -- see module docstring's bug-fix note:
-        # medianGeneExpression requires this versioned id, a plain gene symbol always returns
-        # zero records.
+        # GTEx's own gene reference has no matching record (including "still rate-limited after
+        # retries") -- see module docstring's bug-fix note: medianGeneExpression requires this
+        # versioned id, a plain gene symbol always returns zero records.
         if gene_symbol in self._gencode_id_cache:
             return self._gencode_id_cache[gene_symbol]
 
-        resp = requests.get(
-            f"{self.base_url}/reference/gene",
-            params={"geneId": gene_symbol, "genomeBuild": self.genome_build},
-            timeout=self.timeout,
-        )
+        resp = self._get(f"{self.base_url}/reference/gene", params={"geneId": gene_symbol, "genomeBuild": self.genome_build})
+        if resp.status_code == 429:
+            print(
+                f"GTEx: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries resolving "
+                f"{gene_symbol!r} -- treating as unresolved this run (not a real negative).",
+                flush=True,
+            )
+            self._gencode_id_cache[gene_symbol] = None
+            return None
         resp.raise_for_status()
         payload = resp.json()
         records = payload.get("data") or []
@@ -148,12 +203,13 @@ class GTExClient:
     def get_median_expression(self, gene_symbol: str, tissue_site_detail_id: str) -> Optional[float]:
         # Input: gene symbol, GTEx tissueSiteDetailId (e.g. "Pancreas", "Brain_Cortex").
         # Output: median nTPM, or None if GTEx has no record (distinct from a confirmed 0.0) --
-        # including the case where gene_symbol itself doesn't resolve to a gencodeId at all.
+        # including the case where gene_symbol itself doesn't resolve to a gencodeId at all, or
+        # is still rate-limited after retries.
         gencode_id = self._resolve_gencode_id(gene_symbol)
         if gencode_id is None:
             return None
 
-        resp = requests.get(
+        resp = self._get(
             f"{self.base_url}/expression/medianGeneExpression",
             params={
                 "gencodeId": gencode_id,
@@ -161,8 +217,14 @@ class GTExClient:
                 "datasetId": self.dataset_id,
                 "itemsPerPage": 5,
             },
-            timeout=self.timeout,
         )
+        if resp.status_code == 429:
+            print(
+                f"GTEx: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries checking "
+                f"{gene_symbol!r} in {tissue_site_detail_id!r} -- treating as 'no data' this run.",
+                flush=True,
+            )
+            return None
         resp.raise_for_status()
         payload = resp.json()
         records = payload.get("data") or []

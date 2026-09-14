@@ -1,6 +1,19 @@
 import json
 
+import pytest
+
 from PipelineB.tissue_client import EXPRESSION_THRESHOLD, GTExClient, StubGTExClient, check_tissue_expression
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeping(monkeypatch):
+    # GTExClient._get paces every request and backs off on 429 with real time.sleep() calls
+    # (see tissue_client.py's rate-limit-hardening note) -- fine for a real run, but every test
+    # in this file would otherwise burn real wall-clock time for no reason. Record calls instead
+    # so backoff-timing tests can still assert on them.
+    sleeps = []
+    monkeypatch.setattr("PipelineB.tissue_client.time.sleep", lambda seconds: sleeps.append(seconds))
+    return sleeps
 
 
 def test_gtex_expression_above_threshold_marks_expressed():
@@ -42,8 +55,10 @@ def test_to_dict_is_json_serializable():
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200, headers=None):
         self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         pass
@@ -106,3 +121,48 @@ def test_gtex_client_returns_none_when_gene_symbol_does_not_resolve(monkeypatch)
     client = GTExClient()
 
     assert client.get_median_expression("NOTAREALGENE", "Pancreas") is None
+
+
+def test_gtex_client_retries_429_and_succeeds(monkeypatch):
+    """Regression test for the 2026-09-14 rate-limit hardening (see tissue_client.py's module
+    docstring): a single transient 429 must not fail the request -- retry and use the next
+    response, exactly like crossdb_client.py's GWASCatalogClient."""
+    responses = [
+        _FakeResponse({}, status_code=429),
+        _FakeResponse({"data": [{"geneSymbol": "INSR", "gencodeId": "ENSG00000171105.16"}]}),
+    ]
+
+    def fake_get(url, params, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("PipelineB.tissue_client.requests.get", fake_get)
+    client = GTExClient()
+
+    assert client._resolve_gencode_id("INSR") == "ENSG00000171105.16"
+    assert responses == []
+
+
+def test_gtex_client_degrades_to_none_after_exhausting_retries(monkeypatch):
+    """If GTEx is still rate-limiting after every retry, the whole pipeline must not crash --
+    the gene/tissue check is treated as 'no data this time', same as crossdb_client.py's
+    equivalent fix (which was itself a response to a real 429 crash)."""
+    monkeypatch.setattr(
+        "PipelineB.tissue_client.requests.get", lambda url, params, timeout: _FakeResponse({}, status_code=429)
+    )
+    client = GTExClient()
+
+    assert client.get_median_expression("INSR", "Pancreas") is None
+
+
+def test_gtex_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
+    responses = [
+        _FakeResponse({}, status_code=429, headers={"Retry-After": "5"}),
+        _FakeResponse({"data": [{"geneSymbol": "INSR", "gencodeId": "ENSG00000171105.16"}]}),
+    ]
+
+    monkeypatch.setattr("PipelineB.tissue_client.requests.get", lambda url, params, timeout: responses.pop(0))
+    client = GTExClient()
+
+    client._resolve_gencode_id("INSR")
+
+    assert 5.0 in _no_real_sleeping  # waited the server-specified Retry-After, not the default backoff
