@@ -80,7 +80,13 @@ robots.txt), means the next attempt needs the actual 422 response body
 offending field) rather than a fourth guess from secondary sources.
 `resp.raise_for_status()` was replaced with `_raise_for_status_with_body`
 below specifically so that response body is captured automatically the
-next time this fails, instead of needing a separate diagnostic run.
+next time this fails, instead of needing a separate diagnostic run. Both
+callers also now catch that error and degrade to "no data this run"
+(printing the full message, body included) rather than letting it
+propagate -- consistent with agent3_confirmation.py's existing
+philosophy that Agent 3 findings are reported per-check, never a hard
+pipeline failure; a broken request for one gene's tissue check
+shouldn't take down Agents 1/2/4's results along with it.
 
 RATE-LIMIT HARDENING, 2026-09-14 (same day): the equivalent fix in this
 module's sibling, crossdb_client.py (GWAS Catalog), made that client's
@@ -236,7 +242,17 @@ class GTExClient:
             )
             self._gencode_id_cache[gene_symbol] = None
             return None
-        _raise_for_status_with_body(resp)
+        try:
+            _raise_for_status_with_body(resp)
+        except requests.HTTPError as e:
+            # Never let a broken request (wrong param name, a real GTEx-side error, etc.) crash
+            # the whole pipeline over one gene's tissue check -- see agent3_confirmation.py's
+            # module docstring: Agent 3 findings are reported per-check, never a hard failure.
+            # The full error (now including the response body, see _raise_for_status_with_body)
+            # is printed so this is diagnosable from a normal run's console output alone.
+            print(f"GTEx: request failed resolving {gene_symbol!r} -- treating as unresolved this run. {e}", flush=True)
+            self._gencode_id_cache[gene_symbol] = None
+            return None
         payload = resp.json()
         records = payload.get("data") or []
 
@@ -282,7 +298,15 @@ class GTExClient:
                 flush=True,
             )
             return None
-        _raise_for_status_with_body(resp)
+        try:
+            _raise_for_status_with_body(resp)
+        except requests.HTTPError as e:
+            print(
+                f"GTEx: request failed checking {gene_symbol!r} in {tissue_site_detail_id!r} -- "
+                f"treating as 'no data' this run. {e}",
+                flush=True,
+            )
+            return None
         payload = resp.json()
         records = payload.get("data") or []
         if not records:

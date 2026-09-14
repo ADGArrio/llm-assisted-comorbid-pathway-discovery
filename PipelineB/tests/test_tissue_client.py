@@ -55,13 +55,17 @@ def test_to_dict_is_json_serializable():
 
 
 class _FakeResponse:
-    def __init__(self, payload, status_code=200, headers=None):
+    def __init__(self, payload, status_code=200, headers=None, text=""):
         self._payload = payload
         self.status_code = status_code
         self.headers = headers or {}
+        self.text = text
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
 
     def json(self):
         return self._payload
@@ -173,3 +177,37 @@ def test_gtex_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
     client._resolve_gencode_id("INSR")
 
     assert 5.0 in _no_real_sleeping  # waited the server-specified Retry-After, not the default backoff
+
+
+def test_gtex_client_degrades_gracefully_on_non_429_http_error(monkeypatch, capsys):
+    """Regression test for bug-fix #3 (see tissue_client.py's module docstring): a real run hit
+    a genuine 422 from /reference/gene. A broken request for one gene must not crash the whole
+    pipeline -- it should degrade to 'unresolved this run' and print the response body (so the
+    failure is diagnosable from a normal run's console output), not raise."""
+    monkeypatch.setattr(
+        "PipelineB.tissue_client.requests.get",
+        lambda url, params, timeout: _FakeResponse({}, status_code=422, text='{"detail":[{"loc":["query","geneIds"],"msg":"field required"}]}'),
+    )
+    client = GTExClient()
+
+    result = client._resolve_gencode_id("IRS1")
+
+    assert result is None
+    printed = capsys.readouterr().out
+    assert "422" in printed
+    assert "geneIds" in printed  # the response body made it into the printed warning
+
+
+def test_gtex_client_get_median_expression_degrades_gracefully_on_non_429_http_error(monkeypatch):
+    """Same as above, but for the second request (medianGeneExpression) -- a gene that resolves
+    fine but then fails on the expression lookup must also degrade, not crash."""
+
+    def fake_get(url, params, timeout):
+        if url.endswith("/reference/gene"):
+            return _FakeResponse({"data": [{"geneSymbol": "IRS1", "gencodeId": "ENSG00000169213.12"}]})
+        return _FakeResponse({}, status_code=500, text="Internal Server Error")
+
+    monkeypatch.setattr("PipelineB.tissue_client.requests.get", fake_get)
+    client = GTExClient()
+
+    assert client.get_median_expression("IRS1", "Pancreas") is None
