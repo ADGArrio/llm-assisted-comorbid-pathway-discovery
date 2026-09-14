@@ -30,9 +30,10 @@ BFS note: when two branches reach the same node (gene or metabolite) at
 the same depth, only the first-found path through it is kept (marked
 visited) -- affects which specific path is reported through a shared
 node, not whether the shortest depth is found. `_MAX_FRONTIER_SIZE` caps
-nodes queried per BFS layer (logs a warning + truncates deterministically
-if exceeded) to keep request size/runtime bounded; a truncated node
-could in theory miss a legitimate longer path through it. Each goal gene
+nodes queried per BFS layer (logs a warning + truncates if exceeded, with
+disease-scored genes protected -- see "frontier truncation prioritized"
+note below) to keep request size/runtime bounded; a truncated unscored
+node could in theory miss a legitimate longer path through it. Each goal gene
 is only *recorded* once, the first time it's reached (giving each goal
 its own shortest path, tracked via `found_targets`) -- but the search
 now keeps expanding PAST a goal gene too (see "goal-gene expansion" note
@@ -203,6 +204,52 @@ literally PLAUSIBLE -- a candidate the model discusses without that
 exact word is rejected, no matter how positive its sentence reads. This
 also plays to the model's own apparent habit of commenting on every
 item in a numbered list, instead of fighting it.
+
+Frontier truncation prioritized, fixed 2026-09-14 (found on a real run
+with all prior fixes in): `_MAX_FRONTIER_SIZE` (300) is being hit hard on
+real T2DM->AD data -- one real run's per-depth frontier sizes were 599,
+2387, 348, 340 (depths 2-5), meaning as little as 300/2387 (~13%) of the
+graph at a given depth was ever actually queried. The old truncation was
+`sorted(frontier, key=lambda item: item[0])[:_MAX_FRONTIER_SIZE]` --
+plain alphabetical order on the node id. That's a real, silent sampling
+bias, not a neutral cut: it systematically favors gene symbols that sort
+early in the alphabet and discards the rest regardless of biological
+relevance, with no correlation to whether a dropped node was actually
+useful. Concretely, a bridge gene like GSK3B or a goal gene like MAPT
+sorts in the back half of the alphabet and could be silently dropped
+from a crowded frontier before its own outgoing edges are ever queried
+-- with nothing in the output indicating this happened (the warning only
+reports the count, not which specific genes were kept or lost). This is
+a real, still-partially-unresolved candidate explanation for why deeper,
+more specific chains (e.g. continuing from AKT1 to GSK3B to MAPT) keep
+not showing up, independent of the goal-gene-expansion and max_paths
+fixes above. Fixed by changing the truncation sort key (`_frontier_priority`)
+to keep every gene with a real disease1 or disease2 Open Targets score
+(`scored_genes = set(start_genes) | goal_genes`) ahead of any unscored
+gene or metabolite, falling back to the node id only to break ties
+deterministically within each tier. This guarantees a scored gene is
+never dropped by the cap as long as the total count of scored genes
+doesn't itself exceed 300 (true for realistic Agent 1 gene-pool sizes).
+It does NOT fully solve the underlying problem: the bulk of each
+frontier is still unscored bridge genes, and among those, ties still
+break alphabetically -- a real bridge gene needed to reach a deeper
+target can still be dropped if it's unscored and sorts late among the
+unscored majority. The cap exists for real reasons (OmniPath API request
+size/runtime), and 300 is small relative to the graph density actually
+observed on this disease pair; raising it further is a real available
+lever but untested from this sandboxed environment (network-blocked),
+so it's being left as a documented option for the user to try locally
+and watch for request-size/timeout issues, rather than changed blindly.
+
+Complex nodes filtered, fixed 2026-09-14 (same real run): see
+omnipath_client.py's module docstring's "Complex nodes are dropped" note
+-- a chain in that same real run routed through three OmniPath
+multi-protein complexes in a row (rendered as long underscore-joined
+pseudo gene symbols like "AKT1S1_DEPTOR_MLST8_MTOR_RPTOR"), which can
+never carry an Open Targets score, can't be confirmed by Agent 3, and
+render as confusing noise in the readable pathway output. OmniPathClient
+now drops any interaction where either end is a COMPLEX rather than a
+single gene, so BFS never sees them at all.
 """
 import argparse
 import json
@@ -366,6 +413,17 @@ def _score_maps(agent1_result: Agent1DiscoveryResult) -> Tuple[Dict[str, float],
     return d1, d2
 
 
+def _frontier_priority(item: Tuple[Tuple[str, str], List[_RawEdge]], scored_genes: set) -> Tuple[int, str]:
+    # Input: one frontier entry ((kind, node_id), path-so-far), the set of genes with a real
+    # disease1 or disease2 Open Targets score. Output: a sort key for frontier truncation --
+    # see the module docstring's "frontier truncation prioritized" note. Lower sorts first
+    # (kept); a scored gene is always priority 0 (kept over any unscored node), everything else
+    # (unscored genes, metabolites) is priority 1; node id breaks ties deterministically.
+    (kind, node_id), _ = item
+    is_scored = kind == "gene" and node_id in scored_genes
+    return (0 if is_scored else 1, node_id)
+
+
 def _bfs_shortest_paths(
     omnipath_client,
     metalinks_client,
@@ -387,6 +445,8 @@ def _bfs_shortest_paths(
     frontier: List[Tuple[Tuple[str, str], List[_RawEdge]]] = [(("gene", g), []) for g in start_genes]
     found: List[List[_RawEdge]] = []
     depth = 0
+    scored_genes = set(start_genes) | goal_genes  # every gene with a real disease1 or disease2
+    # association score -- used only to prioritize what survives frontier truncation, see below.
 
     # NOTE: the loop no longer stops early once len(found) reaches max_paths -- see the module
     # docstring's "max_paths cutting off exploration too early" note. It only stops on
@@ -398,10 +458,12 @@ def _bfs_shortest_paths(
         if len(frontier) > _MAX_FRONTIER_SIZE:
             print(
                 f"WARNING: Agent 2 BFS depth {depth}: frontier of {len(frontier)} nodes exceeds "
-                f"the {_MAX_FRONTIER_SIZE}-node safety cap; truncating (sorted, deterministic).",
+                f"the {_MAX_FRONTIER_SIZE}-node safety cap; truncating -- keeping disease-scored "
+                f"genes first, then the rest deterministically by id (see module docstring's "
+                f"'frontier truncation prioritized' note).",
                 flush=True,
             )
-            frontier = sorted(frontier, key=lambda item: item[0])[:_MAX_FRONTIER_SIZE]
+            frontier = sorted(frontier, key=lambda item: _frontier_priority(item, scored_genes))[:_MAX_FRONTIER_SIZE]
 
         gene_ids = [node_id for (kind, node_id), _ in frontier if kind == "gene"]
         metabolite_ids = [node_id for (kind, node_id), _ in frontier if kind == "metabolite"]

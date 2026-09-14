@@ -30,6 +30,32 @@ this as an explicit, comparable option (`run_agent2(...,
 omnipath_datasets="extended")` in main.py, or `--omnipath-datasets` on
 this module's sibling CLI in agent2_chain.py) rather than silently
 changing the default.
+
+Complex nodes are dropped, fixed 2026-09-14: OmniPath annotates some
+interactions as involving a multi-protein COMPLEX rather than a single
+gene product on one or both ends -- its source/target id column reads
+e.g. "COMPLEX:P42345_Q8N122_Q8TB45_Q96B36_Q9BVC4" and genesymbols=1
+renders it as "AKT1S1_DEPTOR_MLST8_MTOR_RPTOR" (the mTORC1 complex, as
+one underscore-joined pseudo gene symbol). A real T2DM->AD run's BFS
+routed a chain through three of these in a row (mTORC1, the ULK1
+autophagy-initiation complex, and the AMPK complex) before landing on a
+real single gene again. This is real, literature-accurate systems
+biology, but a pseudo "gene" like that is a genuine problem for this
+pipeline specifically: (1) it can never carry an Open Targets disease-
+association score (Open Targets scores single genes, not composite
+complex ids), so it can never be a `goal_genes` endpoint -- it can only
+ever be an opaque bridge hop that inflates the search space for no
+scoring benefit; (2) Agent 3's confirmation step (GTEx tissue expression,
+GWAS Catalog) also operates on single genes, so a complex hop can't be
+independently confirmed the way a real gene can; (3) it renders as a
+long, confusing underscore-joined string in the readable pathway output
+`main.py`'s `agent2_explanation` builds -- directly undermining the
+"just the explanation and mechanistic pathway, no unreadable info"
+request that output was built for. `get_outgoing_interactions` now drops
+any interaction where either end is a COMPLEX (detected via the raw
+source/target id's "COMPLEX:" prefix, before the genesymbols=1
+substitution) rather than passing it through as if it were an ordinary
+single-gene edge.
 """
 import csv
 import io
@@ -117,10 +143,12 @@ class OmniPathClient:
         for row in reader:
             if not _truthy(row.get("is_directed", "")):
                 continue  # an undirected edge can't support a directional chain step
-            source_gene = row.get("source_genesymbol") or row.get("source")
-            target_gene = row.get("target_genesymbol") or row.get("target")
             source_uniprot = row.get("source", "")
             target_uniprot = row.get("target", "")
+            if source_uniprot.startswith("COMPLEX:") or target_uniprot.startswith("COMPLEX:"):
+                continue  # multi-protein complex, not a single gene -- see module docstring
+            source_gene = row.get("source_genesymbol") or row.get("source")
+            target_gene = row.get("target_genesymbol") or row.get("target")
             interactions.append(
                 Interaction(
                     source_gene=source_gene,

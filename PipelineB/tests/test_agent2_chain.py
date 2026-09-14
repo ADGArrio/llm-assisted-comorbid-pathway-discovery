@@ -343,6 +343,40 @@ def test_bfs_does_not_stop_exploring_once_max_paths_shallow_hits_are_found():
     assert "MID --inhibits--> DEEP" in llm.last_prompt  # the depth-2 candidate survived the trim
 
 
+def test_frontier_truncation_protects_disease_scored_genes_over_alphabetical_order():
+    """Regression test for a real bug, fixed 2026-09-14 (see agent2_chain.py's
+    module docstring, "Frontier truncation prioritized"): a real run showed
+    per-depth frontiers of 599-2387 nodes against the 300-node safety cap, and
+    the old truncation kept only the alphabetically-first 300 -- a real,
+    silent sampling bias with no relation to biological relevance. A gene like
+    "ZZZGOAL" (disease-associated, but sorting near the end of the alphabet)
+    could be dropped from a crowded frontier before its own outgoing edges
+    were ever queried, even though continuing past it was exactly the point
+    of the goal-gene-expansion fix. Here ZZZGOAL is reachable at depth 1
+    alongside 350 unscored bridge genes that all sort before it -- enough to
+    blow well past the 300-node cap -- and "DEEPER_GOAL" is reachable only
+    through ZZZGOAL's own depth-2 outgoing edge. DEEPER_GOAL must still be
+    found, proving ZZZGOAL survived truncation despite its alphabetical
+    position."""
+    bridge_genes = [f"BRIDGE{i:04d}" for i in range(350)]
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=[
+            GeneAssociation("ZZZGOAL", "ENSG_Z", "P_Z", 0.5),
+            GeneAssociation("DEEPER_GOAL", "ENSG_D", "P_D", 0.9),
+        ],
+    )
+    interactions = [Interaction("A", "PA", g, f"P_{g}", "activates", f"PA->P_{g}") for g in bridge_genes]
+    interactions.append(Interaction("A", "PA", "ZZZGOAL", "P_Z", "activates", "PA->P_Z"))
+    interactions.append(Interaction("ZZZGOAL", "P_Z", "DEEPER_GOAL", "P_D", "activates", "P_Z->P_D"))
+    omnipath = StubOmniPathClient(interactions)
+    llm = StubLLMClient(fixed_response="NONE: nothing specific enough.")
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert "ZZZGOAL --activates--> DEEPER_GOAL" in llm.last_prompt
+
+
 def test_citations_for_path_genes_are_included_in_the_llm_prompt():
     agent1_result = _agent1_result(
         disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6), GeneAssociation("B", "ENSGB", "PB", 0.5)],

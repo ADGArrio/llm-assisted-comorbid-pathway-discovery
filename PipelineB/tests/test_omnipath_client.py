@@ -35,6 +35,28 @@ def test_parse_response_skips_undirected_edges():
     assert interactions[0].interaction_type == "activates"
 
 
+def test_parse_response_skips_complex_nodes_on_either_end():
+    """Regression test for a real issue, fixed 2026-09-14 (see the module
+    docstring's "Complex nodes are dropped" note): a real T2DM->AD run's
+    BFS routed a chain through three OmniPath multi-protein complexes in a
+    row (mTORC1, the ULK1 complex, the AMPK complex), rendered as long
+    underscore-joined pseudo gene symbols. A complex can never carry an
+    Open Targets score and can't be confirmed by Agent 3, so these rows
+    must be dropped entirely, on either end, not passed through as if
+    they were ordinary single-gene edges."""
+    tsv = (
+        "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n"
+        "P1\tP2\tGENEA\tGENEB\t1\t1\t0\n"
+        "COMPLEX:P3_P4\tP5\tCOMPLEXNAME\tGENEC\t1\t1\t0\n"
+        "P6\tCOMPLEX:P7_P8\tGENED\tCOMPLEXNAME2\t1\t1\t0\n"
+    )
+    client = OmniPathClient()
+    interactions = client._parse_response(tsv)
+    assert len(interactions) == 1
+    assert interactions[0].source_gene == "GENEA"
+    assert interactions[0].target_gene == "GENEB"
+
+
 def test_parse_response_handles_empty_text():
     client = OmniPathClient()
     assert client._parse_response("") == []
