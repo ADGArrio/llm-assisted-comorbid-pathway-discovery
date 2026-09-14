@@ -35,15 +35,17 @@ def test_parse_response_skips_undirected_edges():
     assert interactions[0].interaction_type == "activates"
 
 
-def test_parse_response_skips_complex_nodes_on_either_end():
-    """Regression test for a real issue, fixed 2026-09-14 (see the module
-    docstring's "Complex nodes are dropped" note): a real T2DM->AD run's
-    BFS routed a chain through three OmniPath multi-protein complexes in a
-    row (mTORC1, the ULK1 complex, the AMPK complex), rendered as long
-    underscore-joined pseudo gene symbols. A complex can never carry an
-    Open Targets score and can't be confirmed by Agent 3, so these rows
-    must be dropped entirely, on either end, not passed through as if
-    they were ordinary single-gene edges."""
+def test_parse_response_keeps_complex_nodes_on_either_end():
+    """Regression test locking in a deliberate decision, 2026-09-14 (see the
+    module docstring's "Complex nodes are kept" note): a filter dropping any
+    interaction touching an OmniPath multi-protein COMPLEX (rendered as a
+    long underscore-joined pseudo gene symbol, e.g. the mTORC1 complex) was
+    tried and then explicitly reverted -- complexes are real, important
+    biology, and skipping them isn't a call to make unilaterally; the
+    unresolved tradeoff (real mechanism vs. unscorable/unconfirmable) is
+    tracked in claude/open_issues_for_committee.md instead. This test exists
+    so a future edit can't silently reintroduce that filter without it being
+    a deliberate, visible change."""
     tsv = (
         "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n"
         "P1\tP2\tGENEA\tGENEB\t1\t1\t0\n"
@@ -52,15 +54,53 @@ def test_parse_response_skips_complex_nodes_on_either_end():
     )
     client = OmniPathClient()
     interactions = client._parse_response(tsv)
-    assert len(interactions) == 1
-    assert interactions[0].source_gene == "GENEA"
-    assert interactions[0].target_gene == "GENEB"
+    assert len(interactions) == 3
+    assert {i.source_gene for i in interactions} == {"GENEA", "COMPLEXNAME", "GENED"}
+    assert {i.target_gene for i in interactions} == {"GENEB", "GENEC", "COMPLEXNAME2"}
 
 
 def test_parse_response_handles_empty_text():
     client = OmniPathClient()
     assert client._parse_response("") == []
     assert client._parse_response("   ") == []
+
+
+def test_get_outgoing_interactions_batches_large_gene_lists(monkeypatch):
+    """Regression test, added 2026-09-14 alongside raising agent2_chain.py's
+    _MAX_FRONTIER_SIZE from 300 to 3000: a single request with thousands of
+    comma-joined gene symbols risks a URL-length failure. get_outgoing_interactions
+    must split a large gene list into multiple _QUERY_BATCH_SIZE-sized requests
+    and concatenate their results, transparently to the caller."""
+    from PipelineB.omnipath_client import _QUERY_BATCH_SIZE
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params, timeout):
+        batch = params["sources"].split(",")
+        calls.append(batch)
+        rows = "\n".join(f"P_{g}\tPX\t{g}\tTARGET\t1\t1\t0" for g in batch)
+        tsv = "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n" + rows
+        return FakeResponse(tsv)
+
+    monkeypatch.setattr("PipelineB.omnipath_client.requests.get", fake_get)
+    client = OmniPathClient()
+    total_genes = _QUERY_BATCH_SIZE * 2 + 50  # forces 3 batches
+    genes = [f"G{i:05d}" for i in range(total_genes)]
+
+    interactions = client.get_outgoing_interactions(genes)
+
+    assert len(calls) == 3
+    assert len(calls[0]) == _QUERY_BATCH_SIZE
+    assert len(calls[1]) == _QUERY_BATCH_SIZE
+    assert len(calls[2]) == 50
+    assert len(interactions) == total_genes
 
 
 def test_stub_returns_outgoing_edges_including_targets_outside_the_source_set():

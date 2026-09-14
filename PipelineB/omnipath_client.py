@@ -31,31 +31,29 @@ omnipath_datasets="extended")` in main.py, or `--omnipath-datasets` on
 this module's sibling CLI in agent2_chain.py) rather than silently
 changing the default.
 
-Complex nodes are dropped, fixed 2026-09-14: OmniPath annotates some
-interactions as involving a multi-protein COMPLEX rather than a single
-gene product on one or both ends -- its source/target id column reads
-e.g. "COMPLEX:P42345_Q8N122_Q8TB45_Q96B36_Q9BVC4" and genesymbols=1
-renders it as "AKT1S1_DEPTOR_MLST8_MTOR_RPTOR" (the mTORC1 complex, as
-one underscore-joined pseudo gene symbol). A real T2DM->AD run's BFS
-routed a chain through three of these in a row (mTORC1, the ULK1
-autophagy-initiation complex, and the AMPK complex) before landing on a
-real single gene again. This is real, literature-accurate systems
-biology, but a pseudo "gene" like that is a genuine problem for this
-pipeline specifically: (1) it can never carry an Open Targets disease-
-association score (Open Targets scores single genes, not composite
-complex ids), so it can never be a `goal_genes` endpoint -- it can only
-ever be an opaque bridge hop that inflates the search space for no
-scoring benefit; (2) Agent 3's confirmation step (GTEx tissue expression,
-GWAS Catalog) also operates on single genes, so a complex hop can't be
-independently confirmed the way a real gene can; (3) it renders as a
-long, confusing underscore-joined string in the readable pathway output
-`main.py`'s `agent2_explanation` builds -- directly undermining the
-"just the explanation and mechanistic pathway, no unreadable info"
-request that output was built for. `get_outgoing_interactions` now drops
-any interaction where either end is a COMPLEX (detected via the raw
-source/target id's "COMPLEX:" prefix, before the genesymbols=1
-substitution) rather than passing it through as if it were an ordinary
-single-gene edge.
+Complex nodes are kept, tried-and-reverted 2026-09-14: OmniPath
+annotates some interactions as involving a multi-protein COMPLEX rather
+than a single gene product on one or both ends -- its source/target id
+column reads e.g. "COMPLEX:P42345_Q8N122_Q8TB45_Q96B36_Q9BVC4" and
+genesymbols=1 renders it as "AKT1S1_DEPTOR_MLST8_MTOR_RPTOR" (the mTORC1
+complex, as one underscore-joined pseudo gene symbol). A real T2DM->AD
+run's BFS routed a chain through three of these in a row (mTORC1, the
+ULK1 autophagy-initiation complex, and the AMPK complex) before landing
+on a real single gene again -- real, literature-accurate systems biology
+(mTORC1 does inhibit the ULK1 complex, which does feed into AMPK, which
+does inhibit HMGCR), but a pseudo "gene" like that has real downsides
+for this pipeline specifically: it can never carry an Open Targets
+disease-association score, so it can never be a `goal_genes` endpoint;
+Agent 3's confirmation step (GTEx, GWAS Catalog) operates on single
+genes, so a complex hop can't be independently confirmed; and it renders
+as a long, confusing underscore-joined string in the readable pathway
+output. A filter dropping any interaction touching a COMPLEX was tried
+the same day, then reverted per explicit direction: complexes are real,
+important biology, and skipping them isn't a call to make unilaterally.
+`get_outgoing_interactions` includes them again. The unresolved tradeoff
+(real mechanism vs. unscorable/unconfirmable/hard-to-render) is tracked
+as an open issue for committee discussion in
+claude/open_issues_for_committee.md, not resolved by code.
 """
 import csv
 import io
@@ -68,6 +66,7 @@ import requests
 DEFAULT_BASE_URL = "https://omnipathdb.org/interactions"
 DEFAULT_DATASETS = "omnipath"  # the core curated PPI set
 EXTENDED_DATASETS = "omnipath,pathwayextra,kinaseextra"  # + broader curated signaling/kinase coverage; see module docstring
+_QUERY_BATCH_SIZE = 300  # genes per HTTP request -- see get_outgoing_interactions
 
 
 @dataclass
@@ -120,17 +119,29 @@ class OmniPathClient:
     def get_outgoing_interactions(self, source_genes: List[str]) -> List[Interaction]:
         # Input: list of source gene symbols. Output: directed Interactions FROM
         # any of those genes, to whatever they point at in OmniPath (may be outside source_genes).
+        #
+        # Batched in groups of _QUERY_BATCH_SIZE, added 2026-09-14 alongside raising
+        # agent2_chain.py's _MAX_FRONTIER_SIZE: a single GET with thousands of comma-joined gene
+        # symbols in one query string risks hitting a URL-length limit (many servers/proxies cap
+        # around 2-8k characters) or a slow/failed request, untested from this network-blocked
+        # sandbox. Splitting into several smaller, known-safe-sized requests avoids that risk
+        # regardless of how large the caller's gene list is, at the cost of more HTTP round trips.
         if not source_genes:
             return []
 
-        params = {
-            "sources": ",".join(sorted(set(source_genes))),
-            "genesymbols": "1",
-            "datasets": self.datasets,
-        }
-        resp = requests.get(self.base_url, params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        return self._parse_response(resp.text)
+        genes = sorted(set(source_genes))
+        interactions: List[Interaction] = []
+        for i in range(0, len(genes), _QUERY_BATCH_SIZE):
+            batch = genes[i : i + _QUERY_BATCH_SIZE]
+            params = {
+                "sources": ",".join(batch),
+                "genesymbols": "1",
+                "datasets": self.datasets,
+            }
+            resp = requests.get(self.base_url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            interactions.extend(self._parse_response(resp.text))
+        return interactions
 
     def _parse_response(self, text: str) -> List[Interaction]:
         # Input: raw TSV response body. Output: parsed Interaction list (directed edges only).
@@ -145,8 +156,8 @@ class OmniPathClient:
                 continue  # an undirected edge can't support a directional chain step
             source_uniprot = row.get("source", "")
             target_uniprot = row.get("target", "")
-            if source_uniprot.startswith("COMPLEX:") or target_uniprot.startswith("COMPLEX:"):
-                continue  # multi-protein complex, not a single gene -- see module docstring
+            # Complex nodes (source/target id prefixed "COMPLEX:") are intentionally NOT
+            # filtered here -- see module docstring's "Complex nodes are kept" note.
             source_gene = row.get("source_genesymbol") or row.get("source")
             target_gene = row.get("target_genesymbol") or row.get("target")
             interactions.append(

@@ -206,50 +206,48 @@ also plays to the model's own apparent habit of commenting on every
 item in a numbered list, instead of fighting it.
 
 Frontier truncation prioritized, fixed 2026-09-14 (found on a real run
-with all prior fixes in): `_MAX_FRONTIER_SIZE` (300) is being hit hard on
-real T2DM->AD data -- one real run's per-depth frontier sizes were 599,
-2387, 348, 340 (depths 2-5), meaning as little as 300/2387 (~13%) of the
-graph at a given depth was ever actually queried. The old truncation was
-`sorted(frontier, key=lambda item: item[0])[:_MAX_FRONTIER_SIZE]` --
-plain alphabetical order on the node id. That's a real, silent sampling
-bias, not a neutral cut: it systematically favors gene symbols that sort
-early in the alphabet and discards the rest regardless of biological
-relevance, with no correlation to whether a dropped node was actually
-useful. Concretely, a bridge gene like GSK3B or a goal gene like MAPT
-sorts in the back half of the alphabet and could be silently dropped
-from a crowded frontier before its own outgoing edges are ever queried
--- with nothing in the output indicating this happened (the warning only
-reports the count, not which specific genes were kept or lost). This is
-a real, still-partially-unresolved candidate explanation for why deeper,
-more specific chains (e.g. continuing from AKT1 to GSK3B to MAPT) keep
-not showing up, independent of the goal-gene-expansion and max_paths
-fixes above. Fixed by changing the truncation sort key (`_frontier_priority`)
-to keep every gene with a real disease1 or disease2 Open Targets score
+with all prior fixes in): the truncation sort key (`_frontier_priority`)
+keeps every gene with a real disease1 or disease2 Open Targets score
 (`scored_genes = set(start_genes) | goal_genes`) ahead of any unscored
 gene or metabolite, falling back to the node id only to break ties
-deterministically within each tier. This guarantees a scored gene is
-never dropped by the cap as long as the total count of scored genes
-doesn't itself exceed 300 (true for realistic Agent 1 gene-pool sizes).
-It does NOT fully solve the underlying problem: the bulk of each
-frontier is still unscored bridge genes, and among those, ties still
-break alphabetically -- a real bridge gene needed to reach a deeper
-target can still be dropped if it's unscored and sorts late among the
-unscored majority. The cap exists for real reasons (OmniPath API request
-size/runtime), and 300 is small relative to the graph density actually
-observed on this disease pair; raising it further is a real available
-lever but untested from this sandboxed environment (network-blocked),
-so it's being left as a documented option for the user to try locally
-and watch for request-size/timeout issues, rather than changed blindly.
+deterministically within each tier -- instead of the old plain
+alphabetical sort, which was a real, silent sampling bias with no
+correlation to biological relevance (a bridge or goal gene sorting late
+in the alphabet, e.g. GSK3B or MAPT, could be dropped from a crowded
+frontier before its own outgoing edges were ever queried, undermining
+the whole point of the goal-gene-expansion fix above). This guarantees a
+scored gene is never dropped by the cap as long as the total scored-gene
+count doesn't itself exceed `_MAX_FRONTIER_SIZE`. It does NOT fully
+solve the underlying problem: the bulk of each frontier is still
+unscored bridge genes, and ties among those still break alphabetically
+-- an unscored bridge gene needed to reach a deeper target can still be
+dropped if it sorts late among the unscored majority.
 
-Complex nodes filtered, fixed 2026-09-14 (same real run): see
-omnipath_client.py's module docstring's "Complex nodes are dropped" note
--- a chain in that same real run routed through three OmniPath
-multi-protein complexes in a row (rendered as long underscore-joined
-pseudo gene symbols like "AKT1S1_DEPTOR_MLST8_MTOR_RPTOR"), which can
-never carry an Open Targets score, can't be confirmed by Agent 3, and
-render as confusing noise in the readable pathway output. OmniPathClient
-now drops any interaction where either end is a COMPLEX rather than a
-single gene, so BFS never sees them at all.
+`_MAX_FRONTIER_SIZE` raised from 300 to 3000, same day, per explicit
+user direction: real per-depth frontier sizes on a T2DM->AD run were
+599-3308 (depths 2-5) against the old 300-node cap -- as little as ~13%
+of a given depth's real graph was ever queried, meaning most of what
+biology actually connects the two diseases with was being silently
+discarded regardless of the truncation-priority fix above. The cap
+existed partly out of a (reasonable at the time) concern about OmniPath
+request size/runtime with one big query string; that concern is now
+handled separately -- see omnipath_client.py's `get_outgoing_interactions`
+batching note -- so the cap no longer needs to stay this low for that
+reason. 3000 comfortably clears both real depth-2/3 frontiers observed
+so far without removing the safety net entirely (an actually-unbounded
+frontier risks runaway growth at depth 4-5 on a dense graph, especially
+with `omnipath_datasets="extended"`). Still genuinely untested at this
+new size from this network-blocked sandbox -- if real runs keep hitting
+even this cap, raising it further is a reasonable next step, watching
+for OmniPath request/runtime issues as the signal to stop.
+
+Complex nodes: tried filtering them out the same day (they can't carry
+an Open Targets score, can't be confirmed by Agent 3, and rendered as
+confusing long strings), then reverted per explicit direction -- see
+omnipath_client.py's module docstring's "Complex nodes are kept" note
+and claude/open_issues_for_committee.md. BFS sees them again as ordinary
+edges (their "gene" is just never a `goal_genes` member, so they can
+only ever be bridge hops, same as before this note was added).
 """
 import argparse
 import json
@@ -266,7 +264,7 @@ from PipelineB.pubmed_client import Citation
 
 DEFAULT_MAX_HOPS = 5
 DEFAULT_MAX_CANDIDATE_PATHS = 10
-_MAX_FRONTIER_SIZE = 300  # safety cap per BFS layer; see module docstring
+_MAX_FRONTIER_SIZE = 3000  # safety cap per BFS layer; see module docstring's "_MAX_FRONTIER_SIZE raised" note
 
 
 @dataclass

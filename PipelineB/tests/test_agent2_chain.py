@@ -346,19 +346,22 @@ def test_bfs_does_not_stop_exploring_once_max_paths_shallow_hits_are_found():
 def test_frontier_truncation_protects_disease_scored_genes_over_alphabetical_order():
     """Regression test for a real bug, fixed 2026-09-14 (see agent2_chain.py's
     module docstring, "Frontier truncation prioritized"): a real run showed
-    per-depth frontiers of 599-2387 nodes against the 300-node safety cap, and
-    the old truncation kept only the alphabetically-first 300 -- a real,
-    silent sampling bias with no relation to biological relevance. A gene like
-    "ZZZGOAL" (disease-associated, but sorting near the end of the alphabet)
-    could be dropped from a crowded frontier before its own outgoing edges
-    were ever queried, even though continuing past it was exactly the point
-    of the goal-gene-expansion fix. Here ZZZGOAL is reachable at depth 1
-    alongside 350 unscored bridge genes that all sort before it -- enough to
-    blow well past the 300-node cap -- and "DEEPER_GOAL" is reachable only
-    through ZZZGOAL's own depth-2 outgoing edge. DEEPER_GOAL must still be
-    found, proving ZZZGOAL survived truncation despite its alphabetical
-    position."""
-    bridge_genes = [f"BRIDGE{i:04d}" for i in range(350)]
+    per-depth frontiers of 599-3308 nodes against the safety cap in effect at
+    the time, and the old truncation kept only the alphabetically-first N --
+    a real, silent sampling bias with no relation to biological relevance. A
+    gene like "ZZZGOAL" (disease-associated, but sorting near the end of the
+    alphabet) could be dropped from a crowded frontier before its own
+    outgoing edges were ever queried, even though continuing past it was
+    exactly the point of the goal-gene-expansion fix. Here ZZZGOAL is
+    reachable at depth 1 alongside more unscored bridge genes than
+    `_MAX_FRONTIER_SIZE` allows (enough to force truncation regardless of the
+    current cap value) that all sort before it, and "DEEPER_GOAL" is
+    reachable only through ZZZGOAL's own depth-2 outgoing edge. DEEPER_GOAL
+    must still be found, proving ZZZGOAL survived truncation despite its
+    alphabetical position."""
+    from PipelineB.agent2_chain import _MAX_FRONTIER_SIZE
+
+    bridge_genes = [f"BRIDGE{i:06d}" for i in range(_MAX_FRONTIER_SIZE + 50)]
     agent1_result = _agent1_result(
         disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
         disease2_targets=[
