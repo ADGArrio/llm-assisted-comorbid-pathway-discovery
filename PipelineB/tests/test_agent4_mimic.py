@@ -40,7 +40,7 @@ def test_zero_disease2_base_rate_returns_none_relative_risk_not_a_crash():
 
 def test_missing_icd_mapping_raises_value_error():
     stub = StubMimicClient({"__all__": set()})
-    with pytest.raises(ValueError, match="No ICD-10 prefix mapping"):
+    with pytest.raises(ValueError, match="No ICD prefix mapping"):
         run_agent4_mimic("Some Unmapped Disease", DISEASE2, mimic_client=stub)
 
 

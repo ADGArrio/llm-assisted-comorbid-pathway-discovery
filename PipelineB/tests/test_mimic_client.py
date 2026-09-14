@@ -13,11 +13,12 @@ DIAGNOSES_CSV = """subject_id,hadm_id,seq_num,icd_code,icd_version
 4,103,1,25000,9
 5,104,1,I2510,10
 """
-# subject 1: T2DM (E119) + CAD (I2510) -- both
-# subject 2: T2DM only
-# subject 3: AD only (G309)
-# subject 4: icd9-only legacy code, no icd10 diagnosis at all -- still part of "__all__"
-# subject 5: CAD only
+# subject 1: T2DM (E119, ICD-10) + CAD (I2510, ICD-10) -- both
+# subject 2: T2DM only (E119, ICD-10)
+# subject 3: AD only (G309, ICD-10)
+# subject 4: T2DM, but coded under the legacy ICD-9 system (25000, Type II unspecified) -- no
+#            ICD-10 diagnosis at all; only counted for T2DM once ICD-9 prefixes are supplied
+# subject 5: CAD only (I2510, ICD-10)
 
 
 @pytest.fixture
@@ -34,16 +35,26 @@ def test_compute_cohort_sets_from_a_real_small_gzipped_csv(mimic_data_dir):
 
     sets = client.compute_cohort_sets(
         {
-            "Type 2 Diabetes Mellitus": ["E11"],
-            "Coronary Artery Disease": ["I25"],
-            "Alzheimer's Disease": ["G30"],
+            "Type 2 Diabetes Mellitus": {"9": ["2500"], "10": ["E11"]},
+            "Coronary Artery Disease": {"9": [], "10": ["I25"]},
+            "Alzheimer's Disease": {"9": [], "10": ["G30"]},
         }
     )
 
-    assert sets["Type 2 Diabetes Mellitus"] == {"1", "2"}
+    assert sets["Type 2 Diabetes Mellitus"] == {"1", "2", "4"}  # subject 4 now matched via ICD-9 "2500"
     assert sets["Coronary Artery Disease"] == {"1", "5"}
     assert sets["Alzheimer's Disease"] == {"3"}
-    assert sets["__all__"] == {"1", "2", "3", "4", "5"}  # subject 4's icd9-only row still counts
+    assert sets["__all__"] == {"1", "2", "3", "4", "5"}
+
+
+def test_icd9_and_icd10_prefixes_are_matched_only_against_their_own_version(mimic_data_dir):
+    # subject 4's code (25000, icd_version=9) must NOT match an icd_version=10 prefix list,
+    # even if the prefix string would otherwise overlap -- versions are matched independently.
+    client = MimicClient(data_dir=mimic_data_dir, chunk_size=2)
+
+    sets = client.compute_cohort_sets({"Type 2 Diabetes Mellitus": {"9": [], "10": ["E11"]}})
+
+    assert sets["Type 2 Diabetes Mellitus"] == {"1", "2"}  # subject 4 excluded: no icd9 prefixes supplied
 
 
 def test_missing_mimic_data_dir_raises_clear_error(monkeypatch):
@@ -55,7 +66,7 @@ def test_missing_mimic_data_dir_raises_clear_error(monkeypatch):
 def test_stub_client_returns_configured_sets_without_file_io():
     stub = StubMimicClient({"__all__": {"1", "2"}, "Type 2 Diabetes Mellitus": {"1"}})
 
-    result = stub.compute_cohort_sets({"Type 2 Diabetes Mellitus": ["E11"]})
+    result = stub.compute_cohort_sets({"Type 2 Diabetes Mellitus": {"9": [], "10": ["E11"]}})
 
     assert result == {"__all__": {"1", "2"}, "Type 2 Diabetes Mellitus": {"1"}}
-    assert stub.calls == [{"Type 2 Diabetes Mellitus": ["E11"]}]
+    assert stub.calls == [{"Type 2 Diabetes Mellitus": {"9": [], "10": ["E11"]}}]

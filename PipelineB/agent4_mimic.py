@@ -25,7 +25,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
-from common.config import DISEASE_ICD10_PREFIXES, DISEASE_PAIRS, get_pair
+from common.config import DISEASE_ICD_PREFIXES, DISEASE_PAIRS, get_pair
 from PipelineB.mimic_client import MimicClient
 
 
@@ -58,12 +58,12 @@ class MimicCohortResult:
 def run_agent4_mimic(disease1: str, disease2: str, mimic_client: Optional[object] = None) -> MimicCohortResult:
     # Input: two disease names, optional client (defaults to real MimicClient(), needs
     # MIMIC_DATA_DIR in .env; pass StubMimicClient in tests). Output: MimicCohortResult.
-    prefixes1 = DISEASE_ICD10_PREFIXES.get(disease1)
-    prefixes2 = DISEASE_ICD10_PREFIXES.get(disease2)
+    prefixes1 = DISEASE_ICD_PREFIXES.get(disease1)
+    prefixes2 = DISEASE_ICD_PREFIXES.get(disease2)
     if not prefixes1:
-        raise ValueError(f"No ICD-10 prefix mapping for {disease1!r} in common/config.py's DISEASE_ICD10_PREFIXES.")
+        raise ValueError(f"No ICD prefix mapping for {disease1!r} in common/config.py's DISEASE_ICD_PREFIXES.")
     if not prefixes2:
-        raise ValueError(f"No ICD-10 prefix mapping for {disease2!r} in common/config.py's DISEASE_ICD10_PREFIXES.")
+        raise ValueError(f"No ICD prefix mapping for {disease2!r} in common/config.py's DISEASE_ICD_PREFIXES.")
 
     mimic_client = mimic_client or MimicClient()
     sets = mimic_client.compute_cohort_sets({disease1: prefixes1, disease2: prefixes2})
