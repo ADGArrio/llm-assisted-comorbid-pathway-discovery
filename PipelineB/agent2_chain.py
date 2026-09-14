@@ -32,11 +32,39 @@ visited) -- affects which specific path is reported through a shared
 node, not whether the shortest depth is found. `_MAX_FRONTIER_SIZE` caps
 nodes queried per BFS layer (logs a warning + truncates deterministically
 if exceeded) to keep request size/runtime bounded; a truncated node
-could in theory miss a legitimate longer path through it. Search stops
-per goal gene the first time that gene is reached (giving each goal its
-own shortest path, tracked via `found_targets`), and stops overall once
-`max_hops` is reached, the frontier is exhausted, or `max_paths` results
-are collected.
+could in theory miss a legitimate longer path through it. Each goal gene
+is only *recorded* once, the first time it's reached (giving each goal
+its own shortest path, tracked via `found_targets`) -- but the search
+now keeps expanding PAST a goal gene too (see "goal-gene expansion" note
+below), and stops overall once `max_hops` is reached, the frontier is
+exhausted, or `max_paths` results are collected.
+
+Goal-gene expansion, fixed 2026-09-14: a goal gene is any gene Open
+Targets independently scored >= min_score for disease2 (see
+opentargets_client.py) -- reaching one is a "hit" in the sense that it
+gets recorded as a found path, but a gene can clear that bar on its own
+while being a weak, generic, or upstream player, with a much more
+specific and well-characterized mechanism sitting one or two hops
+further down the exact same real edge chain. Concretely: on a real
+T2DM->AD run, INSR --activates--> PIK3R1 was a genuine 1-hop candidate
+(PIK3R1 is the real PI3K subunit and the literal textbook second step
+of the insulin-signaling->AD cascade) and PIK3R1 itself independently
+cleared Open Targets' AD-association threshold -- so the old code
+recorded that hit and, critically, never queried PIK3R1's own outgoing
+edges, meaning AKT1->GSK3B->MAPT(tau) -- the well-established, more
+disease-defining continuation of that exact pathway -- was never even
+attempted, regardless of `max_hops`. The old code enforced this by
+putting a goal-gene target into `found` and an `elif` that only added
+non-goal targets to `next_frontier`, so a goal-gene node could never be
+expanded past. Fixed by expanding EVERY newly-visited node regardless of
+goal-gene membership (only `visited` gates re-expansion now); a goal
+gene still gets exactly one recorded path (via `found_targets`, checked
+independently of expansion), but the search now also continues past it
+looking for other, possibly more specific, goal genes reachable deeper
+through it. This does not privilege longer chains over shorter ones --
+both the short hit and any longer one found by continuing past it are
+offered to the LLM as separate candidates, and `_SELECTION_PROMPT_TEMPLATE`
+explicitly tells it length is not a plausibility signal either way.
 
 BFS depth-exhaustion bug, fixed 2026-09-14: the loop used to also stop
 entirely the moment ANY goal gene was reached, even at depth 1, never
@@ -300,6 +328,8 @@ def _bfs_shortest_paths(
     # distinct goal gene reached (tracked via found_targets, so a goal already satisfied at a
     # shallower depth can't also be found again at a deeper one). A path's first and last node
     # are always genes; a metabolite (when metalinks_client is given) can only be a middle hop.
+    # Reaching a goal gene records it but does NOT stop the search from continuing past it --
+    # see the module docstring's "goal-gene expansion" note.
     visited = {("gene", g) for g in start_genes}
     found_targets: set = set()  # goal genes already given a path -- see module docstring's BFS note
     frontier: List[Tuple[Tuple[str, str], List[_RawEdge]]] = [(("gene", g), []) for g in start_genes]
@@ -338,16 +368,26 @@ def _bfs_shortest_paths(
             path = paths_by_node[node]
             for edge in by_source.get(node, []):
                 target_node = (edge.target_kind, edge.target_id)
-                if edge.target_kind == "gene" and edge.target_id in goal_genes:
-                    if edge.target_id in found_targets:
-                        continue  # already have this goal gene's (shorter or equal) shortest path
+                new_path = path + [edge]
+
+                if (
+                    edge.target_kind == "gene"
+                    and edge.target_id in goal_genes
+                    and edge.target_id not in found_targets
+                ):
                     found_targets.add(edge.target_id)
-                    found.append(path + [edge])
+                    found.append(new_path)
                     if len(found) >= max_paths:
                         return found
-                elif target_node not in visited:
+
+                # Keep exploring past this node regardless of whether it was just recorded as a
+                # goal gene -- a gene independently clearing Open Targets' disease2 threshold
+                # doesn't mean a more specific mechanism doesn't sit further down the same real
+                # chain (see the module docstring's "goal-gene expansion" note). Only `visited`
+                # gates re-expansion now, not goal-gene membership.
+                if target_node not in visited:
                     visited.add(target_node)
-                    next_frontier.append((target_node, path + [edge]))
+                    next_frontier.append((target_node, new_path))
         frontier = next_frontier
 
     return found

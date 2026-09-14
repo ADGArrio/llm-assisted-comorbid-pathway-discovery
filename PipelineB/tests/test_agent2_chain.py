@@ -407,6 +407,49 @@ def test_bfs_does_not_find_the_same_goal_gene_twice_at_different_depths():
     assert len(result.chains[0].edges) == 1
 
 
+def test_bfs_keeps_searching_past_a_goal_gene_for_a_more_specific_one_deeper():
+    """Regression test for a real bug, fixed 2026-09-14 (see agent2_chain.py's
+    module docstring, "Goal-gene expansion"): a gene can independently clear
+    Open Targets' disease2 threshold (a "hit") while being a weak, generic,
+    or upstream player -- with a much more specific, better-known mechanism
+    sitting one or two hops further down the exact same real chain. Modeled
+    directly on a real T2DM->AD run: INSR->PIK3R1 is a genuine 1-hop
+    candidate and PIK3R1 independently clears the AD threshold, but the
+    textbook continuation PIK3R1->AKT1->GSK3B->MAPT (MAPT = tau, also an AD
+    gene) must still be found by continuing the search past PIK3R1, not
+    abandoned just because PIK3R1 alone already counted as a hit."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("INSR", "ENSG_INSR", "P_INSR", 0.9)],
+        disease2_targets=[
+            GeneAssociation("PIK3R1", "ENSG_PIK3R1", "P_PIK3R1", 0.3),
+            GeneAssociation("MAPT", "ENSG_MAPT", "P_MAPT", 0.85),
+        ],
+    )
+    omnipath = StubOmniPathClient(
+        [
+            Interaction("INSR", "P_INSR", "PIK3R1", "P_PIK3R1", "activates", "INSR->PIK3R1"),
+            Interaction("PIK3R1", "P_PIK3R1", "AKT1", "P_AKT1", "activates", "PIK3R1->AKT1"),
+            Interaction("AKT1", "P_AKT1", "GSK3B", "P_GSK3B", "inhibits", "AKT1->GSK3B"),
+            Interaction("GSK3B", "P_GSK3B", "MAPT", "P_MAPT", "activates", "GSK3B->MAPT"),
+        ]
+    )
+    llm = StubLLMClient(
+        fixed_response=(
+            "1: PLAUSIBLE - INSR directly activates PIK3R1, the p85 regulatory subunit of PI3K.\n"
+            "2: PLAUSIBLE - The well-established insulin-signaling cascade through AKT1 and GSK3B "
+            "phosphorylating tau."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.candidate_path_count == 2
+    lengths = sorted(len(c.edges) for c in result.chains)
+    assert lengths == [1, 4]
+    long_chain = next(c for c in result.chains if len(c.edges) == 4)
+    assert [e.target_gene for e in long_chain.edges] == ["PIK3R1", "AKT1", "GSK3B", "MAPT"]
+
+
 def test_default_max_hops_is_five():
     from PipelineB.agent2_chain import DEFAULT_MAX_HOPS
 
