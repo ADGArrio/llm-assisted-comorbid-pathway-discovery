@@ -312,6 +312,128 @@ def test_gwas_client_stops_paginating_after_max_search_pages_even_with_more_avai
     assert results == []  # gave up, not stuck in a loop -- reaching this line at all is the test
 
 
+def test_gwas_client_follows_efo_traits_link_when_not_embedded(monkeypatch):
+    """Regression test for bug-fix #5 (see crossdb_client.py's module docstring): a live
+    diagnostic on IRS1's known T2DM SNP (rs2943641) found 32/32 real associations with an empty
+    efoTraits list -- the actual trait data lives at each association's own
+    `_links.efoTraits.href`, the same HAL "embed on request only" pattern bug-fix #1 already
+    found one level up (SNP -> associations). _parse_association must follow it."""
+    search_payload = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs2943641", "_links": {"associations": {"href": "https://api.example/snps/rs2943641/associations"}}}
+            ]
+        }
+    }
+    associations_payload = {
+        "_embedded": {
+            "associations": [
+                {"pvalue": 9e-12, "_links": {"efoTraits": {"href": "https://api.example/associations/13684/efoTraits"}}}
+            ]
+        }
+    }
+    efo_traits_payload = {
+        "_embedded": {"efoTraits": [{"trait": "type 2 diabetes mellitus", "shortForm": "MONDO_0005148"}]}
+    }
+
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            return _FakeResponse(search_payload)
+        if url.endswith("rs2943641/associations"):
+            return _FakeResponse(associations_payload)
+        assert url == "https://api.example/associations/13684/efoTraits"
+        return _FakeResponse(efo_traits_payload)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+
+    assert len(calls) == 3  # search + snp associations + efoTraits follow-up
+    assert len(results) == 1
+    assert results[0].trait_name == "type 2 diabetes mellitus"
+    assert results[0].efo_id == "MONDO_0005148"
+
+
+def test_gwas_client_stops_fetching_efo_traits_once_a_match_is_found(monkeypatch):
+    """A single busy SNP can have dozens of associations (rs2943641 had 32 in a live run) --
+    following every one's efoTraits link after already matching one would be pure waste, and a
+    real rate-limit risk (see bug-fix #3). Must stop as soon as one association matches."""
+    search_payload = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs1", "_links": {"associations": {"href": "https://api.example/snps/rs1/associations"}}}
+            ]
+        }
+    }
+    associations_payload = {
+        "_embedded": {
+            "associations": [
+                {"pvalue": 1e-10, "_links": {"efoTraits": {"href": "https://api.example/associations/1/efoTraits"}}},
+                {"pvalue": 1e-8, "_links": {"efoTraits": {"href": "https://api.example/associations/2/efoTraits"}}},
+            ]
+        }
+    }
+    match_traits = {"_embedded": {"efoTraits": [{"trait": "type 2 diabetes mellitus", "shortForm": "MONDO_0005148"}]}}
+
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            return _FakeResponse(search_payload)
+        if url.endswith("rs1/associations"):
+            return _FakeResponse(associations_payload)
+        assert url == "https://api.example/associations/1/efoTraits"  # association 2 must never be requested
+        return _FakeResponse(match_traits)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
+
+    assert len(calls) == 3  # search + snp associations + only the first association's efoTraits
+    assert len(results) == 1
+
+
+def test_gwas_client_flags_last_check_rate_limited_when_efo_traits_followup_exhausts_retries(monkeypatch):
+    """Same degradation philosophy as the SNP-level and search-level follow-ups (bug-fix #3):
+    if the efoTraits follow-up itself is still rate-limited after retries, that association is
+    treated as 'no match here', not an error, and the check is flagged possibly_incomplete."""
+    search_payload = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs1", "_links": {"associations": {"href": "https://api.example/snps/rs1/associations"}}}
+            ]
+        }
+    }
+    associations_payload = {
+        "_embedded": {
+            "associations": [
+                {"pvalue": 1e-10, "_links": {"efoTraits": {"href": "https://api.example/associations/1/efoTraits"}}}
+            ]
+        }
+    }
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            return _FakeResponse(search_payload)
+        if url.endswith("rs1/associations"):
+            return _FakeResponse(associations_payload)
+        return _FakeResponse({}, status_code=429)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
+
+    assert results == []
+    assert client.last_check_rate_limited is True
+
+
 def test_gwas_client_retries_429_and_succeeds(monkeypatch, _no_real_sleeping):
     """A single transient 429 must not fail the request -- retry and use the second response."""
     search_payload = {"_embedded": {"singleNucleotidePolymorphisms": []}}

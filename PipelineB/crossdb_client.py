@@ -184,6 +184,56 @@ before without modification.
 
 3 new tests (dedup within a page, pagination to a later page, and a safety cap on total pages
 walked), 117 passing (was 114).
+
+BUG FIX #5, 2026-09-14 (same day, right after bug-fix #4's pagination
+fix landed): the next full run -- confirmed via a fresh-process
+diagnostic to rule out a stale cached import, not a guess -- still came
+back 0/6, IRS1 x Type 2 Diabetes Mellitus included, with
+`last_check_rate_limited=False` (ruling out rate limiting too). A direct
+fetch of rs2943641's (IRS1's well-known T2DM SNP, see bug-fix #4)
+associations found 32 real associations -- and every single one showed
+`efoTraits: []` when read via this module's own `_trait_matches_disease`
+check. `efoTraits` is simply never embedded inline on a live association
+resource. This is the exact same HAL "embed on request only" pattern bug
+fix #1 already found and fixed one level up (SNP -> associations) -- it
+just turns out the pattern goes one level deeper than assumed. The
+original module docstring even said so explicitly: "the efoTraits/
+trait/shortForm parsing is kept as-is for an individual association
+resource, since that part of the schema is well documented and wasn't
+implicated by this bug." That assumption was wrong, and this is now
+directly proven: a user-run diagnostic followed one association's own
+`_links.efoTraits.href` (`.../associations/{id}/efoTraits`) and got back
+`{"_embedded": {"efoTraits": [{"trait": "type 2 diabetes mellitus",
+"shortForm": "MONDO_0005148", ...}]}}` -- the real trait data, one hop
+away from where this module was looking. (Also notable: this trait's
+`shortForm` is a MONDO accession, not an EFO one, despite the field name
+-- harmless here since the code only stores it as an opaque id string,
+never parses it as EFO-specific.)
+
+Fixed by making `_parse_association` follow `_links.efoTraits.href` when
+`efoTraits` isn't already present on the association dict (mirroring
+`_associations_for_snp`'s existing embed-or-follow-link pattern exactly)
+-- a test or a future response shape that already embeds `efoTraits`
+directly still works unchanged, since the follow-the-link branch only
+runs when the key is genuinely absent. This adds one more HTTP request
+per association actually examined, which matters: a single busy SNP can
+have dozens of associations (32 for rs2943641 alone), so
+`_associations_for_snp` now also stops iterating a SNP's own association
+list as soon as one match is found -- the same early-exit philosophy
+bug-fix #2 already applies across SNPs, now applied within one SNP's
+associations too, to avoid needlessly re-triggering the rate-limiting
+bug-fix #3 fixed.
+
+One known, deliberately deferred gap: a live association resource has no
+top-level `studyAccession` field (only an unfollowed `_links.study.href`
+pointer), so `GwasAssociation.study_accession` is always `None` in
+practice. Left alone since nothing downstream reads it yet (main.py's
+readable report only uses `trait_name`); follow that link too if a real
+future need for it surfaces.
+
+3 new tests (following the efoTraits link, stopping early once matched,
+and degrading gracefully if that follow-up is rate-limited), 120
+passing (was 117).
 """
 import os
 import time
@@ -384,13 +434,39 @@ class GWASCatalogClient:
         results: List[GwasAssociation] = []
         for assoc in raw_associations:
             results.extend(self._parse_association(assoc, gene_symbol, disease_name))
+            if results:
+                # One matching trait is enough -- stop paying for further per-association
+                # efoTraits follow-up requests for this SNP. A single busy SNP can have dozens
+                # of associations (rs2943641 had 32 in a live run) -- see bug-fix #5 note.
+                break
         return results
 
     def _parse_association(self, assoc: dict, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
         # Input: one association resource (embedded or fetched separately). Output: the
-        # GwasAssociation entries among its efoTraits that match disease_name.
+        # GwasAssociation entries among its efoTraits that match disease_name. `efoTraits` is
+        # NOT embedded inline on a live association resource -- see bug-fix #5 in the module
+        # docstring -- so this follows the association's own `_links.efoTraits.href` (same HAL
+        # "embed on request only" pattern as _associations_for_snp above) unless a test or some
+        # other shape already provides it directly.
+        raw_efo_traits = assoc.get("efoTraits")
+        if raw_efo_traits is None:
+            href = assoc.get("_links", {}).get("efoTraits", {}).get("href")
+            if not href:
+                return []
+            resp = self._get(href)
+            if resp.status_code == 429:
+                print(
+                    f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries following "
+                    f"{href} -- skipping this association's traits.",
+                    flush=True,
+                )
+                self.last_check_rate_limited = True
+                return []
+            resp.raise_for_status()
+            raw_efo_traits = resp.json().get("_embedded", {}).get("efoTraits", [])
+
         results: List[GwasAssociation] = []
-        for efo_trait in assoc.get("efoTraits", []):
+        for efo_trait in raw_efo_traits:
             trait_name = efo_trait.get("trait", "")
             if not _trait_matches_disease(trait_name, disease_name):
                 continue
@@ -400,6 +476,11 @@ class GWASCatalogClient:
                     trait_name=trait_name,
                     efo_id=efo_trait.get("shortForm"),
                     pvalue=assoc.get("pvalue"),
+                    # NOTE: a live association resource has no top-level "studyAccession" field
+                    # (only a `_links.study.href` pointer, never followed) -- this is always None
+                    # in practice. Left as a known gap since nothing downstream (main.py's
+                    # readable report, agent3_confirmation.py) reads it yet; follow that link too
+                    # if a future need actually surfaces this field.
                     study_accession=assoc.get("studyAccession"),
                 )
             )
