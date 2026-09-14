@@ -54,8 +54,23 @@ def run_pipeline_a_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2) 
     return data
 
 
+def show_narrative(data: dict) -> None:
+    """Renders a pipeline-A-shaped result's narrative as actual formatted
+    Markdown (headers, bold, arrows) instead of a raw Python dict repr --
+    the LLM writes real Markdown/LaTeX (###, **bold**, $\\rightarrow$),
+    which just shows up as literal syntax if you print the dict directly.
+    Falls back to plain print outside a notebook/IPython context."""
+    header = f"### {data['disease1']} → {data['disease2']}"
+    try:
+        from IPython.display import Markdown, display
+        display(Markdown(f"{header}\n\n{data['narrative']}"))
+    except ImportError:
+        print(f"{data['disease1']} -> {data['disease2']}\n")
+        print(data["narrative"])
+
+
 pipeline_a_output = run_pipeline_a_and_save()
-pipeline_a_output
+show_narrative(pipeline_a_output)
 
 
 # %% Pipeline B -- Agent 1 (Discovery)
@@ -136,34 +151,64 @@ pipeline_b_output
 
 
 # %% Side-by-side comparison: Pipeline A output vs. Pipeline B output
+def _narrative_to_html(narrative: str) -> str:
+    """Small, dependency-free Markdown-ish -> HTML conversion for an LLM
+    narrative -- just enough of the subset these prompts actually produce
+    (###/## headers, **bold**, $\\rightarrow$/\\rightarrow arrows, ---
+    rules, paragraph breaks) to make it readable in a raw HTML display,
+    instead of one escaped JSON string with literal \\n and ** in it.
+    Escapes the raw text first, then applies these substitutions, so any
+    stray '<'/'&' in the narrative itself renders safely."""
+    import re
+    import html as html_lib
+
+    text = html_lib.escape(narrative)
+    text = text.replace(r"$\rightarrow$", " → ").replace(r"\rightarrow", " → ")
+    text = re.sub(r"^### (.+)$", r"<h4>\1</h4>", text, flags=re.MULTILINE)
+    text = re.sub(r"^## (.+)$", r"<h3>\1</h3>", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"^---$", "<hr>", text, flags=re.MULTILINE)
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    return "".join(b if b.startswith(("<h", "<hr")) else f"<p>{b}</p>" for b in blocks)
+
+
 def show_side_by_side(a_data: dict, b_data: dict) -> None:
-    """Renders Pipeline A's output and Pipeline B's output as two columns.
-    In VS Code's Interactive Window this displays as a real two-pane view;
-    falls back to plain sequential printing outside a notebook/IPython context."""
-    a_text = json.dumps(a_data, indent=2)
+    """Renders Pipeline A's narrative (formatted, not raw JSON) and
+    Pipeline B's structured output (JSON -- it's nested chain/agent data,
+    not prose, so JSON is already the readable form) as two columns. In
+    VS Code's Interactive Window this displays as a real two-pane view;
+    falls back to plain sequential printing outside a notebook/IPython
+    context."""
     b_text = json.dumps(b_data, indent=2)
 
     try:
         from IPython.display import HTML, display
         import html as html_lib
 
+        a_html = _narrative_to_html(a_data.get("narrative", ""))
+        subtitle = f"{html_lib.escape(a_data.get('disease1', ''))} → {html_lib.escape(a_data.get('disease2', ''))}"
+
         display(HTML(f"""
-        <div style="display:flex; gap:16px; font-family:monospace; font-size:12px;">
+        <div style="display:flex; gap:16px; font-family:sans-serif; font-size:13px;">
           <div style="flex:1; min-width:0;">
             <h3>Pipeline A -- Orphaned LLM</h3>
-            <pre style="white-space:pre-wrap; background:#f5f5f5; color:#111; padding:8px;
-                        border-radius:6px; max-height:600px; overflow:auto;">{html_lib.escape(a_text)}</pre>
+            <div style="background:#f5f5f5; color:#111; padding:12px; border-radius:6px;
+                        max-height:600px; overflow:auto; line-height:1.5;">
+              <p><em>{subtitle}</em></p>
+              {a_html}
+            </div>
           </div>
           <div style="flex:1; min-width:0;">
             <h3>Pipeline B -- Grounded Multi-Agent</h3>
             <pre style="white-space:pre-wrap; background:#f5f5f5; color:#111; padding:8px;
-                        border-radius:6px; max-height:600px; overflow:auto;">{html_lib.escape(b_text)}</pre>
+                        border-radius:6px; max-height:600px; overflow:auto; font-family:monospace;">{html_lib.escape(b_text)}</pre>
           </div>
         </div>
         """))
     except ImportError:
         print("=" * 30, "PIPELINE A", "=" * 30)
-        print(a_text)
+        print(f"{a_data.get('disease1')} -> {a_data.get('disease2')}\n")
+        print(a_data.get("narrative", ""))
         print("=" * 30, "PIPELINE B", "=" * 30)
         print(b_text)
 

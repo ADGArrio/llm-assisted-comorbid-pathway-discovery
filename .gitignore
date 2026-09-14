@@ -9,3 +9,6 @@ __pycache__/
 # local virtual environment
 .venv/
 venv/
+
+# main.py run output -- regenerated per run, not source
+outputs/
