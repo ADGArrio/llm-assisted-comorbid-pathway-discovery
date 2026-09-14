@@ -296,6 +296,56 @@ def test_multi_hop_path_found_when_no_direct_edge_exists():
     assert edges[1].source_disease_assoc_score is None  # MID has no disease1 score
 
 
+def test_bfs_continues_past_first_successful_depth_to_find_other_goals_deeper():
+    """Regression test for a real bug, fixed 2026-09-14 (see
+    agent2_chain.py's module docstring, "BFS depth-exhaustion bug"): the
+    search used to stop the moment ANY goal gene was reached, even at
+    depth 1, so a different goal gene only reachable at depth 2+ was
+    silently never found -- regardless of max_hops. Here A->X is a real
+    depth-1 edge, and B->MID->Y is a real depth-2 path to a *different*
+    goal gene; both must show up as candidates."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6), GeneAssociation("B", "ENSGB", "PB", 0.5)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8), GeneAssociation("Y", "ENSGY", "PY", 0.7)],
+    )
+    omnipath = StubOmniPathClient(
+        [
+            Interaction("A", "PA", "X", "PX", "activates", "PA->PX"),  # depth 1: reaches goal X
+            Interaction("B", "PB", "MID", "PM", "activates", "PB->PM"),  # depth 1: bridge, not a goal
+            Interaction("MID", "PM", "Y", "PY", "inhibits", "PM->PY"),  # depth 2: reaches goal Y
+        ]
+    )
+    llm = StubLLMClient(fixed_response="1: A directly activates X via a well-characterized cascade.")
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.candidate_path_count == 2
+    assert "1. A --activates--> X" in llm.last_prompt
+    assert "B --activates--> MID -> MID --inhibits--> Y" in llm.last_prompt
+
+
+def test_bfs_does_not_find_the_same_goal_gene_twice_at_different_depths():
+    """A goal gene reached at depth 1 must not also show up as a second,
+    longer candidate if a deeper route to that same gene also exists --
+    found_targets should keep only its first (shortest) path."""
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=[GeneAssociation("X", "ENSGX", "PX", 0.8)],
+    )
+    omnipath = StubOmniPathClient(
+        [
+            Interaction("A", "PA", "X", "PX", "activates", "PA->PX"),  # depth 1: direct hit on X
+            Interaction("A", "PA", "MID", "PM", "activates", "PA->PM"),  # depth 1: bridge
+            Interaction("MID", "PM", "X", "PX", "inhibits", "PM->PX"),  # depth 2: a LONGER route to the same X
+        ]
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=RaisingLLMClient())
+
+    assert result.candidate_path_count == 1
+    assert len(result.chains[0].edges) == 1
+
+
 def test_default_max_hops_is_five():
     from PipelineB.agent2_chain import DEFAULT_MAX_HOPS
 

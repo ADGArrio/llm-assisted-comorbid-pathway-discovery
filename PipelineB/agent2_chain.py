@@ -32,7 +32,28 @@ visited) -- affects which specific path is reported through a shared
 node, not whether the shortest depth is found. `_MAX_FRONTIER_SIZE` caps
 nodes queried per BFS layer (logs a warning + truncates deterministically
 if exceeded) to keep request size/runtime bounded; a truncated node
-could in theory miss a legitimate longer path through it.
+could in theory miss a legitimate longer path through it. Search stops
+per goal gene the first time that gene is reached (giving each goal its
+own shortest path, tracked via `found_targets`), and stops overall once
+`max_hops` is reached, the frontier is exhausted, or `max_paths` results
+are collected.
+
+BFS depth-exhaustion bug, fixed 2026-09-14: the loop used to also stop
+entirely the moment ANY goal gene was reached, even at depth 1, never
+proceeding to depth 2+ to look for other goal genes only reachable
+deeper -- regardless of `max_hops`. A real T2DM->AD run surfaced this:
+Agent 1's gene pools happened to have several disease2 genes one
+generic, uncurated-direction OmniPath interaction away from a disease1
+gene (e.g. INSR -unknown-> AXL/ATP1A1/CLTC/NEU1/PIKFYVE), so BFS reported
+those 6 depth-1 candidates and quit, never even attempting depth 2-5
+where a more specific, better-supported mechanism might connect other
+gene pairs. Fixed by only skipping *already-satisfied* goal genes
+(`found_targets`) rather than halting the whole search on first success,
+so a deeper, more specific candidate to a *different* goal gene now gets
+a chance to be found too, up to `max_hops`/`max_paths`. This does not
+remove the shallow candidates (they're often real edges, just weakly
+characterized) -- it adds better ones alongside them for the LLM to
+actually choose between. See claude/agent2_bfs_and_prompt_recalibration.md.
 
 DEFAULT_MAX_HOPS = 5: deep enough to usually surface more than one
 candidate for the LLM to actually adjudicate between, per a real
@@ -55,22 +76,35 @@ so an empty `chains` list isn't a dead end -- `Agent2ChainResult.rejection_reaso
 carries that sentence (None if the LLM gave a bare "NONE" with no reason,
 which is tolerated rather than treated as a formatting error).
 
-Plausibility bar loosened (2026-09-14, same day): the original bar required
-a specific, named mechanism for every single hop, which was rejecting all
-10 candidates outright on real T2DM->AD runs (see
-claude/agent2_findings_maxhops10_run.md and the repeated
-candidate_path_count=10/chains=[] results that prompted this change). The
-bar is now whether the chain as a whole tells a coherent biological story --
-an individual step can be justified by general biological reasoning (shared
-pathway membership, an established broad functional relationship, a
-plausible indirect role) rather than a fully specified named mechanism, as
-long as the LLM says explicitly when a step is on that weaker footing. A
-chain is still rejected if it requires a genuine, unsupported logical leap,
-and the LLM still never invents edges/genes/metabolites -- it only judges
-the real candidates BFS found. `claude/possible_metrics.md` has the
-(separate, not-yet-built) plan to eventually compare this lenient default
-against a stricter variant as a metric; this change is not that experiment,
-it's a direct change to the one production prompt.
+Plausibility bar loosened, then recalibrated (both 2026-09-14): the
+original bar required a specific, named mechanism for every single hop,
+which was rejecting all 10 candidates outright on real T2DM->AD runs (see
+claude/agent2_findings_maxhops10_run.md). Loosening it to "a coherent
+overall story, general reasoning is enough per hop" over-corrected: on
+the very next real run it endorsed all 6 depth-1, uncurated-direction
+candidates from the BFS bug above with near-identical templated
+rationale text -- effectively the same 100%-acceptance,
+no-real-discrimination failure mode already documented in
+claude/agent2_findings_maxhops10_run.md's Finding 1, just reproduced
+under a different prompt. The bar is now hop-count-tiered: a single-hop
+candidate (the whole "chain" is one interaction) must have a specific,
+real, named mechanism to be endorsed -- "these proteins are known to
+interact" / a bare database edge is not enough on its own, which is
+exactly what the BFS bug's depth-1 junk was. A multi-hop candidate only
+needs ONE of its hops to have a specific, named mechanism; the rest may
+rest on general biological reasoning if the LLM says so explicitly.
+Rationale: a single unqualified interaction has no internal structure to
+lean on, so it needs to clear the high bar on its own; a real multi-step
+mechanism can have a genuinely strong anchor hop plus weaker-but-plausible
+supporting hops, which is a different (more defensible) thing than a
+lone guess. See claude/agent2_bfs_and_prompt_recalibration.md for the
+full diagnosis (this is the second time this same local model has
+defaulted to near-0% or near-100% acceptance depending on prompt
+wording, worth flagging honestly in the thesis methods/limitations
+section). `claude/possible_metrics.md` separately tracks the
+not-yet-built plan to compare strict/lenient variants as a metric --
+this recalibration is a direct change to the one production prompt, not
+that experiment.
 """
 import argparse
 import json
@@ -244,14 +278,17 @@ def _bfs_shortest_paths(
 ) -> List[List[_RawEdge]]:
     # Input: OmniPath client, MetalinksDB client (None = protein-only search, no metabolite hops),
     # start gene pool, goal gene set, hop limit, max paths to collect.
-    # Output: shortest paths (each a list of _RawEdge, >= 1 edge long). A path's first and last
-    # node are always genes; a metabolite (when metalinks_client is given) can only be a middle hop.
+    # Output: shortest paths (each a list of _RawEdge, >= 1 edge long) -- one shortest path per
+    # distinct goal gene reached (tracked via found_targets, so a goal already satisfied at a
+    # shallower depth can't also be found again at a deeper one). A path's first and last node
+    # are always genes; a metabolite (when metalinks_client is given) can only be a middle hop.
     visited = {("gene", g) for g in start_genes}
+    found_targets: set = set()  # goal genes already given a path -- see module docstring's BFS note
     frontier: List[Tuple[Tuple[str, str], List[_RawEdge]]] = [(("gene", g), []) for g in start_genes]
     found: List[List[_RawEdge]] = []
     depth = 0
 
-    while frontier and depth < max_hops and not found:
+    while frontier and depth < max_hops and len(found) < max_paths:
         depth += 1
 
         if len(frontier) > _MAX_FRONTIER_SIZE:
@@ -284,6 +321,9 @@ def _bfs_shortest_paths(
             for edge in by_source.get(node, []):
                 target_node = (edge.target_kind, edge.target_id)
                 if edge.target_kind == "gene" and edge.target_id in goal_genes:
+                    if edge.target_id in found_targets:
+                        continue  # already have this goal gene's (shorter or equal) shortest path
+                    found_targets.add(edge.target_id)
                     found.append(path + [edge])
                     if len(found) >= max_paths:
                         return found
@@ -322,8 +362,9 @@ _SELECTION_PROMPT_TEMPLATE = """You are a biomedical researcher evaluating sever
 molecular pathways, all independently confirmed to exist in real interaction databases \
 (OmniPath for protein-protein steps, MetalinksDB for gene<->metabolite steps -- a step written \
 as "[metabolite] <name>" is a small-molecule metabolite, not a protein). Each pathway links a \
-protein associated with {disease1} to a protein associated with {disease2}, through the same \
-number of intermediate steps.
+protein associated with {disease1} to a protein associated with {disease2}. Candidates can have \
+different numbers of intermediate steps -- a shorter candidate is not automatically better than a \
+longer one; judge each one on the evidence for it, not on its length.
 
 Some genes below have supporting literature citations; use them as evidence where available. \
 Where none are listed for a gene, rely on your own domain knowledge of it -- but if you are not \
@@ -340,23 +381,29 @@ be read as tentative.
 
 {candidates_text}
 
-A candidate is biologically plausible if, taken as a whole, it describes a coherent biological \
-story connecting {disease1} to {disease2} -- you do NOT need a fully specified, named mechanism \
-for every single step to endorse it. General biological reasoning is enough for an individual \
-step: shared pathway membership, a well-established broad functional relationship, or a \
-plausible indirect role for a gene/metabolite in the relevant biology all count, as long as you \
-say so plainly when a step is on that weaker footing (e.g. "the direct mechanism between X and Y \
-isn't fully specified here, but both are established players in cholesterol trafficking"). \
-Reject a candidate only if it requires a genuine, unsupported logical leap -- a step with no \
-known or reasonably inferable relationship at all between its endpoints, even at a general \
-pathway level. It's still fine, and expected, for some candidates to be rejected on that basis; \
-do not endorse a candidate just because it is structurally present in the list, and do not \
-invent any new steps, genes, or metabolites -- judge only the candidates given.
+How plausible a candidate needs to be depends on how many steps it has:
+
+- A SINGLE-STEP candidate (just one interaction, directly linking the two proteins) must have a \
+SPECIFIC, real, named mechanism for you to endorse it (e.g. "X phosphorylates Y, activating Y's \
+kinase activity" or "X converts to metabolite Y via enzyme Z") -- "these are known to interact" \
+or "this edge exists in a database" is NOT enough on its own. A single unqualified interaction \
+has no other structure to lean on, so it has to clear this bar by itself.
+- A MULTI-STEP candidate (two or more interactions) needs at least ONE of its steps to have a \
+specific, named mechanism you can state confidently. The other step(s) may rest on general \
+biological reasoning instead (shared pathway membership, a well-established broad functional \
+relationship, a plausible indirect role) as long as you say so plainly when a step is on that \
+weaker footing (e.g. "the direct mechanism between X and Y isn't fully specified here, but both \
+are established players in cholesterol trafficking"). Reject it if none of its steps has a real, \
+specific mechanism, or if a step requires a genuine, unsupported logical leap.
+
+Either way, it's expected and fine for some or all candidates to be rejected -- do not endorse a \
+candidate just because it is structurally present in the list, and do not invent any new steps, \
+genes, or metabolites; judge only the candidates given.
 
 Respond with exactly one line per plausible candidate, in this format:
-<candidate number>: <one-sentence rationale for the chain overall, noting explicitly which \
-steps (if any) rest on general reasoning rather than a fully specified mechanism, and any \
-UNKNOWN DIRECTION caveat>
+<candidate number>: <one-sentence rationale naming which step(s) have a specific mechanism, \
+noting explicitly any step that instead rests on general reasoning, and any UNKNOWN DIRECTION \
+caveat>
 
 If none of the candidates are plausible, respond with a single line starting with the word NONE, \
 followed by a colon and one sentence explaining what was missing or unconvincing across the \
