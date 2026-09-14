@@ -47,6 +47,186 @@ def save_json(data: dict, filename: str) -> Path:
     return path
 
 
+# %% Readable output formatting -- turns raw result dicts into plain text
+# (disease1 -> gene1 --activates--> gene2 -> ... -> disease2, plus
+# rationale and confirmation summaries) instead of raw JSON/dict dumps.
+# Defined early (before any agent runs) since run_pipeline_b_and_save's
+# cell below prints through pipeline_b_report immediately after running.
+def _format_chain_pathway(chain: dict, disease1: str = None, disease2: str = None) -> str:
+    """One endorsed Agent 2 chain (a ChainCandidate.to_dict()) as a single
+    arrow-diagram line, e.g. 'APOE --activates--> [metabolite] Cholesterol
+    --produces--> ABCA1' -- the mechanistic pathway itself, without the
+    edge ids/disease-assoc-scores/hmdb ids that only matter for the saved
+    JSON, not for reading it. Pass disease1/disease2 to bookend the line
+    with the two diseases the chain is actually claiming to connect, e.g.
+    'Type 2 Diabetes Mellitus -> IRS1 --activates--> MAPK8 -> Alzheimer's
+    Disease' -- the full claim, not just the gene-to-gene middle."""
+    edges = chain["edges"]
+
+    def node(kind: str, name: str) -> str:
+        return f"[metabolite] {name}" if kind == "metabolite" else name
+
+    parts = [node(edges[0]["source_kind"], edges[0]["source_gene"])]
+    for edge in edges:
+        parts.append(f'--{edge["interaction_type"]}-->')
+        parts.append(node(edge["target_kind"], edge["target_gene"]))
+    pathway = " ".join(parts)
+    if disease1 and disease2:
+        return f"{disease1} -> {pathway} -> {disease2}"
+    return pathway
+
+
+def _format_confirmation_summary(confirmation: dict) -> str:
+    """One chain's Agent 3 result (an Agent3ConfirmationResult.to_dict())
+    as plain-language sentences -- which genes were confirmed expressed
+    in disease-relevant tissue (GTEx) and which endpoint genes have real
+    GWAS Catalog hits for their disease -- instead of the full per-tissue/
+    per-SNP JSON array, which is still saved to outputs/ but is not what
+    you want to read at a glance. 'No GTEx/GWAS record' is real negative
+    evidence, not proof the chain is wrong -- see agent3_confirmation.py's
+    module docstring -- so this reports counts and specifics rather than
+    a single pass/fail verdict."""
+    tissue_checks = confirmation.get("tissue_checks") or []
+    expressed = [t for t in tissue_checks if t.get("expressed") is True]
+    no_record = [t for t in tissue_checks if t.get("source") == "none"]
+
+    lines = [f"Tissue expression (GTEx): {len(expressed)}/{len(tissue_checks)} gene/tissue checks confirmed expressed."]
+    if expressed:
+        lines.append("  Expressed: " + ", ".join(f"{t['gene_symbol']} in {t['tissue']}" for t in expressed))
+    if no_record:
+        genes_with_no_record = sorted({t["gene_symbol"] for t in no_record})
+        lines.append(f"  No GTEx record at all for: {', '.join(genes_with_no_record)}")
+
+    lines.append("GWAS Catalog endpoint check:")
+    for e in confirmation.get("endpoint_checks") or []:
+        if e.get("confirmed"):
+            traits = ", ".join(sorted({a["trait_name"] for a in e.get("gwas_associations", [])}))
+            lines.append(f"  {e['gene_symbol']} confirmed for {e['disease_name']} ({traits})")
+        else:
+            lines.append(f"  {e['gene_symbol']}: no GWAS Catalog hit for {e['disease_name']}")
+
+    metabolites = confirmation.get("chain_metabolites") or []
+    if metabolites:
+        lines.append(f"  (metabolite hop(s) not tissue/GWAS-checked -- gene-centric only: {', '.join(metabolites)})")
+
+    return "\n".join(lines)
+
+
+def agent1_explanation(agent1_data: Optional[dict], top_n: int = 5) -> str:
+    """Agent 1's raw result dict (hundreds of scored genes per disease) as
+    one plain-language summary line per disease -- gene counts plus the
+    top few by Open Targets disease-association score -- instead of the
+    full nested target lists, which are still saved to outputs/ in full."""
+    if not agent1_data:
+        return ""
+
+    def top_genes(targets: list) -> str:
+        ranked = sorted(targets, key=lambda t: t.get("disease_assoc_score", 0.0), reverse=True)[:top_n]
+        return ", ".join(f"{t['gene_symbol']} ({t['disease_assoc_score']:.3f})" for t in ranked)
+
+    d1, d2 = agent1_data.get("disease1", ""), agent1_data.get("disease2", "")
+    d1_targets = agent1_data.get("disease1_targets") or []
+    d2_targets = agent1_data.get("disease2_targets") or []
+    return (
+        f"Agent 1 (Discovery): {len(d1_targets)} genes associated with {d1} "
+        f"(top {top_n}: {top_genes(d1_targets)}); {len(d2_targets)} genes associated with {d2} "
+        f"(top {top_n}: {top_genes(d2_targets)})."
+    )
+
+
+def agent4_explanation(agent4_data: Optional[dict]) -> str:
+    """Agent 4's raw result dict (an MimicCohortResult.to_dict()) as one
+    plain-language sentence -- the real-world MIMIC-IV comorbidity check,
+    independent of Agents 1-3 -- instead of the bare rate/count fields."""
+    if not agent4_data:
+        return ""
+
+    d1, d2 = agent4_data.get("disease1", ""), agent4_data.get("disease2", "")
+    rr = agent4_data.get("relative_risk")
+    rr_text = f"{rr:.2f}x" if rr is not None else "undefined (disease2 base rate is 0 in this cohort)"
+    return (
+        f"Agent 4 (MIMIC-IV Cohort Check): of {agent4_data.get('n_total_patients', 0):,} total patients, "
+        f"{agent4_data.get('n_disease1_patients', 0):,} had {d1}, {agent4_data.get('n_disease2_patients', 0):,} "
+        f"had {d2}, and {agent4_data.get('n_both_patients', 0):,} had both. Patients with {d1} had {d2} at a "
+        f"rate of {agent4_data.get('disease2_rate_in_disease1_cohort', 0.0):.2%}, vs. a base rate of "
+        f"{agent4_data.get('disease2_base_rate', 0.0):.2%} across the full cohort -- a relative risk of {rr_text}. "
+        f"(Crude, unadjusted co-occurrence -- no age/sex matching, no causal claim; see agent4_mimic.py.)"
+    )
+
+
+def agent2_explanation(
+    agent2_data: Optional[dict], disease1: str, disease2: str, agent3_data: Optional[list] = None
+) -> str:
+    """Turns Agent 2's raw result dict into the same kind of plain-language
+    explanation Pipeline A gives: the mechanistic pathway(s) it endorsed,
+    bookended by the two diseases themselves (disease1 -> gene1
+    --activates--> gene2 -> ... -> disease2), plus its rationale for each
+    -- or a direct statement of why it endorsed none -- instead of the
+    full nested JSON (edge ids, disease-assoc scores, hmdb ids, etc.),
+    which is still saved to outputs/ but isn't what you want to read at a
+    glance. Pass agent3_data (the list of Agent3ConfirmationResult dicts,
+    same order as agent2_data['chains']) to append each chain's tissue/
+    GWAS confirmation summary right under its pathway and rationale."""
+    if agent2_data is None:
+        return (
+            f"Agent 2 found no structural path at all connecting {disease1} to {disease2} "
+            f"within the max-hop search limit."
+        )
+
+    chains = agent2_data.get("chains") or []
+    if not chains:
+        reason = agent2_data.get("rejection_reason")
+        reason_text = f' Its stated reason: "{reason}"' if reason else " (no reason was given)."
+        return (
+            f"Agent 2 found {agent2_data.get('candidate_path_count', 0)} structurally real "
+            f"candidate pathway(s) connecting {disease1} to {disease2}, but did not judge any "
+            f"of them biologically plausible enough to endorse.{reason_text}"
+        )
+
+    blocks = []
+    for i, chain in enumerate(chains, start=1):
+        label = f"Pathway {i}" if len(chains) > 1 else "Pathway"
+        rationale = chain.get("rationale") or "(no rationale given)"
+        caveat = (
+            "\n(Note: at least one step's direction of effect is not confirmed by curated "
+            "evidence -- treat this pathway as tentative.)"
+            if chain.get("has_unconfirmed_direction")
+            else ""
+        )
+        block = f"{label}: {_format_chain_pathway(chain, disease1, disease2)}\n{rationale}{caveat}"
+        if agent3_data is not None and i - 1 < len(agent3_data):
+            block += "\n" + _format_confirmation_summary(agent3_data[i - 1])
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def pipeline_b_report(b_data: dict) -> str:
+    """The full Pipeline B combined result (as saved by
+    run_pipeline_b_and_save: agent1/agent2/agent3/agent4 keys) as one
+    readable plain-text report -- Agent 1's top genes, each endorsed
+    pathway (disease1 -> gene1 --activates--> ... -> disease2) with its
+    rationale and Agent 3 confirmation summary, and Agent 4's MIMIC-IV
+    comorbidity numbers -- instead of printing the raw dict, which is a
+    wall of nested JSON-shaped Python data most useful for saved output,
+    not for reading right after a run. The full nested detail is still
+    saved to outputs/ in full by run_pipeline_b_and_save; this is what to
+    read instead of printing pipeline_b_output directly."""
+    disease1, disease2 = b_data.get("disease1", ""), b_data.get("disease2", "")
+    sections = [f"{disease1} -> {disease2}"]
+
+    a1_line = agent1_explanation(b_data.get("agent1"))
+    if a1_line:
+        sections.append(a1_line)
+
+    sections.append(agent2_explanation(b_data.get("agent2"), disease1, disease2, agent3_data=b_data.get("agent3")))
+
+    a4_line = agent4_explanation(b_data.get("agent4"))
+    if a4_line:
+        sections.append(a4_line)
+
+    return "\n\n".join(sections)
+
+
 # %% Pipeline A -- Orphaned LLM baseline
 def run_pipeline_a_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2) -> dict:
     """Runs Pipeline A (one ungrounded LLM call) and saves its output."""
@@ -185,7 +365,7 @@ def run_pipeline_b_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2) 
 
 
 pipeline_b_output = run_pipeline_b_and_save()
-pipeline_b_output
+print(pipeline_b_report(pipeline_b_output))
 
 
 # %% Side-by-side comparison: Pipeline A output vs. Pipeline B output
@@ -210,72 +390,18 @@ def _narrative_to_html(narrative: str) -> str:
     return "".join(b if b.startswith(("<h", "<hr")) else f"<p>{b}</p>" for b in blocks)
 
 
-def _format_chain_pathway(chain: dict) -> str:
-    """One endorsed Agent 2 chain (a ChainCandidate.to_dict()) as a single
-    arrow-diagram line, e.g. 'APOE --activates--> [metabolite] Cholesterol
-    --produces--> ABCA1' -- the mechanistic pathway itself, without the
-    edge ids/disease-assoc-scores/hmdb ids that only matter for the saved
-    JSON, not for reading it."""
-    edges = chain["edges"]
-
-    def node(kind: str, name: str) -> str:
-        return f"[metabolite] {name}" if kind == "metabolite" else name
-
-    parts = [node(edges[0]["source_kind"], edges[0]["source_gene"])]
-    for edge in edges:
-        parts.append(f'--{edge["interaction_type"]}-->')
-        parts.append(node(edge["target_kind"], edge["target_gene"]))
-    return " ".join(parts)
-
-
-def agent2_explanation(agent2_data: Optional[dict], disease1: str, disease2: str) -> str:
-    """Turns Agent 2's raw result dict into the same kind of plain-language
-    explanation Pipeline A gives: the mechanistic pathway(s) it endorsed
-    plus its rationale for each, or a direct statement of why it endorsed
-    none -- instead of the full nested JSON (edge ids, disease-assoc
-    scores, hmdb ids, etc.), which is still saved to outputs/ but isn't
-    what you want to read at a glance."""
-    if agent2_data is None:
-        return (
-            f"Agent 2 found no structural path at all connecting {disease1} to {disease2} "
-            f"within the max-hop search limit."
-        )
-
-    chains = agent2_data.get("chains") or []
-    if not chains:
-        reason = agent2_data.get("rejection_reason")
-        reason_text = f' Its stated reason: "{reason}"' if reason else " (no reason was given)."
-        return (
-            f"Agent 2 found {agent2_data.get('candidate_path_count', 0)} structurally real "
-            f"candidate pathway(s) connecting {disease1} to {disease2}, but did not judge any "
-            f"of them biologically plausible enough to endorse.{reason_text}"
-        )
-
-    blocks = []
-    for i, chain in enumerate(chains, start=1):
-        label = f"Pathway {i}" if len(chains) > 1 else "Pathway"
-        rationale = chain.get("rationale") or "(no rationale given)"
-        caveat = (
-            "\n(Note: at least one step's direction of effect is not confirmed by curated "
-            "evidence -- treat this pathway as tentative.)"
-            if chain.get("has_unconfirmed_direction")
-            else ""
-        )
-        blocks.append(f"{label}: {_format_chain_pathway(chain)}\n{rationale}{caveat}")
-    return "\n\n".join(blocks)
-
-
 def show_side_by_side(a_data: dict, b_data: dict) -> None:
-    """Renders Pipeline A's narrative and Pipeline B's Agent-2 explanation
-    (mechanistic pathway + rationale, or the reason nothing was endorsed --
-    see agent2_explanation) side by side, both as readable text rather than
-    raw JSON. The full nested output (all four agents, edge ids, scores,
-    etc.) is still saved under outputs/ by run_pipeline_b_and_save -- this
-    view is deliberately just the headline explanation. In VS Code's
-    Interactive Window this displays as a real two-pane view; falls back
-    to plain sequential printing outside a notebook/IPython context."""
+    """Renders Pipeline A's narrative and Pipeline B's full readable report
+    (pathways bookended by the disease names, rationale, and Agent 3
+    confirmation summary -- see agent2_explanation/pipeline_b_report) side
+    by side, both as readable text rather than raw JSON. The full nested
+    output (all four agents, edge ids, scores, etc.) is still saved under
+    outputs/ by run_pipeline_b_and_save -- this view is deliberately just
+    the headline explanation. In VS Code's Interactive Window this
+    displays as a real two-pane view; falls back to plain sequential
+    printing outside a notebook/IPython context."""
     b_explanation = agent2_explanation(
-        b_data.get("agent2"), b_data.get("disease1", ""), b_data.get("disease2", "")
+        b_data.get("agent2"), b_data.get("disease1", ""), b_data.get("disease2", ""), agent3_data=b_data.get("agent3")
     )
 
     try:
