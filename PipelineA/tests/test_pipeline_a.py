@@ -7,15 +7,13 @@ FIXED_NARRATIVE = (
 )
 
 
-def test_run_pipeline_a_returns_narrative_and_symbols():
+def test_run_pipeline_a_returns_the_narrative():
     client = StubLLMClient(fixed_response=FIXED_NARRATIVE)
     result = run_pipeline_a("Type 2 Diabetes Mellitus", "Alzheimer's Disease", client=client)
 
     assert result.disease1 == "Type 2 Diabetes Mellitus"
     assert result.disease2 == "Alzheimer's Disease"
     assert result.narrative == FIXED_NARRATIVE
-    assert "TCF7L2" in result.cited_symbols
-    assert "APP" in result.cited_symbols
 
 
 def test_run_pipeline_a_prompts_with_both_disease_names():

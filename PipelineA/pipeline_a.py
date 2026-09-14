@@ -2,21 +2,26 @@
 Pipeline A -- Orphaned LLM (ungrounded baseline).
 
 Service: LLMClient (common/llm_client.py) -- one call, no retrieval, no tools.
-Data: two disease names in; free-text narrative + extracted gene symbols out.
+Data: two disease names in; free-text narrative out.
 Used by: standalone CLI, and as the control arm compared against Pipeline B.
 
 Usage:
     python -m PipelineA.pipeline_a --pair t2dm_ad
     python -m PipelineA.pipeline_a --disease1 "Type 2 Diabetes Mellitus" --disease2 "Alzheimer's Disease"
+
+Metrics (BioPathBench: gene/protein extraction, protein recall,
+hallucination rate) were purged 2026-09-14 to get the bare pipelines
+running cleanly first -- see claude/metrics_purge.md. Pipeline A returns
+just the raw narrative for now; extraction/scoring can be layered back on
+once the metric design is settled.
 """
 import argparse
 import json
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import Optional
 
 from common.config import DISEASE_PAIRS, get_pair
 from common.llm_client import LLMClient
-from metrics.extract import extract_gene_protein_mentions
 
 PROMPT_TEMPLATE = """You are a biomedical researcher. Explain the most likely molecular \
 mechanism connecting these two diseases:
@@ -38,7 +43,6 @@ class PipelineAResult:
     disease1: str
     disease2: str
     narrative: str
-    cited_symbols: List[str]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,12 +50,11 @@ class PipelineAResult:
 
 def run_pipeline_a(disease1: str, disease2: str, client: Optional[object] = None) -> PipelineAResult:
     # Input: two disease names, optional LLM client (defaults to real LLMClient(); pass StubLLMClient in tests).
-    # Output: PipelineAResult with the raw narrative and its extracted gene/protein symbols.
+    # Output: PipelineAResult with the raw narrative.
     client = client or LLMClient()
     prompt = PROMPT_TEMPLATE.format(disease1=disease1, disease2=disease2)
     narrative = client.generate(prompt, temperature=0.3)
-    symbols = extract_gene_protein_mentions(narrative)
-    return PipelineAResult(disease1=disease1, disease2=disease2, narrative=narrative, cited_symbols=symbols)
+    return PipelineAResult(disease1=disease1, disease2=disease2, narrative=narrative)
 
 
 def _cli():

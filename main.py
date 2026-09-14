@@ -9,7 +9,11 @@ Pipeline A don't depend on each other and can run independently; Agents
 
 Every run is saved as JSON under outputs/, named by disease pair id, so
 results persist across interactive sessions and are ready for comparison
-(BioPathBench scoring, the thesis writeup, etc.).
+and the thesis writeup.
+
+Metrics (BioPathBench) were purged 2026-09-14 to get the bare pipelines
+running cleanly first -- see claude/metrics_purge.md. This file only
+runs and saves both pipelines' raw output side by side; no scoring yet.
 """
 
 # %% Setup
@@ -17,8 +21,6 @@ import json
 from pathlib import Path
 
 from common.config import get_pair
-from metrics.benchmark import hallucination_rate, protein_recall
-from metrics.gene_reference import load_known_gene_symbols
 from PipelineA.pipeline_a import run_pipeline_a
 from PipelineB.agent1_discovery import run_agent1_discovery
 from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
@@ -131,25 +133,6 @@ def run_pipeline_b_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2) 
 
 pipeline_b_output = run_pipeline_b_and_save()
 pipeline_b_output
-
-
-# %% BioPathBench: score Pipeline A against Agent 1's grounded gene set
-def score_pipeline_a(pipeline_a_data: dict, agent1_result) -> dict:
-    """Protein Recall (vs. Agent 1's discovered genes) and Hallucination
-    Rate (vs. the full HGNC gene list -- set HGNC_GENE_LIST_PATH in .env)."""
-    cited = pipeline_a_data["cited_symbols"]
-    scores = {"protein_recall": protein_recall(cited, agent1_result)}
-    try:
-        known_symbols = load_known_gene_symbols()
-        scores["hallucination_rate"] = hallucination_rate(cited, known_symbols)
-    except FileNotFoundError as e:
-        scores["hallucination_rate"] = None
-        print(f"Hallucination rate skipped: {e}")
-    return scores
-
-
-pipeline_a_scores = score_pipeline_a(pipeline_a_output, agent1_result)
-pipeline_a_scores
 
 
 # %% Side-by-side comparison: Pipeline A output vs. Pipeline B output
