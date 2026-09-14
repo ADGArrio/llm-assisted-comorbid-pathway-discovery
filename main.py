@@ -24,7 +24,6 @@ from PipelineB.agent1_discovery import run_agent1_discovery
 from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
 from PipelineB.agent3_confirmation import run_agent3_confirmation
 from PipelineB.agent4_mimic import run_agent4_mimic
-from PipelineB.crossdb_client import DisGeNETClient
 from PipelineB.metalinks_client import MetalinksClient
 
 OUTPUT_DIR = Path("outputs")
@@ -86,13 +85,13 @@ agent2_result.to_dict() if agent2_result else None
 
 
 # %% Pipeline B -- Agent 3 (Independent Confirmation)
-def run_agent3(agent1_result, agent2_result, use_disgenet: bool = False):
-    """Agent 3: tissue-expression + cross-database confirmation for each
-    Agent 2 chain candidate. Returns [] if Agent 2 found no chain."""
+def run_agent3(agent1_result, agent2_result):
+    """Agent 3: tissue-expression (GTEx) + cross-database (GWAS Catalog)
+    confirmation for each Agent 2 chain candidate. Returns [] if Agent 2
+    found no chain."""
     if agent2_result is None:
         return []
-    disgenet_client = DisGeNETClient() if use_disgenet else None
-    return run_agent3_confirmation(agent1_result, agent2_result, disgenet_client=disgenet_client)
+    return run_agent3_confirmation(agent1_result, agent2_result)
 
 
 agent3_results = run_agent3(agent1_result, agent2_result)

@@ -52,9 +52,10 @@ run and test on its own:
   citations as evidence -- it never invents an edge itself.
 - **Agent 3, Independent Confirmation** (`agent3_confirmation.py`) --
   checks each chain against evidence Agents 1-2 never used: tissue
-  expression (GTEx, HPA fallback) and cross-database gene-disease
-  association (GWAS Catalog, DisGeNET). Reports each check individually
-  rather than collapsing to one verdict.
+  expression (GTEx) and cross-database gene-disease association (GWAS
+  Catalog -- real numerical study-level evidence, kept over DisGeNET
+  since Agent 1's PubMed citations already cover literature evidence).
+  Reports each check individually rather than collapsing to one verdict.
 - **Agent 4, MIMIC-IV Cohort Check** (`agent4_mimic.py`) -- queries local
   MIMIC-IV diagnosis data for the real-world co-occurrence rate of the two
   diagnoses, as descriptive (not causal) supporting evidence for the
@@ -116,5 +117,5 @@ pytest -v
 
 Everything runs offline against stub clients (`StubLLMClient`,
 `StubOpenTargetsClient`, `StubOmniPathClient`, `StubMetalinksClient`,
-`StubGTExClient`, `StubHPAClient`, `StubGWASCatalogClient`,
-`StubDisGeNETClient`, `StubMimicClient`) -- no model or network needed.
+`StubGTExClient`, `StubGWASCatalogClient`, `StubMimicClient`) -- no model
+or network needed.

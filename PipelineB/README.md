@@ -187,23 +187,23 @@ candidate now carry a visible caveat.
 Per project_architecture.md, this checks each chain candidate against evidence
 Agents 1-2 never looked at -- what keeps validation non-circular rather than
 just re-confirming Open Targets/OmniPath's own say-so. Two independent checks,
-run per chain candidate returned by Agent 2:
+run per chain candidate returned by Agent 2 (simplified 2026-09-14 to these
+two sources -- see `claude/agent3_simplification.md`):
 
-- **Tissue plausibility** (`tissue_client.py`): is a gene actually expressed
-  in a tissue relevant to the disease it's nearest to in the chain? GTEx is
-  the primary source (accepts a bare gene symbol, no id resolution needed);
-  Human Protein Atlas is a fallback used only when GTEx has no record *and*
-  an Ensembl id is known for that gene (not every gene has one -- a pure BFS
-  bridge gene from OmniPath that Open Targets never surfaced has no Ensembl
-  id in this pipeline at all). A gene counts as "expressed" at >=1.0 nTPM,
-  a common low-expression cutoff -- see the module docstring for why this is
-  a documented simplification, not an exact biological threshold.
-- **Cross-database gene-disease association** (`crossdb_client.py`): for the
-  chain's two disease-anchored endpoint genes specifically (the first gene,
-  claimed disease1-associated by Agent 1, and the last gene, claimed
-  disease2-associated), does GWAS Catalog and/or DisGeNET -- association
-  sources independent of Open Targets -- also confirm gene<->disease? This
-  is the committee's Metric 1 (committee_feedback_plan.md), generalized from
+- **Tissue plausibility** (`tissue_client.py`, GTEx only): is a gene actually
+  expressed in a tissue relevant to the disease it's nearest to in the
+  chain? GTEx accepts a bare gene symbol, no id resolution needed. A gene
+  counts as "expressed" at >=1.0 nTPM, a common low-expression cutoff -- see
+  the module docstring for why this is a documented simplification, not an
+  exact biological threshold.
+- **Cross-database gene-disease association** (`crossdb_client.py`, GWAS
+  Catalog only): for the chain's two disease-anchored endpoint genes
+  specifically (the first gene, claimed disease1-associated by Agent 1, and
+  the last gene, claimed disease2-associated), does GWAS Catalog -- a
+  source independent of Open Targets, and real numerical study-level
+  evidence (p-values, study accessions) rather than another
+  literature-aggregation source -- also confirm gene<->disease? This is
+  the committee's Metric 1 (committee_feedback_plan.md), generalized from
   "one PPI edge" to "the two ends of a possibly-longer chain." A middle
   bridge gene has no such check: Agent 1 never claimed it was
   disease-associated in the first place, so there's nothing to
@@ -211,41 +211,29 @@ run per chain candidate returned by Agent 2:
   tissues (a bridge gene isn't assigned to one side of the mechanism).
 - Like Agent 2, this agent doesn't collapse everything into one pass/fail
   "confirmed" boolean. A gene not expressed in GTEx, or with no GWAS
-  Catalog/DisGeNET hit, is real negative evidence worth reporting on its own
+  Catalog hit, is real negative evidence worth reporting on its own
   terms -- a gene can matter at the protein level (trafficking, complex
   formation) without showing up as disease-associated in a genetics-only
   database. `Agent3ConfirmationResult` reports every tissue check and both
   endpoint cross-db checks individually, plus simple counts
   (`tissue_expressed_count`/`tissue_checked_count`) -- no single collapsed
   verdict.
-- **On DisGeNET specifically**: during setup, a URL was suggested for
-  connecting to DisGeNET as an MCP server (`https://mcp.disgenet.com/mcp`).
-  That domain doesn't match DisGeNET's actual documented API host
-  (`api.disgenet.com`, confirmed via disgenet.com/Tools and real working
-  client code in the ToolUniverse project), doesn't appear in Anthropic's
-  MCP connector registry, and there's no tool available to add an arbitrary
-  remote MCP server by URL regardless -- so `crossdb_client.py` is built
-  directly against the verified real DisGeNET REST API instead. Put your
-  real academic-license API key in `.env` as `DISGENET_API_KEY`; DisGeNET is
-  entirely optional (`disgenet_client=None` / omit `--use-disgenet`) --
-  GWAS Catalog alone still runs the cross-db check.
 - GWAS Catalog's exact endpoint path could not be confirmed against a live
   docs fetch in this environment (JS-rendered reference page); built against
   the well-established v1 HAL finder-method pattern that other real
   integrations use, with a clear error naming the docs URL to check if it
-  404s on a real run. GTEx and HPA's exact response field names are
-  similarly unconfirmed from a live call and parsed defensively (see each
-  module's docstring) -- same "strong starting point, not guaranteed final"
-  posture already applied to opentargets_client.py and gap1_pull.py before
-  either had a live check.
+  404s on a real run. GTEx's exact response field names are similarly
+  unconfirmed from a live call and parsed defensively (see the module's
+  docstring) -- same "strong starting point, not guaranteed final" posture
+  already applied to opentargets_client.py and gap1_pull.py before either
+  had a live check.
 
 ```
 python -m PipelineB.agent3_confirmation --pair t2dm_ad
-python -m PipelineB.agent3_confirmation --pair t2dm_ad --use-disgenet
 ```
 
 Not yet run for real -- try it and report back what comes out, especially
-whether GTEx/HPA/GWAS Catalog's actual response shapes match what the
+whether GTEx/GWAS Catalog's actual response shapes match what the
 defensive parsing above expects.
 
 **Agent 4 -- MIMIC-IV Cohort Check** (`agent4_mimic.py`, `mimic_client.py`)
@@ -259,10 +247,10 @@ only needs a disease pair, not a chain.
 - Reads MIMIC-IV's `diagnoses_icd.csv.gz` locally (PhysioNet-credentialed
   data, queried locally per project_architecture.md, not a live API) in
   500k-row chunks, matching ICD-10 codes against the hand-mapped prefixes
-  in `common/config.py`'s `DISEASE_ICD10_PREFIXES` (T2DM: E11, AD: G30, CAD:
-  I25 -- chronic ischemic heart disease specifically, not the full I20-I25
-  ischemic heart disease block; worth revisiting if cohort counts are too
-  small).
+  in `common/config.py`'s `DISEASE_ICD10_PREFIXES` (T2DM: E11; AD: G30; CAD:
+  the full I20-I25 ischemic-heart-disease range -- I25 alone was checked
+  against the real MIMIC-IV data and undercounts by ~2,755 patients, mostly
+  from I21/acute MI; see `claude/agent4_mimic_real_run.md`).
 - Computes a relative risk: (rate of disease2 among disease1 patients) /
   (disease2's base rate in the whole population). **This is a crude,
   unadjusted ratio** -- no age/sex matching, no confounder adjustment -- and
@@ -279,17 +267,13 @@ only needs a disease pair, not a chain.
   two files directly by their individual PhysioNet URLs should take minutes.
   If your download is already stuck, there's no need to let it finish --
   cancel it and grab just these two files instead.
-- 82/82 tests pass overall, including a real (small, synthetic) gzipped CSV
-  fixture exercising `MimicClient`'s actual chunked-read logic, not just a
-  stub -- the only place in this codebase so far that tests a real file
-  format end to end without a network call.
+- Confirmed working against the user's own real, downloaded MIMIC-IV data
+  (2026-09-13) -- see `claude/agent4_mimic_real_run.md` for real relative-risk
+  numbers on both disease pairs.
 
 ```
 python -m PipelineB.agent4_mimic --pair t2dm_ad
 ```
-
-Not yet run for real -- needs `MIMIC_DATA_DIR` pointing at real MIMIC-IV
-files on your machine first.
 
 ## Not started yet
 

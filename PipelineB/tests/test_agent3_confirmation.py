@@ -1,9 +1,11 @@
+import json
+
 from PipelineB.agent1_discovery import Agent1DiscoveryResult
 from PipelineB.agent2_chain import Agent2ChainResult, ChainCandidate, ChainEdge
 from PipelineB.agent3_confirmation import run_agent3_confirmation
-from PipelineB.crossdb_client import DisgenetAssociation, GwasAssociation, StubDisGeNETClient, StubGWASCatalogClient
+from PipelineB.crossdb_client import GwasAssociation, StubGWASCatalogClient
 from PipelineB.opentargets_client import GeneAssociation
-from PipelineB.tissue_client import StubGTExClient, StubHPAClient
+from PipelineB.tissue_client import StubGTExClient
 
 DISEASE1 = "Type 2 Diabetes Mellitus"
 DISEASE2 = "Alzheimer's Disease"
@@ -74,9 +76,7 @@ def test_empty_chains_returns_empty_list():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([])
 
-    result = run_agent3_confirmation(
-        agent1_result, agent2_result, gtex_client=StubGTExClient({}), hpa_client=StubHPAClient({}), gwas_client=StubGWASCatalogClient({})
-    )
+    result = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}))
 
     assert result == []
 
@@ -85,10 +85,9 @@ def test_single_edge_chain_checks_both_endpoints_against_own_disease_tissues():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])
     gtex = StubGTExClient({"INSR|Pancreas": 10.0, "APP|Brain_Cortex": 8.0})
-    hpa = StubHPAClient({})
     gwas = StubGWASCatalogClient({})
 
-    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, hpa_client=hpa, gwas_client=gwas)
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, gwas_client=gwas)
 
     assert len(results) == 1
     confirmation = results[0]
@@ -109,10 +108,9 @@ def test_multi_hop_chain_checks_middle_gene_against_both_diseases_tissues():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_two_hop_chain()])
     gtex = StubGTExClient({})
-    hpa = StubHPAClient({})
     gwas = StubGWASCatalogClient({})
 
-    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, hpa_client=hpa, gwas_client=gwas)
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, gwas_client=gwas)
 
     tissues_checked = {(t.gene_symbol, t.tissue) for t in results[0].tissue_checks}
     # MID is a pure bridge gene -- checked against BOTH diseases' tissues
@@ -127,10 +125,9 @@ def test_metabolite_middle_hop_excluded_from_tissue_checks_and_listed_in_chain_m
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_metabolite_bridge_chain()])
     gtex = StubGTExClient({})
-    hpa = StubHPAClient({})
     gwas = StubGWASCatalogClient({})
 
-    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, hpa_client=hpa, gwas_client=gwas)
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=gtex, gwas_client=gwas)
 
     assert len(results) == 1
     confirmation = results[0]
@@ -145,84 +142,43 @@ def test_metabolite_middle_hop_excluded_from_tissue_checks_and_listed_in_chain_m
     assert endpoint_genes == {"INSR", "APP"}
 
 
-def test_endpoint_confirmed_true_when_gwas_has_evidence_even_without_disgenet():
+def test_endpoint_confirmed_true_when_gwas_has_evidence():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])
     gwas_hit = GwasAssociation("INSR", "type 2 diabetes", "EFO_0001360", 1e-15, "GCST001")
     gwas = StubGWASCatalogClient({("INSR", DISEASE1): [gwas_hit]})
 
-    results = run_agent3_confirmation(
-        agent1_result, agent2_result, gtex_client=StubGTExClient({}), hpa_client=StubHPAClient({}), gwas_client=gwas, disgenet_client=None
-    )
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=gwas)
 
     insr_check = next(e for e in results[0].endpoint_checks if e.gene_symbol == "INSR")
     assert insr_check.confirmed is True
-    assert insr_check.disgenet_association is None
 
 
-def test_endpoint_confirmed_true_when_only_disgenet_has_evidence():
-    agent1_result = _agent1_result()
-    agent2_result = _agent2_result([_single_edge_chain()])
-    disgenet_hit = DisgenetAssociation("APP", DISEASE2, 0.9, 200)
-    disgenet = StubDisGeNETClient({("APP", DISEASE2): disgenet_hit})
-    gwas = StubGWASCatalogClient({})  # no GWAS hits at all
-
-    results = run_agent3_confirmation(
-        agent1_result,
-        agent2_result,
-        gtex_client=StubGTExClient({}),
-        hpa_client=StubHPAClient({}),
-        gwas_client=gwas,
-        disgenet_client=disgenet,
-    )
-
-    app_check = next(e for e in results[0].endpoint_checks if e.gene_symbol == "APP")
-    assert app_check.confirmed is True
-    assert app_check.gwas_associations == []
-
-
-def test_endpoint_not_confirmed_when_neither_source_has_evidence():
+def test_endpoint_not_confirmed_when_no_gwas_evidence():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])
     gwas = StubGWASCatalogClient({})
-    disgenet = StubDisGeNETClient({})
 
-    results = run_agent3_confirmation(
-        agent1_result,
-        agent2_result,
-        gtex_client=StubGTExClient({}),
-        hpa_client=StubHPAClient({}),
-        gwas_client=gwas,
-        disgenet_client=disgenet,
-    )
+    results = run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=gwas)
 
     assert all(not e.confirmed for e in results[0].endpoint_checks)
 
 
-def test_disgenet_client_none_still_runs_gwas_only():
+def test_gwas_client_called_for_both_endpoints():
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])
     gwas_hit = GwasAssociation("INSR", "type 2 diabetes", "EFO_0001360", 1e-15, "GCST001")
     gwas = StubGWASCatalogClient({("INSR", DISEASE1): [gwas_hit]})
 
-    results = run_agent3_confirmation(
-        agent1_result, agent2_result, gtex_client=StubGTExClient({}), hpa_client=StubHPAClient({}), gwas_client=gwas, disgenet_client=None
-    )
+    run_agent3_confirmation(agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=gwas)
 
     assert len(gwas.calls) == 2  # both endpoints checked
-    assert all(e.disgenet_association is None for e in results[0].endpoint_checks)
 
 
 def test_to_dict_is_json_serializable():
-    import json
-
     agent1_result = _agent1_result()
     agent2_result = _agent2_result([_single_edge_chain()])
     results = run_agent3_confirmation(
-        agent1_result,
-        agent2_result,
-        gtex_client=StubGTExClient({"INSR|Pancreas": 5.0}),
-        hpa_client=StubHPAClient({}),
-        gwas_client=StubGWASCatalogClient({}),
+        agent1_result, agent2_result, gtex_client=StubGTExClient({"INSR|Pancreas": 5.0}), gwas_client=StubGWASCatalogClient({})
     )
     json.dumps(results[0].to_dict())
