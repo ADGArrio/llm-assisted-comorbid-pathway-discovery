@@ -87,14 +87,27 @@ agent1_result.to_dict()
 def run_agent2(agent1_result, max_hops: int = None, include_metabolites: bool = True):
     """Agent 2: BFS chain construction over OmniPath (+ MetalinksDB metabolite
     hops by default), with an LLM adjudicating between equally-short candidates.
-    Returns None if no structural path exists within max_hops."""
+    Returns None if no structural path exists within max_hops (NoChainFoundError
+    from BFS itself). A non-None result with an EMPTY chains list is a different,
+    equally valid outcome: BFS found real candidates, but the LLM judged none of
+    them biologically plausible enough to endorse -- printed explicitly below so
+    it's not mistaken for main.py silently doing nothing."""
     kwargs = {"max_hops": max_hops} if max_hops else {}
     metalinks_client = MetalinksClient() if include_metabolites else None
     try:
-        return run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **kwargs)
+        result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **kwargs)
     except NoChainFoundError as e:
         print(f"Agent 2: {e}")
         return None
+
+    if not result.chains:
+        print(
+            f"Agent 2 found {result.candidate_path_count} structural candidate path(s) "
+            f"(see shared_genes/candidate_path_count below), but the LLM did not judge any "
+            f"of them biologically plausible enough to endorse. This is a real, expected "
+            f"possible outcome -- not a bug -- see agent2_chain.py's module docstring."
+        )
+    return result
 
 
 agent2_result = run_agent2(agent1_result)
