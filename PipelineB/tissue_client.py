@@ -34,11 +34,34 @@ instead from GTEx's own OpenAPI spec (mirrored at
 github.com/broadinstitute/gtex-public/blob/master/gtex_api/gtex_api.yml).
 Fixed by resolving gene symbol -> gencodeId first, via GTEx's own
 `/reference/gene` endpoint (which does accept a plain gene symbol) --
-see `_resolve_gencode_id` below. Still not verified against the live
-endpoint from this sandbox; if a real run still comes back with
-unexpectedly many "no GTEx record" results, check that resolution step
-first (e.g. print `GTExClient()._resolve_gencode_id("INSR")`) before
-assuming the genes really do lack data.
+see `_resolve_gencode_id` below.
+
+BUG FIX #2, 2026-09-14 (same day, next run): the fix above still came
+back 0/18 on the next real run -- for INSR, PTPN1, CAPN1, OGG1, all of
+which have real GTEx data. Root cause: the query parameter names above
+were still wrong, just wrong in a new way -- `geneId` and `gencodeId`/
+`tissueSiteDetailId` are singular, but GTEx's v2 API actually expects
+the *plural* forms `geneIds`, `gencodeIds`, `tissueSiteDetailIds` (a
+single value under the plural key still works fine -- these are
+"character vector" params, and one gene is a length-1 vector). The
+mirrored OpenAPI spec used for the first fix (from an older
+broadinstitute repo, itself only documenting the legacy v6p/v7 datasets)
+was simply out of date. This was re-confirmed via GTEx's own actively
+maintained R client, ropensci/gtexr (docs.ropensci.org/gtexr and its
+source on GitHub), which sends `geneIds=`/`gencodeIds=`/
+`tissueSiteDetailIds=` and documents the exact response field names
+this module already parses for (`gencodeId`, `geneSymbol`, `median` --
+response fields stay singular even though request params are plural).
+A silently-ignored/unrecognized query param is why the first fix's
+`/reference/gene` call kept returning either zero or unrelated records
+instead of erroring -- there was nothing to catch. Still not verified
+against the live endpoint from this sandbox (network allowlist blocks
+gtexportal.org, WebFetch blocked by its robots.txt); if a real run still
+comes back with unexpectedly many "no GTEx record" results after this,
+run `GTExClient()._resolve_gencode_id("INSR")` and print the raw
+response (`requests.get(f"{client.base_url}/reference/gene",
+params={"geneIds": "INSR", "genomeBuild": "GRCh38/hg38"}).json()`)
+before assuming the genes really do lack data.
 
 RATE-LIMIT HARDENING, 2026-09-14 (same day): the equivalent fix in this
 module's sibling, crossdb_client.py (GWAS Catalog), made that client's
@@ -170,7 +193,10 @@ class GTExClient:
         if gene_symbol in self._gencode_id_cache:
             return self._gencode_id_cache[gene_symbol]
 
-        resp = self._get(f"{self.base_url}/reference/gene", params={"geneId": gene_symbol, "genomeBuild": self.genome_build})
+        resp = self._get(
+            f"{self.base_url}/reference/gene",
+            params={"geneIds": gene_symbol, "genomeBuild": self.genome_build, "itemsPerPage": 10},
+        )
         if resp.status_code == 429:
             print(
                 f"GTEx: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries resolving "
@@ -212,8 +238,8 @@ class GTExClient:
         resp = self._get(
             f"{self.base_url}/expression/medianGeneExpression",
             params={
-                "gencodeId": gencode_id,
-                "tissueSiteDetailId": tissue_site_detail_id,
+                "gencodeIds": gencode_id,
+                "tissueSiteDetailIds": tissue_site_detail_id,
                 "datasetId": self.dataset_id,
                 "itemsPerPage": 5,
             },
