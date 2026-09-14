@@ -208,6 +208,110 @@ def test_gwas_client_stops_following_snps_once_a_match_is_found(monkeypatch):
     assert len(results) == 1
 
 
+def test_gwas_client_dedupes_repeated_snp_entries_on_a_page(monkeypatch):
+    """Regression test for bug-fix #4 (see crossdb_client.py's module docstring): a live
+    findByGene response for IRS1 listed every rsId twice in a row within a single page. A
+    duplicate entry must not cost a second follow-up request for the same SNP."""
+    search_payload = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs1", "_links": {"associations": {"href": "https://api.example/snps/rs1/associations"}}},
+                {"rsId": "rs1", "_links": {"associations": {"href": "https://api.example/snps/rs1/associations"}}},
+            ]
+        }
+    }
+    empty_associations = {"_embedded": {"associations": []}}
+
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            return _FakeResponse(search_payload)
+        assert url == "https://api.example/snps/rs1/associations"
+        return _FakeResponse(empty_associations)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
+
+    assert len(calls) == 2  # search + exactly one follow-up for rs1, not two
+
+
+def test_gwas_client_paginates_to_find_a_match_on_a_later_page(monkeypatch):
+    """Regression test for bug-fix #4: a real run's IRS1 check never found its known T2DM SNP
+    because it only ever requested page 0 of findByGene, and that SNP was on a later page (6
+    total pages existed for IRS1 in the live diagnostic that found this). If page 0 doesn't
+    exhaust the distinct-SNP cap and more pages exist (per the response's own page.totalPages),
+    get_gene_disease_associations must keep walking pages rather than stopping after page 0."""
+    page0 = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs_no_match", "_links": {"associations": {"href": "https://api.example/snps/rs_no_match/associations"}}}
+            ]
+        },
+        "page": {"size": 20, "totalElements": 21, "totalPages": 2, "number": 0},
+    }
+    page1 = {
+        "_embedded": {
+            "singleNucleotidePolymorphisms": [
+                {"rsId": "rs_match", "_links": {"associations": {"href": "https://api.example/snps/rs_match/associations"}}}
+            ]
+        },
+        "page": {"size": 20, "totalElements": 21, "totalPages": 2, "number": 1},
+    }
+    no_match_associations = {"_embedded": {"associations": []}}
+    match_associations = {
+        "_embedded": {"associations": [{"pvalue": 9e-12, "studyAccession": "GCST999", "efoTraits": [_efo_trait("Type 2 diabetes mellitus")]}]}
+    }
+
+    search_calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if url.endswith(_ASSOCIATIONS_BY_GENE_PATH):
+            search_calls.append(params)
+            return _FakeResponse(page0 if params["page"] == 0 else page1)
+        if url.endswith("rs_no_match/associations"):
+            return _FakeResponse(no_match_associations)
+        assert url.endswith("rs_match/associations")
+        return _FakeResponse(match_associations)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+
+    assert [c["page"] for c in search_calls] == [0, 1]  # walked into page 1 to find the match
+    assert len(results) == 1
+    assert results[0].study_accession == "GCST999"
+
+
+def test_gwas_client_stops_paginating_after_max_search_pages_even_with_more_available(monkeypatch):
+    """Safety cap: even if the live response keeps claiming more pages exist and no match is
+    ever found, get_gene_disease_associations must not walk pages forever."""
+    import PipelineB.crossdb_client as crossdb_client
+
+    monkeypatch.setattr(crossdb_client, "_MAX_SEARCH_PAGES_PER_GENE", 2)
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        assert url.endswith(_ASSOCIATIONS_BY_GENE_PATH)
+        page_number = params["page"]
+        return _FakeResponse(
+            {
+                "_embedded": {"singleNucleotidePolymorphisms": []},
+                "page": {"size": 20, "totalElements": 1000, "totalPages": 50, "number": page_number},
+            }
+        )
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = crossdb_client.GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
+
+    assert results == []  # gave up, not stuck in a loop -- reaching this line at all is the test
+
+
 def test_gwas_client_retries_429_and_succeeds(monkeypatch, _no_real_sleeping):
     """A single transient 429 must not fail the request -- retry and use the second response."""
     search_payload = {"_embedded": {"singleNucleotidePolymorphisms": []}}

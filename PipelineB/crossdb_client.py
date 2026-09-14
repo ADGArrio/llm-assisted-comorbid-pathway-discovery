@@ -128,6 +128,62 @@ reads it works the same against either client without an `isinstance`
 check or a `getattr` default at every call site outside
 agent3_confirmation.py (which still uses `getattr(..., False)` defensively
 for any third client that doesn't define the attribute at all).
+
+BUG FIX #4, 2026-09-14 (same day, after bug-fix #3's pacing widening):
+the next full run showed *zero* "rate-limited before finishing this
+check" notes anywhere -- bug-fix #3 worked, GWAS Catalog stopped cutting
+checks short -- but the 0/6 result, including IRS1 x Type 2 Diabetes
+Mellitus, didn't change at all. With rate-limiting ruled out, the user
+ran a direct diagnostic against the live endpoint (this sandbox still
+can't reach it) that finally explains why, with real data:
+
+  GET /singleNucleotidePolymorphisms/search/findByGene?geneName=IRS1
+  -> 200, page info {"size": 20, "totalElements": 115, "totalPages": 6,
+     "number": 0} -- IRS1 has 115 matching SNP entries across 6 pages,
+     and this module only ever requested page 0 (no `page` param sent at
+     all). The 20 entries on that one page were also only 10 *distinct*
+     rsIds -- every rsId appeared twice in a row (e.g. "rs7558386",
+     "rs7558386", "rs10933153", "rs10933153", ...) -- a real, consistent
+     quirk of this endpoint's response, not a diagnostic artifact (both
+     entries for a given rsId look identical on inspection; the cause
+     wasn't tracked down further, but deduping by rsId is a safe
+     mitigation regardless of why it happens). So the old
+     `snps[:_MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS]` slice was checking only
+     ~10 unique SNPs out of 115 real candidates, and paying for 20 HTTP
+     requests to do it (half of them wasted on exact duplicates).
+  GET /singleNucleotidePolymorphisms/rs2943641/associations (queried
+  directly, bypassing findByGene) -> 200, a real association: pvalue
+  9e-12, authorReportedGenes including IRS1 (ensemblGeneId
+  ENSG00000169047, matching the gencodeId Round 5 resolved for this same
+  gene in tissue_client.py). rs2943641 is IRS1's well-known T2DM GWAS
+  SNP -- and it was nowhere in the 10 unique rsIds page 0 returned, so
+  this module could never have found it no matter how the per-SNP
+  parsing or trait-matching logic looked. (The diagnostic's printed
+  output was truncated before showing that association's efoTraits text
+  directly, so this fix doesn't depend on assuming what specific trait
+  string it carries -- only on the now-confirmed fact that the SNP
+  itself was unreachable before this fix, which is enough on its own to
+  explain a false negative.)
+
+Fixed by making `get_gene_disease_associations` walk pages (`page=0`,
+`page=1`, ... -- the standard Spring Data REST HAL pagination param,
+and exactly the field name the response's own `page.number` already
+uses) instead of only ever reading page 0, and dedup SNP entries by
+`rsId` (within and across pages) so a repeated entry doesn't cost a
+second follow-up request. `_MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS` now
+means *distinct* SNPs checked, not raw entries sliced from one page.
+Paging stops as soon as: a match is found (early-exit, unchanged from
+bug-fix #2), the distinct-SNP cap is reached, the live response's own
+`page.totalPages` says there's nothing more, or `_MAX_SEARCH_PAGES_PER_GENE`
+search-page requests have been made (a safety cap independent of
+`totalPages`, in case a gene has far more pages than are worth the
+request budget to walk). A `page` key absent from a test's fake
+response (every existing test predates this fix) defaults `totalPages`
+to `1`, so old single-page test fixtures keep behaving exactly as
+before without modification.
+
+3 new tests (dedup within a page, pagination to a later page, and a safety cap on total pages
+walked), 117 passing (was 114).
 """
 import os
 import time
@@ -138,13 +194,17 @@ import requests
 
 GWAS_DEFAULT_BASE_URL = "https://www.ebi.ac.uk/gwas/rest/api"
 _ASSOCIATIONS_BY_GENE_PATH = "/singleNucleotidePolymorphisms/search/findByGene"
-# Cap on how many of a gene's SNPs get a follow-up associations request -- a highly studied gene
-# can turn up hundreds of SNPs, and each now costs its own HTTP round trip (see bug-fix note
-# above), so this bounds worst-case request count per gene/disease check. findByGene's own
-# default page size is 20, so this doesn't cut into what a single search page already returns.
-# In practice _associations_for_snp stops early once a match is found (see bug-fix #2 note),
-# so this cap is really only exercised in full by genes with no matching evidence at all.
+# Cap on how many of a gene's *distinct* SNPs (by rsId -- see bug-fix #4) get a follow-up
+# associations request -- a highly studied gene can turn up hundreds of SNPs across many search
+# result pages, and each now costs its own HTTP round trip, so this bounds worst-case request
+# count per gene/disease check. In practice _associations_for_snp stops early once a match is
+# found (see bug-fix #2 note), so this cap is really only exercised in full by genes with no
+# matching evidence at all.
 _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS = 20
+# Safety cap on how many search *pages* get fetched while pursuing the distinct-SNP cap above --
+# independent of the live totalPages count, in case a gene has far more pages than are worth the
+# request budget to walk fully. See bug-fix #4: IRS1 alone had totalPages=6 for T2DM.
+_MAX_SEARCH_PAGES_PER_GENE = 10
 # Client-side pacing between requests, and 429 retry/backoff settings -- see bug-fix #2 note.
 # GWAS Catalog doesn't publish a documented rate limit, so these are conservative guesses, not
 # a verified real limit.
@@ -229,39 +289,68 @@ class GWASCatalogClient:
         # found nothing" apart from "gave up on some part of this check due to persistent rate
         # limiting" -- see bug-fix #3 in the module docstring.
         self.last_check_rate_limited = False
-        resp = self._get(f"{self.base_url}{_ASSOCIATIONS_BY_GENE_PATH}", params={"geneName": gene_symbol})
-        if resp.status_code == 404:
-            raise RuntimeError(
-                f"GWAS Catalog: {_ASSOCIATIONS_BY_GENE_PATH} 404'd for gene {gene_symbol!r} -- the "
-                f"v1/v2 endpoint shape may have changed. Check https://www.ebi.ac.uk/gwas/rest/docs/api "
-                f"and update crossdb_client.py's _ASSOCIATIONS_BY_GENE_PATH."
-            )
-        if resp.status_code == 429:
-            print(
-                f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries for gene "
-                f"{gene_symbol!r} -- skipping this gene's check this run (treated as 'not checked', "
-                f"not a real negative).",
-                flush=True,
-            )
-            self.last_check_rate_limited = True
-            return []
-        resp.raise_for_status()
-        payload = resp.json()
-
         results: List[GwasAssociation] = []
-        snps = payload.get("_embedded", {}).get("singleNucleotidePolymorphisms", [])
-        for snp in snps[:_MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS]:
-            results.extend(self._associations_for_snp(snp, gene_symbol, disease_name))
-            if results:
-                # One matching association is enough to prove `confirmed=True` -- stop paying
-                # for further per-SNP follow-up requests to this gene. See bug-fix #2 note.
+        seen_rsids = set()
+        first_page_payload = None
+
+        for page_number in range(_MAX_SEARCH_PAGES_PER_GENE):
+            resp = self._get(
+                f"{self.base_url}{_ASSOCIATIONS_BY_GENE_PATH}",
+                params={"geneName": gene_symbol, "page": page_number},
+            )
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"GWAS Catalog: {_ASSOCIATIONS_BY_GENE_PATH} 404'd for gene {gene_symbol!r} -- the "
+                    f"v1/v2 endpoint shape may have changed. Check https://www.ebi.ac.uk/gwas/rest/docs/api "
+                    f"and update crossdb_client.py's _ASSOCIATIONS_BY_GENE_PATH."
+                )
+            if resp.status_code == 429:
+                print(
+                    f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries for gene "
+                    f"{gene_symbol!r} (page {page_number}) -- skipping the rest of this gene's check this "
+                    f"run (treated as 'not checked', not a real negative).",
+                    flush=True,
+                )
+                self.last_check_rate_limited = True
+                return results
+            resp.raise_for_status()
+            payload = resp.json()
+            if first_page_payload is None:
+                first_page_payload = payload
+
+            snps = payload.get("_embedded", {}).get("singleNucleotidePolymorphisms", [])
+            for snp in snps:
+                rsid = snp.get("rsId")
+                if rsid is not None:
+                    if rsid in seen_rsids:
+                        # findByGene repeats the same rsId more than once within a page in
+                        # practice (a confirmed live-response quirk, not a diagnostic artifact --
+                        # see bug-fix #4) -- skip the duplicate rather than pay for a second
+                        # identical follow-up request.
+                        continue
+                    seen_rsids.add(rsid)
+                results.extend(self._associations_for_snp(snp, gene_symbol, disease_name))
+                if results:
+                    # One matching association is enough to prove `confirmed=True` -- stop paying
+                    # for further per-SNP follow-up requests to this gene. See bug-fix #2 note.
+                    break
+                if len(seen_rsids) >= _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS:
+                    break
+
+            if results or len(seen_rsids) >= _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS:
                 break
+
+            total_pages = payload.get("page", {}).get("totalPages", 1)
+            if page_number + 1 >= total_pages:
+                break  # no more pages to walk
 
         # Defensive fallback for the other plausible HAL shape (associations embedded directly
         # at the top level rather than nested per-SNP) -- see bug-fix note in the module
-        # docstring on why the exact live shape couldn't be confirmed from this sandbox.
-        if not results:
-            for assoc in payload.get("_embedded", {}).get("associations", []):
+        # docstring on why the exact live shape couldn't be confirmed from this sandbox. Checked
+        # against the first page only -- if this shape is ever what a real response actually
+        # uses, it wouldn't be paginated the same way as the per-SNP shape above.
+        if not results and first_page_payload is not None:
+            for assoc in first_page_payload.get("_embedded", {}).get("associations", []):
                 results.extend(self._parse_association(assoc, gene_symbol, disease_name))
 
         return results
