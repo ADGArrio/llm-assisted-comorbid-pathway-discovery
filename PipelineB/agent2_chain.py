@@ -105,6 +105,24 @@ section). `claude/possible_metrics.md` separately tracks the
 not-yet-built plan to compare strict/lenient variants as a metric --
 this recalibration is a direct change to the one production prompt, not
 that experiment.
+
+Explicit per-candidate verdicts required (2026-09-14, third pass same
+day): the hop-tiered bar above had zero effect on a real run -- the LLM
+endorsed all 10 candidates again, and 4 of the 10 rationales *literally
+said* the mechanism "isn't specifically detailed" while still being
+counted as endorsed. Root cause: the model, given a numbered list of 10
+candidates, wrote one line commenting on every single one (rather than
+only the plausible ones, as the old prompt asked), and the old parser
+treated any "<number>: <anything>" line as an endorsement -- it had no
+way to tell "here's why I'm rejecting this" apart from "here's why I
+endorse this," so a candidate discussed-and-rejected got endorsed
+anyway. Fixed by requiring an explicit PLAUSIBLE / NOT PLAUSIBLE verdict
+word right after the candidate number on every line, and having
+`_select_paths` only treat a line as a selection when that verdict is
+literally PLAUSIBLE -- a candidate the model discusses without that
+exact word is rejected, no matter how positive its sentence reads. This
+also plays to the model's own apparent habit of commenting on every
+item in a numbered list, instead of fighting it.
 """
 import argparse
 import json
@@ -396,19 +414,24 @@ weaker footing (e.g. "the direct mechanism between X and Y isn't fully specified
 are established players in cholesterol trafficking"). Reject it if none of its steps has a real, \
 specific mechanism, or if a step requires a genuine, unsupported logical leap.
 
-Either way, it's expected and fine for some or all candidates to be rejected -- do not endorse a \
-candidate just because it is structurally present in the list, and do not invent any new steps, \
-genes, or metabolites; judge only the candidates given.
+Either way, it's expected and fine for some or all candidates to be rejected -- marking a \
+candidate NOT PLAUSIBLE is not a failure, it's the correct answer whenever it's true. Do not \
+invent any new steps, genes, or metabolites; judge only the candidates given.
 
-Respond with exactly one line per plausible candidate, in this format:
-<candidate number>: <one-sentence rationale naming which step(s) have a specific mechanism, \
-noting explicitly any step that instead rests on general reasoning, and any UNKNOWN DIRECTION \
-caveat>
+Respond with exactly one line for EVERY candidate listed above (not just the plausible ones), in \
+this exact format:
+<candidate number>: <PLAUSIBLE or NOT PLAUSIBLE> - <one-sentence rationale naming which step(s) \
+have a specific mechanism, noting explicitly any step that instead rests on general reasoning, \
+and any UNKNOWN DIRECTION caveat>
 
-If none of the candidates are plausible, respond with a single line starting with the word NONE, \
-followed by a colon and one sentence explaining what was missing or unconvincing across the \
-candidates as a whole -- e.g. "NONE: none of the candidates named a specific enough mechanism for \
-every step." This reason is for transparency, not optional decoration -- always include it."""
+The word PLAUSIBLE or NOT PLAUSIBLE right after the colon is mandatory and is the only thing that \
+determines whether a candidate is used -- a candidate you discuss but don't explicitly mark \
+PLAUSIBLE is treated as rejected, regardless of how positive the rest of your sentence sounds. Do \
+not skip a candidate; every one needs its own line and its own verdict.
+
+Alternatively, if none of the candidates are plausible, you may instead respond with a single \
+line starting with the word NONE, followed by a colon and one sentence explaining what was \
+missing or unconvincing across the candidates as a whole."""
 
 
 def _node_label(kind: str, node_id: str) -> str:
@@ -447,10 +470,11 @@ def _select_paths(
 ) -> Tuple[List[Tuple[List[_RawEdge], Optional[str]]], Optional[str]]:
     # Input: candidate paths, disease names, citations, LLM client.
     # Output: (selections, rejection_reason). selections is a list of (path, rationale) tuples the
-    # LLM endorsed -- zero, one, or many. rejection_reason is set only when selections is empty AND
-    # the LLM gave a reason for its blanket "NONE" (None if it didn't, or if selections is non-empty).
-    # Skips the LLM (returns the single path, rationale=None, reason=None) when there's nothing to
-    # adjudicate. Callers must still run every returned tuple through _with_unknown_direction_caveat.
+    # LLM explicitly marked PLAUSIBLE -- zero, one, or many. rejection_reason is set only when
+    # selections is empty AND the LLM gave a reason (its blanket "NONE" reason, or, if it instead
+    # tagged every candidate individually, its NOT PLAUSIBLE reasons joined together). Skips the LLM
+    # (returns the single path, rationale=None, reason=None) when there's nothing to adjudicate.
+    # Callers must still run every returned tuple through _with_unknown_direction_caveat.
     if len(paths) == 1:
         return [(paths[0], None)], None
 
@@ -465,20 +489,39 @@ def _select_paths(
             reason = reason[1:].strip()
         return [], (reason or None)
 
+    # Requires an explicit PLAUSIBLE/NOT PLAUSIBLE verdict per line -- a bare "<number>: <text>"
+    # line (no verdict word) is NOT treated as an endorsement. This was a real bug: the model
+    # would write a line for every candidate, including ones whose own sentence said the mechanism
+    # "isn't specifically detailed" -- i.e. a rejection in substance -- and the old regex (which
+    # accepted any "<number>: <anything>" line) endorsed all of them anyway, because it had no way
+    # to tell a discussed-but-rejected candidate apart from an endorsed one. See
+    # claude/agent2_bfs_and_prompt_recalibration.md.
+    _VERDICT_RE = re.compile(r"\s*(\d+)\s*:\s*(NOT\s+PLAUSIBLE|PLAUSIBLE)\b[\s:.\-]*(.*)", re.IGNORECASE)
     selections: List[Tuple[List[_RawEdge], Optional[str]]] = []
+    not_plausible: List[Tuple[int, str]] = []
     for line in response.strip().splitlines():
-        match = re.match(r"\s*(\d+)\s*:\s*(.+)", line)
+        match = _VERDICT_RE.match(line)
         if not match:
-            continue  # tolerate stray preamble/formatting rather than failing the whole response
+            continue  # tolerate stray preamble/formatting, and lines with no verdict word at all
         index = int(match.group(1)) - 1
-        if 0 <= index < len(paths):
-            selections.append((paths[index], match.group(2).strip()))
+        if not (0 <= index < len(paths)):
+            continue
+        verdict = match.group(2).upper()
+        reason_text = match.group(3).strip()
+        if "NOT" in verdict:
+            not_plausible.append((index, reason_text or "no reason given"))
+        else:
+            selections.append((paths[index], reason_text or None))
+
+    if not selections and not not_plausible:
+        raise RuntimeError(
+            f"Agent 2: LLM path-selection response had no parseable "
+            f"'<number>: PLAUSIBLE/NOT PLAUSIBLE - <rationale>' lines and wasn't 'NONE' either: {response!r}"
+        )
 
     if not selections:
-        raise RuntimeError(
-            f"Agent 2: LLM path-selection response had no parseable '<number>: <rationale>' lines "
-            f"and wasn't 'NONE' either: {response!r}"
-        )
+        reason = "; ".join(f"candidate {i + 1}: {reason}" for i, reason in not_plausible)
+        return [], reason
 
     return selections, None
 

@@ -94,7 +94,7 @@ def _two_path_setup():
 
 def test_llm_can_select_a_single_candidate_among_several():
     agent1_result, omnipath = _two_path_setup()
-    llm = StubLLMClient(fixed_response="2: Because B-Y is the more established pathway.")
+    llm = StubLLMClient(fixed_response="2: PLAUSIBLE - Because B-Y is the more established pathway.")
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -108,8 +108,8 @@ def test_llm_can_select_multiple_plausible_candidates():
     agent1_result, omnipath = _two_path_setup()
     llm = StubLLMClient(
         fixed_response=(
-            "1: Supported by direct literature evidence for A-X.\n"
-            "2: Also plausible based on known B-Y signaling."
+            "1: PLAUSIBLE - Supported by direct literature evidence for A-X.\n"
+            "2: PLAUSIBLE - Also plausible based on known B-Y signaling."
         )
     )
 
@@ -139,7 +139,9 @@ def test_llm_endorsed_chain_with_unknown_edge_gets_caveat_appended():
             Interaction("B", "PB", "Y", "PY", "inhibits", "PB->PY"),
         ]
     )
-    llm = StubLLMClient(fixed_response="1: Plausible based on known A-X signaling despite the unclear direction.")
+    llm = StubLLMClient(
+        fixed_response="1: PLAUSIBLE - Plausible based on known A-X signaling despite the unclear direction."
+    )
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -178,7 +180,7 @@ def test_llm_none_response_with_reason_is_captured():
 
 def test_rejection_reason_is_none_when_a_chain_is_endorsed():
     agent1_result, omnipath = _two_path_setup()
-    llm = StubLLMClient(fixed_response="1: Supported by direct literature evidence for A-X.")
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - Supported by direct literature evidence for A-X.")
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -199,12 +201,71 @@ def test_llm_response_with_no_parseable_lines_and_not_none_raises():
 
 def test_llm_response_ignores_out_of_range_lines_but_keeps_valid_ones():
     agent1_result, omnipath = _two_path_setup()
-    llm = StubLLMClient(fixed_response="99: out of range, should be dropped\n1: This one is valid.")
+    llm = StubLLMClient(
+        fixed_response="99: PLAUSIBLE - out of range, should be dropped\n1: PLAUSIBLE - This one is valid."
+    )
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
     assert len(result.chains) == 1
     assert result.chains[0].rationale == "This one is valid."
+
+
+def test_candidate_discussed_without_a_verdict_word_is_not_endorsed():
+    """Regression test for a real bug, fixed 2026-09-14 (see agent2_chain.py's
+    module docstring, "Explicit per-candidate verdicts required"): the model
+    used to write one line per candidate whether or not it judged it
+    plausible, and the old parser treated any "<number>: <text>" line as an
+    endorsement -- so a candidate whose own sentence said the mechanism
+    "isn't specifically detailed" got endorsed anyway. A line with no
+    explicit PLAUSIBLE/NOT PLAUSIBLE verdict word must not count."""
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1: The mechanism for A activating X is not specifically detailed in the provided "
+            "literature or general knowledge as a direct, named biochemical pathway.\n"
+            "2: PLAUSIBLE - B directly phosphorylates Y, activating its kinase domain."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 1
+    assert result.chains[0].edges[0].source_gene == "B"
+
+
+def test_llm_marks_some_candidates_not_plausible_only_plausible_ones_are_endorsed():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1: NOT PLAUSIBLE - no specific mechanism is established for A-X.\n"
+            "2: PLAUSIBLE - B directly phosphorylates Y."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 1
+    assert result.chains[0].edges[0].source_gene == "B"
+    assert result.rejection_reason is None  # something WAS endorsed -- no blanket rejection reason
+
+
+def test_all_candidates_marked_not_plausible_produces_a_joined_rejection_reason():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1: NOT PLAUSIBLE - no specific mechanism is established for A-X.\n"
+            "2: NOT PLAUSIBLE - no specific mechanism is established for B-Y."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.chains == []
+    assert "candidate 1" in result.rejection_reason
+    assert "candidate 2" in result.rejection_reason
+    assert "A-X" in result.rejection_reason
+    assert "B-Y" in result.rejection_reason
 
 
 def test_citations_for_path_genes_are_included_in_the_llm_prompt():
@@ -219,7 +280,7 @@ def test_citations_for_path_genes_are_included_in_the_llm_prompt():
             Interaction("B", "PB", "Y", "PY", "inhibits", "PB->PY"),
         ]
     )
-    llm = StubLLMClient(fixed_response="1: matches the cited literature.")
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - matches the cited literature.")
 
     run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -238,7 +299,7 @@ def test_unknown_direction_edge_is_marked_in_the_llm_prompt():
             Interaction("B", "PB", "Y", "PY", "inhibits", "PB->PY"),
         ]
     )
-    llm = StubLLMClient(fixed_response="2: B-Y is well established.")
+    llm = StubLLMClient(fixed_response="2: PLAUSIBLE - B-Y is well established.")
 
     run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -315,7 +376,7 @@ def test_bfs_continues_past_first_successful_depth_to_find_other_goals_deeper():
             Interaction("MID", "PM", "Y", "PY", "inhibits", "PM->PY"),  # depth 2: reaches goal Y
         ]
     )
-    llm = StubLLMClient(fixed_response="1: A directly activates X via a well-characterized cascade.")
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - A directly activates X via a well-characterized cascade.")
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -441,7 +502,7 @@ def test_metabolite_bridge_and_protein_path_of_equal_length_both_surface_as_cand
         gene_to_metabolite=[MetaboliteEdge("gene", "A", "metabolite", "Cholesterol", "produces", "HMDB1", "PA", "A->Chol")],
         metabolite_to_gene=[MetaboliteEdge("metabolite", "Cholesterol", "gene", "X", "activates", "HMDB1", "PX", "Chol->X")],
     )
-    llm = StubLLMClient(fixed_response="1: The metabolite route is well supported.")
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - The metabolite route is well supported.")
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, metalinks_client=metalinks, llm_client=llm)
 
