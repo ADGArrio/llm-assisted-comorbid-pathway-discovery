@@ -54,6 +54,23 @@ candidate (responds NONE), it's now asked to give one sentence saying why,
 so an empty `chains` list isn't a dead end -- `Agent2ChainResult.rejection_reason`
 carries that sentence (None if the LLM gave a bare "NONE" with no reason,
 which is tolerated rather than treated as a formatting error).
+
+Plausibility bar loosened (2026-09-14, same day): the original bar required
+a specific, named mechanism for every single hop, which was rejecting all
+10 candidates outright on real T2DM->AD runs (see
+claude/agent2_findings_maxhops10_run.md and the repeated
+candidate_path_count=10/chains=[] results that prompted this change). The
+bar is now whether the chain as a whole tells a coherent biological story --
+an individual step can be justified by general biological reasoning (shared
+pathway membership, an established broad functional relationship, a
+plausible indirect role) rather than a fully specified named mechanism, as
+long as the LLM says explicitly when a step is on that weaker footing. A
+chain is still rejected if it requires a genuine, unsupported logical leap,
+and the LLM still never invents edges/genes/metabolites -- it only judges
+the real candidates BFS found. `claude/possible_metrics.md` has the
+(separate, not-yet-built) plan to eventually compare this lenient default
+against a stricter variant as a metric; this change is not that experiment,
+it's a direct change to the one production prompt.
 """
 import argparse
 import json
@@ -301,12 +318,12 @@ def _with_unknown_direction_caveat(path: List[_RawEdge], rationale: Optional[str
     return _UNKNOWN_DIRECTION_CAVEAT
 
 
-_SELECTION_PROMPT_TEMPLATE = """You are a skeptical biomedical researcher evaluating several \
-candidate molecular pathways, all independently confirmed to exist in real interaction \
-databases (OmniPath for protein-protein steps, MetalinksDB for gene<->metabolite steps -- a \
-step written as "[metabolite] <name>" is a small-molecule metabolite, not a protein). Each \
-pathway links a protein associated with {disease1} to a protein associated with {disease2}, \
-through the same number of intermediate steps.
+_SELECTION_PROMPT_TEMPLATE = """You are a biomedical researcher evaluating several candidate \
+molecular pathways, all independently confirmed to exist in real interaction databases \
+(OmniPath for protein-protein steps, MetalinksDB for gene<->metabolite steps -- a step written \
+as "[metabolite] <name>" is a small-molecule metabolite, not a protein). Each pathway links a \
+protein associated with {disease1} to a protein associated with {disease2}, through the same \
+number of intermediate steps.
 
 Some genes below have supporting literature citations; use them as evidence where available. \
 Where none are listed for a gene, rely on your own domain knowledge of it -- but if you are not \
@@ -323,17 +340,23 @@ be read as tentative.
 
 {candidates_text}
 
-A candidate is biologically plausible only if you can state a SPECIFIC, named mechanism for \
-EVERY step in it (e.g. "X phosphorylates Y, activating Y's kinase activity" or "X converts to \
-metabolite Y via enzyme Z" -- not merely "X and Y are known to interact"). If you cannot do that \
-for every step, the candidate is not plausible -- reject it rather than guessing generously. It \
-is expected and fine for zero, one, or only a few of the candidates below to clear this bar; do \
-not endorse a candidate just because it is structurally present in the list. Do not invent any \
-new steps, genes, or metabolites; judge only the candidates given.
+A candidate is biologically plausible if, taken as a whole, it describes a coherent biological \
+story connecting {disease1} to {disease2} -- you do NOT need a fully specified, named mechanism \
+for every single step to endorse it. General biological reasoning is enough for an individual \
+step: shared pathway membership, a well-established broad functional relationship, or a \
+plausible indirect role for a gene/metabolite in the relevant biology all count, as long as you \
+say so plainly when a step is on that weaker footing (e.g. "the direct mechanism between X and Y \
+isn't fully specified here, but both are established players in cholesterol trafficking"). \
+Reject a candidate only if it requires a genuine, unsupported logical leap -- a step with no \
+known or reasonably inferable relationship at all between its endpoints, even at a general \
+pathway level. It's still fine, and expected, for some candidates to be rejected on that basis; \
+do not endorse a candidate just because it is structurally present in the list, and do not \
+invent any new steps, genes, or metabolites -- judge only the candidates given.
 
 Respond with exactly one line per plausible candidate, in this format:
-<candidate number>: <one-sentence rationale naming the specific mechanism at each step, citing \
-the evidence above or your own reasoning, and noting any UNKNOWN DIRECTION caveat>
+<candidate number>: <one-sentence rationale for the chain overall, noting explicitly which \
+steps (if any) rest on general reasoning rather than a fully specified mechanism, and any \
+UNKNOWN DIRECTION caveat>
 
 If none of the candidates are plausible, respond with a single line starting with the word NONE, \
 followed by a colon and one sentence explaining what was missing or unconvincing across the \

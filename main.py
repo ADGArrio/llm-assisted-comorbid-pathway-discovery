@@ -19,6 +19,7 @@ runs and saves both pipelines' raw output side by side; no scoring yet.
 # %% Setup
 import json
 from pathlib import Path
+from typing import Optional
 
 from common.config import get_pair
 from PipelineA.pipeline_a import run_pipeline_a
@@ -190,14 +191,73 @@ def _narrative_to_html(narrative: str) -> str:
     return "".join(b if b.startswith(("<h", "<hr")) else f"<p>{b}</p>" for b in blocks)
 
 
+def _format_chain_pathway(chain: dict) -> str:
+    """One endorsed Agent 2 chain (a ChainCandidate.to_dict()) as a single
+    arrow-diagram line, e.g. 'APOE --activates--> [metabolite] Cholesterol
+    --produces--> ABCA1' -- the mechanistic pathway itself, without the
+    edge ids/disease-assoc-scores/hmdb ids that only matter for the saved
+    JSON, not for reading it."""
+    edges = chain["edges"]
+
+    def node(kind: str, name: str) -> str:
+        return f"[metabolite] {name}" if kind == "metabolite" else name
+
+    parts = [node(edges[0]["source_kind"], edges[0]["source_gene"])]
+    for edge in edges:
+        parts.append(f'--{edge["interaction_type"]}-->')
+        parts.append(node(edge["target_kind"], edge["target_gene"]))
+    return " ".join(parts)
+
+
+def agent2_explanation(agent2_data: Optional[dict], disease1: str, disease2: str) -> str:
+    """Turns Agent 2's raw result dict into the same kind of plain-language
+    explanation Pipeline A gives: the mechanistic pathway(s) it endorsed
+    plus its rationale for each, or a direct statement of why it endorsed
+    none -- instead of the full nested JSON (edge ids, disease-assoc
+    scores, hmdb ids, etc.), which is still saved to outputs/ but isn't
+    what you want to read at a glance."""
+    if agent2_data is None:
+        return (
+            f"Agent 2 found no structural path at all connecting {disease1} to {disease2} "
+            f"within the max-hop search limit."
+        )
+
+    chains = agent2_data.get("chains") or []
+    if not chains:
+        reason = agent2_data.get("rejection_reason")
+        reason_text = f' Its stated reason: "{reason}"' if reason else " (no reason was given)."
+        return (
+            f"Agent 2 found {agent2_data.get('candidate_path_count', 0)} structurally real "
+            f"candidate pathway(s) connecting {disease1} to {disease2}, but did not judge any "
+            f"of them biologically plausible enough to endorse.{reason_text}"
+        )
+
+    blocks = []
+    for i, chain in enumerate(chains, start=1):
+        label = f"Pathway {i}" if len(chains) > 1 else "Pathway"
+        rationale = chain.get("rationale") or "(no rationale given)"
+        caveat = (
+            "\n(Note: at least one step's direction of effect is not confirmed by curated "
+            "evidence -- treat this pathway as tentative.)"
+            if chain.get("has_unconfirmed_direction")
+            else ""
+        )
+        blocks.append(f"{label}: {_format_chain_pathway(chain)}\n{rationale}{caveat}")
+    return "\n\n".join(blocks)
+
+
 def show_side_by_side(a_data: dict, b_data: dict) -> None:
-    """Renders Pipeline A's narrative (formatted, not raw JSON) and
-    Pipeline B's structured output (JSON -- it's nested chain/agent data,
-    not prose, so JSON is already the readable form) as two columns. In
-    VS Code's Interactive Window this displays as a real two-pane view;
-    falls back to plain sequential printing outside a notebook/IPython
-    context."""
-    b_text = json.dumps(b_data, indent=2)
+    """Renders Pipeline A's narrative and Pipeline B's Agent-2 explanation
+    (mechanistic pathway + rationale, or the reason nothing was endorsed --
+    see agent2_explanation) side by side, both as readable text rather than
+    raw JSON. The full nested output (all four agents, edge ids, scores,
+    etc.) is still saved under outputs/ by run_pipeline_b_and_save -- this
+    view is deliberately just the headline explanation. In VS Code's
+    Interactive Window this displays as a real two-pane view; falls back
+    to plain sequential printing outside a notebook/IPython context."""
+    b_explanation = agent2_explanation(
+        b_data.get("agent2"), b_data.get("disease1", ""), b_data.get("disease2", "")
+    )
 
     try:
         from IPython.display import HTML, display
@@ -205,6 +265,7 @@ def show_side_by_side(a_data: dict, b_data: dict) -> None:
 
         a_html = _narrative_to_html(a_data.get("narrative", ""))
         subtitle = f"{html_lib.escape(a_data.get('disease1', ''))} → {html_lib.escape(a_data.get('disease2', ''))}"
+        b_html = "".join(f"<p>{html_lib.escape(b)}</p>" for b in b_explanation.split("\n\n"))
 
         display(HTML(f"""
         <div style="display:flex; gap:16px; font-family:sans-serif; font-size:13px;">
@@ -218,8 +279,11 @@ def show_side_by_side(a_data: dict, b_data: dict) -> None:
           </div>
           <div style="flex:1; min-width:0;">
             <h3>Pipeline B -- Grounded Multi-Agent</h3>
-            <pre style="white-space:pre-wrap; background:#f5f5f5; color:#111; padding:8px;
-                        border-radius:6px; max-height:600px; overflow:auto; font-family:monospace;">{html_lib.escape(b_text)}</pre>
+            <div style="background:#f5f5f5; color:#111; padding:12px; border-radius:6px;
+                        max-height:600px; overflow:auto; line-height:1.5; white-space:pre-wrap;">
+              <p><em>{subtitle}</em></p>
+              {b_html}
+            </div>
           </div>
         </div>
         """))
@@ -228,7 +292,7 @@ def show_side_by_side(a_data: dict, b_data: dict) -> None:
         print(f"{a_data.get('disease1')} -> {a_data.get('disease2')}\n")
         print(a_data.get("narrative", ""))
         print("=" * 30, "PIPELINE B", "=" * 30)
-        print(b_text)
+        print(b_explanation)
 
 
 show_side_by_side(pipeline_a_output, pipeline_b_output)
