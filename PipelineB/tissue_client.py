@@ -63,6 +63,25 @@ response (`requests.get(f"{client.base_url}/reference/gene",
 params={"geneIds": "INSR", "genomeBuild": "GRCh38/hg38"}).json()`)
 before assuming the genes really do lack data.
 
+BUG FIX #3, IN PROGRESS, 2026-09-14 (same day, next run again): the
+plural-param fix above got further -- a real `422 Unprocessable Entity`
+from `/reference/gene?geneIds=IRS1&genomeBuild=GRCh38%2Fhg38&itemsPerPage=10`,
+a real validation rejection from the live server instead of a silent
+empty result. Progress, but the exact cause isn't nailed down yet:
+further research turned up a *third*, independently-implemented client
+(ToolUniverse's Python `gtex_v2_tool`) that queries this same endpoint
+with `geneId` (singular, matching bug-fix #1) and `gencodeVersion`, with
+no `genomeBuild` parameter at all -- directly contradicting the
+`geneIds`/`genomeBuild` combination bug-fix #2 took from the R client.
+Two independently-maintained clients disagreeing, plus this sandbox
+still unable to reach the live endpoint itself (network allowlist +
+robots.txt), means the next attempt needs the actual 422 response body
+(FastAPI/Pydantic-style validation errors normally name the exact
+offending field) rather than a fourth guess from secondary sources.
+`resp.raise_for_status()` was replaced with `_raise_for_status_with_body`
+below specifically so that response body is captured automatically the
+next time this fails, instead of needing a separate diagnostic run.
+
 RATE-LIMIT HARDENING, 2026-09-14 (same day): the equivalent fix in this
 module's sibling, crossdb_client.py (GWAS Catalog), made that client's
 own success its next problem -- more real HTTP requests per gene tripped
@@ -142,6 +161,18 @@ def _parse_median_expression(record: dict) -> Optional[float]:
     return None
 
 
+def _raise_for_status_with_body(resp) -> None:
+    # Input: a requests.Response. Output: none, or raises requests.HTTPError with the response
+    # body text folded into the message. Plain resp.raise_for_status() only shows the status
+    # line ("422 Client Error: Unprocessable Entity for url: ...") and swallows the actual
+    # validation detail a FastAPI-style API returns in the body (which query param was rejected,
+    # and why) -- exactly the detail bug-fix #3 (see module docstring) needs and didn't have.
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise requests.HTTPError(f"{e} -- response body: {resp.text[:2000]!r}", response=resp) from e
+
+
 class GTExClient:
     def __init__(
         self,
@@ -205,7 +236,7 @@ class GTExClient:
             )
             self._gencode_id_cache[gene_symbol] = None
             return None
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         payload = resp.json()
         records = payload.get("data") or []
 
@@ -251,7 +282,7 @@ class GTExClient:
                 flush=True,
             )
             return None
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         payload = resp.json()
         records = payload.get("data") or []
         if not records:
