@@ -36,8 +36,11 @@ could in theory miss a legitimate longer path through it. Each goal gene
 is only *recorded* once, the first time it's reached (giving each goal
 its own shortest path, tracked via `found_targets`) -- but the search
 now keeps expanding PAST a goal gene too (see "goal-gene expansion" note
-below), and stops overall once `max_hops` is reached, the frontier is
-exhausted, or `max_paths` results are collected.
+below). The search runs the FULL `max_hops` depth (or until the frontier
+is exhausted) regardless of how many candidates have already been found
+-- `max_paths` is enforced once, as a trim, only after the search
+completes (see "max_paths cutting off exploration too early" note
+below), not as an early-stop condition during the search itself.
 
 Goal-gene expansion, fixed 2026-09-14: a goal gene is any gene Open
 Targets independently scored >= min_score for disease2 (see
@@ -61,10 +64,59 @@ goal-gene membership (only `visited` gates re-expansion now); a goal
 gene still gets exactly one recorded path (via `found_targets`, checked
 independently of expansion), but the search now also continues past it
 looking for other, possibly more specific, goal genes reachable deeper
-through it. This does not privilege longer chains over shorter ones --
-both the short hit and any longer one found by continuing past it are
-offered to the LLM as separate candidates, and `_SELECTION_PROMPT_TEMPLATE`
-explicitly tells it length is not a plausibility signal either way.
+through it. Both the short hit and any longer one found by continuing
+past it are offered to the LLM as separate candidates -- unless there
+are more than `max_paths` total, in which case the post-search trim
+below prefers to keep the longer ones (this is the one place length IS
+used as a signal, and only to decide what the LLM even gets to see;
+`_SELECTION_PROMPT_TEMPLATE` still tells the LLM itself that length is
+not a plausibility signal once a candidate is in front of it).
+
+`max_paths` cutting off exploration too early, fixed 2026-09-14 (same
+day as the goal-gene expansion fix above, found on the very next real
+run): the goal-gene expansion fix meant the search could keep going past
+a hit -- but the loop also still stopped as soon as `len(found) >=
+max_paths` (10 by default), *during* the search, the instant that many
+candidates existed. On a real T2DM->AD run, depth 1 alone produced 10
+distinct goal-gene hits (the same shallow single-hop hits described
+above -- PPARG->CDKN1A, PPARG->NR1H2, INSR->PIK3R1, etc.), which filled
+`max_paths` before depth 2 was ever reached -- so the goal-gene expansion
+fix never got a chance to run in practice; the search returned right
+after depth 1 regardless. Fixed by dropping `max_paths` as a loop
+condition entirely -- the search now always runs the full `max_hops`
+depth (bounded compute-wise by `_MAX_FRONTIER_SIZE` per layer, not by
+how many candidates exist) -- and enforcing `max_paths` exactly once,
+after the search, by keeping the candidates with the *most* hops and
+dropping the rest (a stable sort, so same-length candidates keep their
+original discovery order). This is a deliberate bias: the whole point of
+searching past a hit is to find a more specific mechanism, so if there
+turn out to be more real candidates than `max_paths` allows, the ones
+worth keeping are the ones that motivated the search in the first place,
+not an arbitrary first-10 subset dominated by shallow single-hop edges
+(which the plausibility bar already treats most skeptically). Tradeoff,
+stated honestly: a single, very strong 1-hop mechanism could in theory
+be trimmed out in favor of several longer, weaker ones -- this hasn't
+been observed in practice (the real failure mode so far has been the
+opposite: many weak short candidates crowding out any long one), but
+it's a real possible cost of this policy, worth noting in Limitations.
+
+Verdict-line separator widened, fixed 2026-09-14 (same day, found on the
+same real run as the fix above): the run also raised a RuntimeError
+("no parseable ... lines") even though the LLM answered in good faith --
+it wrote "1. NOT PLAUSIBLE - ..." (an ordinary numbered-list period)
+instead of "1: NOT PLAUSIBLE - ..." (the colon the prompt's example
+uses). `_VERDICT_RE` required a literal colon right after the digit, so
+it matched nothing on any of the 10 lines, and the code's fallback logic
+(no `NONE`, but also literally zero parsed lines) had no way to
+distinguish "the model refused the format" from "the model used
+different punctuation for a well-formed verdict," so it raised rather
+than silently guessing. This is the same local model that used a colon
+on an earlier real run and a period on this one, under similar prompts
+-- consistent with the model's own habits being the real source of
+format drift, not a one-off fluke -- so the fix is parser tolerance, not
+another prompt reword (same philosophy as the verdict-word fix above):
+'.', ':', and ')' are all now accepted as the separator between the
+candidate number and its verdict word.
 
 BFS depth-exhaustion bug, fixed 2026-09-14: the loop used to also stop
 entirely the moment ANY goal gene was reached, even at depth 1, never
@@ -162,7 +214,7 @@ from common.config import DISEASE_PAIRS, get_pair
 from common.llm_client import LLMClient
 from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
 from PipelineB.metalinks_client import MetaboliteEdge, MetalinksClient
-from PipelineB.omnipath_client import Interaction, OmniPathClient
+from PipelineB.omnipath_client import EXTENDED_DATASETS, Interaction, OmniPathClient
 from PipelineB.pubmed_client import Citation
 
 DEFAULT_MAX_HOPS = 5
@@ -336,7 +388,11 @@ def _bfs_shortest_paths(
     found: List[List[_RawEdge]] = []
     depth = 0
 
-    while frontier and depth < max_hops and len(found) < max_paths:
+    # NOTE: the loop no longer stops early once len(found) reaches max_paths -- see the module
+    # docstring's "max_paths cutting off exploration too early" note. It only stops on
+    # `max_hops` or an exhausted frontier; `max_paths` is enforced once, as a trim, after the
+    # loop -- see the trim below.
+    while frontier and depth < max_hops:
         depth += 1
 
         if len(frontier) > _MAX_FRONTIER_SIZE:
@@ -377,8 +433,11 @@ def _bfs_shortest_paths(
                 ):
                     found_targets.add(edge.target_id)
                     found.append(new_path)
-                    if len(found) >= max_paths:
-                        return found
+                    # No max_paths check here -- see the note above the while loop and the
+                    # module docstring. Cutting off here (the old behavior) meant a run with
+                    # >= max_paths distinct depth-1 hits could exhaust the cap before ever
+                    # reaching depth 2, silently discarding the exact deeper/more-specific
+                    # candidates the goal-gene-expansion fix above exists to find.
 
                 # Keep exploring past this node regardless of whether it was just recorded as a
                 # goal gene -- a gene independently clearing Open Targets' disease2 threshold
@@ -389,6 +448,23 @@ def _bfs_shortest_paths(
                     visited.add(target_node)
                     next_frontier.append((target_node, new_path))
         frontier = next_frontier
+
+    if len(found) > max_paths:
+        # Trim only now, once the full max_hops search is done -- and prefer the longest
+        # (most-hop) candidates, not first-found order. Rationale: shallow, single-hop hits
+        # are exactly the kind the plausibility bar treats most skeptically (a single
+        # unqualified interaction needs a specific named mechanism to survive on its own,
+        # per _SELECTION_PROMPT_TEMPLATE), so letting them silently fill every max_paths slot
+        # before a deeper, more specific mechanism is ever found defeats the point of
+        # searching past a goal gene at all. sorted() is stable, so candidates of equal
+        # length keep their original discovery order (deterministic, matches existing tests).
+        print(
+            f"WARNING: Agent 2 BFS found {len(found)} candidate path(s), more than "
+            f"max_candidate_paths={max_paths}; keeping the {max_paths} with the most hops "
+            f"(deeper, more specific candidates over shallow ones) and dropping the rest.",
+            flush=True,
+        )
+        found = sorted(found, key=lambda path: -len(path))[:max_paths]
 
     return found
 
@@ -536,7 +612,16 @@ def _select_paths(
     # accepted any "<number>: <anything>" line) endorsed all of them anyway, because it had no way
     # to tell a discussed-but-rejected candidate apart from an endorsed one. See
     # claude/agent2_bfs_and_prompt_recalibration.md.
-    _VERDICT_RE = re.compile(r"\s*(\d+)\s*:\s*(NOT\s+PLAUSIBLE|PLAUSIBLE)\b[\s:.\-]*(.*)", re.IGNORECASE)
+    #
+    # Number/verdict separator, widened 2026-09-14 (same day): the prompt asks for
+    # "<number>: <verdict>", but a real run had the model write "<number>. <verdict>" instead
+    # (an ordinary numbered-list period, not the requested colon) on every single line -- the
+    # old regex required a literal ':' right after the digit, matched nothing at all, and the
+    # whole response was (wrongly) treated as unparseable, raising a RuntimeError instead of
+    # the correct "all candidates rejected" outcome. This model has now used two different
+    # separators across two real runs with similar prompts, so the fix is tolerance in the
+    # parser, not another prompt reword: '.', ':', and ')' are all accepted after the number.
+    _VERDICT_RE = re.compile(r"\s*(\d+)\s*[:.\)]\s*(NOT\s+PLAUSIBLE|PLAUSIBLE)\b[\s:.\-]*(.*)", re.IGNORECASE)
     selections: List[Tuple[List[_RawEdge], Optional[str]]] = []
     not_plausible: List[Tuple[int, str]] = []
     for line in response.strip().splitlines():
@@ -657,6 +742,16 @@ def _cli():
     parser.add_argument(
         "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops"
     )
+    parser.add_argument(
+        "--omnipath-datasets",
+        default=None,
+        help=(
+            "OmniPath dataset scope. Omit for the default core 'omnipath' set. Pass 'extended' "
+            f"as shorthand for '{EXTENDED_DATASETS}' (adds pathwayextra + kinaseextra, still-"
+            "curated but broader coverage), or a raw comma-separated dataset list. See "
+            "omnipath_client.py's module docstring and claude/agent2_bfs_and_prompt_recalibration.md."
+        ),
+    )
     args = parser.parse_args()
 
     if args.pair:
@@ -672,7 +767,15 @@ def _cli():
 
     print("Running Agent 2 (Chain Construction)...", flush=True)
     metalinks_client = None if args.no_metabolites else MetalinksClient()
-    agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, max_hops=args.max_hops)
+    if args.omnipath_datasets == "extended":
+        omnipath_client = OmniPathClient(datasets=EXTENDED_DATASETS)
+    elif args.omnipath_datasets:
+        omnipath_client = OmniPathClient(datasets=args.omnipath_datasets)
+    else:
+        omnipath_client = None  # OmniPathClient()'s own default (the core "omnipath" set)
+    agent2_result = run_agent2_chain(
+        agent1_result, omnipath_client=omnipath_client, metalinks_client=metalinks_client, max_hops=args.max_hops
+    )
 
     if not agent2_result.chains:
         reason_text = f' LLM\'s stated reason: "{agent2_result.rejection_reason}"' if agent2_result.rejection_reason else " (no reason given)"

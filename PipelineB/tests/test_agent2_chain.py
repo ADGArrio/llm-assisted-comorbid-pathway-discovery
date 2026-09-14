@@ -268,6 +268,81 @@ def test_all_candidates_marked_not_plausible_produces_a_joined_rejection_reason(
     assert "B-Y" in result.rejection_reason
 
 
+def test_verdict_lines_using_a_period_after_the_number_are_still_parsed():
+    """Regression test for a real crash, fixed 2026-09-14 (see agent2_chain.py's
+    module docstring, "Verdict-line separator widened"): a real run's LLM wrote
+    "1. NOT PLAUSIBLE - ..." (an ordinary numbered-list period) instead of the
+    prompt's own "1: NOT PLAUSIBLE - ..." example, on all 10 of its lines, and
+    the old regex -- which required a literal colon -- matched none of them,
+    raising RuntimeError instead of correctly reporting a blanket rejection.
+    This response (verbatim shape, trimmed to two candidates) must now parse
+    as two NOT PLAUSIBLE verdicts, not raise."""
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1. NOT PLAUSIBLE - The interaction between A and X lacks a specific, named "
+            "mechanism beyond a general activation relationship.\n"
+            "2. NOT PLAUSIBLE - The interaction between B and Y lacks a specific, named "
+            "mechanism beyond a general activation relationship."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.chains == []
+    assert "candidate 1" in result.rejection_reason
+    assert "candidate 2" in result.rejection_reason
+
+
+def test_verdict_lines_using_a_right_paren_after_the_number_are_still_parsed():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1) PLAUSIBLE - A directly activates X via a well-characterized cascade.\n"
+            "2) NOT PLAUSIBLE - no specific mechanism established for B-Y."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 1
+    assert result.chains[0].edges[0].source_gene == "A"
+
+
+def test_bfs_does_not_stop_exploring_once_max_paths_shallow_hits_are_found():
+    """Regression test for a real bug, fixed 2026-09-14 (see agent2_chain.py's
+    module docstring, "max_paths cutting off exploration too early"): on a real
+    run, 10 distinct depth-1 goal-gene hits filled max_candidate_paths (10)
+    before depth 2 was ever reached, so a deeper, more specific candidate never
+    got a chance to be found at all -- even after the goal-gene-expansion fix
+    that was supposed to let the search continue past a hit. Here 11 distinct
+    depth-1 hits exist (one more than the default cap) alongside a single
+    depth-2 hit reachable only through a non-goal bridge gene; the depth-2
+    candidate must still be found and must survive the max_paths trim (which
+    prefers longer/deeper candidates over shallow ones when there are too
+    many)."""
+    shallow_goals = [GeneAssociation(f"G{i}", f"ENSG{i}", f"P{i}", 0.5) for i in range(1, 12)]  # 11 of them
+    deep_goal = GeneAssociation("DEEP", "ENSG_DEEP", "P_DEEP", 0.9)
+    agent1_result = _agent1_result(
+        disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6)],
+        disease2_targets=shallow_goals + [deep_goal],
+    )
+    shallow_interactions = [
+        Interaction("A", "PA", f"G{i}", f"P{i}", "activates", f"PA->P{i}") for i in range(1, 12)
+    ]
+    bridge_interactions = [
+        Interaction("A", "PA", "MID", "P_MID", "activates", "PA->P_MID"),
+        Interaction("MID", "P_MID", "DEEP", "P_DEEP", "inhibits", "P_MID->P_DEEP"),
+    ]
+    omnipath = StubOmniPathClient(shallow_interactions + bridge_interactions)
+    llm = StubLLMClient(fixed_response="NONE: none of these have a specific enough mechanism.")
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert result.candidate_path_count == 10  # trimmed down from 12 real candidates found
+    assert "MID --inhibits--> DEEP" in llm.last_prompt  # the depth-2 candidate survived the trim
+
+
 def test_citations_for_path_genes_are_included_in_the_llm_prompt():
     agent1_result = _agent1_result(
         disease1_targets=[GeneAssociation("A", "ENSGA", "PA", 0.6), GeneAssociation("B", "ENSGB", "PB", 0.5)],

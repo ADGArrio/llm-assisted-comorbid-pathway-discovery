@@ -11,6 +11,25 @@ Used by: PipelineB.agent2_chain's BFS, to fetch each layer's outgoing
 directed interactions FROM a set of source genes to wherever they
 actually point -- including genes outside that set, so real intermediate
 bridge proteins can be discovered (not restricted back to a fixed list).
+
+Dataset scope (`datasets` param, added as an explicit comparison lever
+2026-09-14): `DEFAULT_DATASETS = "omnipath"` is OmniPath's core,
+highest-confidence combined resource -- the strictest curation bar.
+`EXTENDED_DATASETS` adds two more of OmniPath's own curated categories
+on top of it: `pathwayextra` (further curated signaling/pathway
+interactions with a somewhat looser inclusion bar than the core set) and
+`kinaseextra` (further kinase-substrate relationships specifically --
+the exact edge type a step like AKT1->GSK3B is). Both are still curated,
+sourced data, not inferred/predicted edges -- this is "how much of
+OmniPath's own curated catalog do we query," not "how strict is the
+evidence for one edge." Widening this changes what counts as a "real,
+grounded" edge for the whole Pipeline B comparison, which is a
+methods-relevant choice, not a pure bug fix -- see
+claude/agent2_bfs_and_prompt_recalibration.md for the decision to expose
+this as an explicit, comparable option (`run_agent2(...,
+omnipath_datasets="extended")` in main.py, or `--omnipath-datasets` on
+this module's sibling CLI in agent2_chain.py) rather than silently
+changing the default.
 """
 import csv
 import io
@@ -22,6 +41,7 @@ import requests
 
 DEFAULT_BASE_URL = "https://omnipathdb.org/interactions"
 DEFAULT_DATASETS = "omnipath"  # the core curated PPI set
+EXTENDED_DATASETS = "omnipath,pathwayextra,kinaseextra"  # + broader curated signaling/kinase coverage; see module docstring
 
 
 @dataclass

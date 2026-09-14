@@ -28,6 +28,7 @@ from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
 from PipelineB.agent3_confirmation import run_agent3_confirmation
 from PipelineB.agent4_mimic import run_agent4_mimic
 from PipelineB.metalinks_client import MetalinksClient
+from PipelineB.omnipath_client import EXTENDED_DATASETS, OmniPathClient
 
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -85,16 +86,34 @@ agent1_result.to_dict()
 
 
 # %% Pipeline B -- Agent 2 (Chain Construction)
-def run_agent2(agent1_result, max_hops: int = None, include_metabolites: bool = True):
+def run_agent2(
+    agent1_result,
+    max_hops: int = None,
+    include_metabolites: bool = True,
+    omnipath_datasets: Optional[str] = None,
+):
     """Agent 2: BFS chain construction over OmniPath (+ MetalinksDB metabolite
     hops by default), with an LLM adjudicating between equally-short candidates.
     Returns None if no structural path exists within max_hops (NoChainFoundError
     from BFS itself). A non-None result with an EMPTY chains list is a different,
     equally valid outcome: BFS found real candidates, but the LLM judged none of
     them biologically plausible enough to endorse -- printed explicitly below so
-    it's not mistaken for main.py silently doing nothing."""
+    it's not mistaken for main.py silently doing nothing.
+
+    omnipath_datasets (added 2026-09-14): None (default) queries OmniPath's core
+    curated set only. Pass "extended" to widen to core + pathwayextra + kinaseextra
+    (still curated, broader coverage -- see omnipath_client.py's module docstring),
+    or a raw comma-separated dataset string for anything else. This is the lever for
+    the core-vs-extended OmniPath coverage comparison -- e.g.
+    run_agent2(agent1_result) vs run_agent2(agent1_result, omnipath_datasets="extended")
+    on the same agent1_result, then compare candidate_path_count and the chains
+    themselves. See claude/agent2_bfs_and_prompt_recalibration.md."""
     kwargs = {"max_hops": max_hops} if max_hops else {}
     metalinks_client = MetalinksClient() if include_metabolites else None
+    if omnipath_datasets == "extended":
+        kwargs["omnipath_client"] = OmniPathClient(datasets=EXTENDED_DATASETS)
+    elif omnipath_datasets:
+        kwargs["omnipath_client"] = OmniPathClient(datasets=omnipath_datasets)
     try:
         result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **kwargs)
     except NoChainFoundError as e:
