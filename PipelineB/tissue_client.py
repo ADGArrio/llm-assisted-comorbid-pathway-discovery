@@ -103,6 +103,58 @@ gene/tissue check degrades to `None` ("no data this time") instead of
 raising and taking down the whole run -- same philosophy as GWAS
 Catalog's fix, see crossdb_client.py's bug-fix #2 note for the full
 reasoning.
+
+BUG FIX #4, DEFINITIVE ROOT CAUSE FOUND, 2026-09-14 (same day, after
+getting the user to run three standalone diagnostics directly against
+the live API from their own machine, since this sandbox cannot reach
+gtexportal.org at all -- see below): the persistent 0/18 result across
+every prior round was caused by TWO separate bugs, now both confirmed
+against the real, live API rather than inferred from secondary/
+conflicting documentation:
+
+(1) Bug-fix #2's "plural param names" theory was simply wrong. A live
+call to `/reference/gene?geneIds=IRS1&genomeBuild=...` returned a real
+`422 {"detail":[{"type":"missing","loc":["query","geneId"],"msg":"Field
+required","input":null}]}` -- the server itself says the plural
+`geneIds` is not a recognized param and the singular `geneId` is
+required. A follow-up call with `geneId=IRS1` (singular) returned a
+real `200` with IRS1's correct record. So bug-fix #1's original
+singular param names (`geneId`, `gencodeId`, `tissueSiteDetailId`) were
+right all along; bug-fix #2 regressed them based on a misreading of the
+ropensci/gtexr R package's docs -- that package's R-level argument name
+`geneIds` (which accepts an R vector, since R has no scalar/vector
+distinction) does not mean the wire-level query parameter key is
+plural. Its HTTP layer (httr2 with `.multi = "explode"`) actually sends
+the *same singular* key once per value. This is reverted below: both
+`_resolve_gencode_id` and `get_median_expression` go back to singular
+`geneId`/`gencodeId`/`tissueSiteDetailId`.
+
+(2) The real, previously-undiagnosed root cause of the 0/18 symptom
+itself was `GTEX_DEFAULT_DATASET_ID = "gtex_v10"`. A live diagnostic
+querying `/expression/medianGeneExpression` for IRS1's resolved
+gencodeId in Pancreas with `datasetId=gtex_v10` returned a real `200`
+but with `"data": []` -- a *silent* empty result, no error at all. The
+exact same query with `datasetId=gtex_v8` instead returned `200` with a
+real, correctly-shaped record (`median: 2.26513, unit: "TPM",
+geneSymbol: "IRS1"`). So `gtex_v10` is not a valid/populated dataset id
+on this endpoint (possibly not yet released on the live API, or named
+differently) -- every single request this module ever made, across all
+three prior "fixes," was silently filtered down to zero rows by this
+one bad default, regardless of whether the gene resolved correctly.
+This explains why the 0/18 symptom survived bug-fix #1 (which correctly
+fixed gene resolution) and only changed shape under bug-fix #2 (which
+additionally broke resolution itself, producing the 422). Fixed by
+changing `GTEX_DEFAULT_DATASET_ID` to `"gtex_v8"`.
+
+Both of these are now grounded in direct live-API responses obtained by
+the user running short standalone diagnostics (this sandbox still
+cannot reach gtexportal.org -- network allowlist blocks it, and
+WebFetch is blocked by its robots.txt), not inferred from third-party
+docs that turned out to disagree with each other and with the real
+server. If a future run still shows unexpectedly many "no GTEx record"
+results, the response bodies are now surfaced in the printed warning
+(see `_raise_for_status_with_body`) -- check those first before
+suspecting the param names or dataset id again.
 """
 import os
 import time
@@ -112,11 +164,15 @@ from typing import Dict, List, Optional
 import requests
 
 GTEX_DEFAULT_BASE_URL = "https://gtexportal.org/api/v2"
-GTEX_DEFAULT_DATASET_ID = "gtex_v10"
-# gtex_v10 (like v8) is built on the GRCh38/hg38 genome assembly -- passed explicitly when
-# resolving a gene symbol to its gencodeId so the resolved id's genome build actually matches
-# the dataset being queried (GTEx also serves a legacy GRCh37/hg19 gencodeVersion by default,
-# which would silently mismatch gtex_v10).
+GTEX_DEFAULT_DATASET_ID = "gtex_v8"
+# gtex_v10 looked like the natural choice (it's GTEx's newest release) but is NOT valid on this
+# live endpoint -- see bug-fix #4 in the module docstring: datasetId=gtex_v10 returns a silent
+# 200 {"data": []} for every gene/tissue combination, which is what caused the persistent 0/18
+# result across every prior "fix" in this file's history. gtex_v8 is confirmed (via a live
+# diagnostic) to return real data. gtex_v8 is built on the GRCh38/hg38 genome assembly -- passed
+# explicitly when resolving a gene symbol to its gencodeId so the resolved id's genome build
+# actually matches the dataset being queried (GTEx also serves a legacy GRCh37/hg19
+# gencodeVersion by default, which would silently mismatch gtex_v8).
 GTEX_DEFAULT_GENOME_BUILD = "GRCh38/hg38"
 
 # A gene counts as "expressed" in a tissue at >= this many nTPM. 1.0 is a
@@ -232,7 +288,7 @@ class GTExClient:
 
         resp = self._get(
             f"{self.base_url}/reference/gene",
-            params={"geneIds": gene_symbol, "genomeBuild": self.genome_build, "itemsPerPage": 10},
+            params={"geneId": gene_symbol, "genomeBuild": self.genome_build, "itemsPerPage": 10},
         )
         if resp.status_code == 429:
             print(
@@ -285,8 +341,8 @@ class GTExClient:
         resp = self._get(
             f"{self.base_url}/expression/medianGeneExpression",
             params={
-                "gencodeIds": gencode_id,
-                "tissueSiteDetailIds": tissue_site_detail_id,
+                "gencodeId": gencode_id,
+                "tissueSiteDetailId": tissue_site_detail_id,
                 "datasetId": self.dataset_id,
                 "itemsPerPage": 5,
             },

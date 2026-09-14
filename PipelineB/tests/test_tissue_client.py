@@ -75,23 +75,23 @@ def test_gtex_client_resolves_gene_symbol_to_gencode_id_before_querying_expressi
     """Regression test for the 2026-09-14 bug fixes (see tissue_client.py's module docstring):
     medianGeneExpression requires a versioned gencodeId, not a plain gene symbol -- GTExClient
     must resolve the symbol via /reference/gene first, then pass the resolved id -- not the
-    symbol itself -- to /expression/medianGeneExpression. And both requests must use GTEx's
-    actual (plural) query param names -- geneIds/gencodeIds/tissueSiteDetailIds, not
-    geneId/gencodeId/tissueSiteDetailId -- per bug fix #2: the singular names are silently
-    ignored by the real API rather than erroring, which is why the first fix alone still came
-    back with 0 results on a real run."""
+    symbol itself -- to /expression/medianGeneExpression. Both requests must use GTEx's actual
+    (singular) query param names -- geneId/gencodeId/tissueSiteDetailId -- per bug-fix #4: a
+    live 422 confirmed the plural forms (geneIds/gencodeIds/tissueSiteDetailIds, briefly used in
+    bug-fix #2 based on a misreading of a third-party R client's docs) are rejected by the real
+    API with "field required: geneId", and the singular forms succeed."""
     calls = []
 
     def fake_get(url, params, timeout):
         calls.append((url, params))
         if url.endswith("/reference/gene"):
-            assert params["geneIds"] == "INSR"
-            assert "geneId" not in params
+            assert params["geneId"] == "INSR"
+            assert "geneIds" not in params
             return _FakeResponse({"data": [{"geneSymbol": "INSR", "gencodeId": "ENSG00000171105.16"}]})
         assert url.endswith("/expression/medianGeneExpression")
-        assert params["gencodeIds"] == "ENSG00000171105.16"  # the resolved id, not "INSR"
-        assert params["tissueSiteDetailIds"] == "Pancreas"
-        assert "gencodeId" not in params and "tissueSiteDetailId" not in params
+        assert params["gencodeId"] == "ENSG00000171105.16"  # the resolved id, not "INSR"
+        assert params["tissueSiteDetailId"] == "Pancreas"
+        assert "gencodeIds" not in params and "tissueSiteDetailIds" not in params
         return _FakeResponse({"data": [{"median": 42.0}]})
 
     monkeypatch.setattr("PipelineB.tissue_client.requests.get", fake_get)
@@ -110,7 +110,7 @@ def test_gtex_client_caches_gencode_id_resolution_across_tissues(monkeypatch):
 
     def fake_get(url, params, timeout):
         if url.endswith("/reference/gene"):
-            resolve_calls.append(params["geneIds"])
+            resolve_calls.append(params["geneId"])
             return _FakeResponse({"data": [{"geneSymbol": "IRS1", "gencodeId": "ENSG00000169213.12"}]})
         return _FakeResponse({"data": [{"median": 7.0}]})
 
@@ -121,6 +121,29 @@ def test_gtex_client_caches_gencode_id_resolution_across_tissues(monkeypatch):
     client.get_median_expression("IRS1", "Liver")
 
     assert resolve_calls == ["IRS1"]  # resolved once, reused for the second tissue
+
+
+def test_gtex_client_defaults_to_gtex_v8_dataset(monkeypatch):
+    """Regression test for bug-fix #4 (see tissue_client.py's module docstring): datasetId
+    "gtex_v10" silently returns 200 {"data": []} for every query on the live API -- confirmed via
+    a live diagnostic -- which was the actual root cause of this module's persistent 0/18 bug
+    across three prior "fixes" that were all chasing the wrong thing (param name casing/plurality).
+    "gtex_v8" is confirmed to return real data for the same query, so it must stay the default;
+    this test exists so a future edit can't silently regress back to "gtex_v10"."""
+    seen_dataset_ids = []
+
+    def fake_get(url, params, timeout):
+        if url.endswith("/reference/gene"):
+            return _FakeResponse({"data": [{"geneSymbol": "IRS1", "gencodeId": "ENSG00000169213.12"}]})
+        seen_dataset_ids.append(params["datasetId"])
+        return _FakeResponse({"data": [{"median": 2.26513}]})
+
+    monkeypatch.setattr("PipelineB.tissue_client.requests.get", fake_get)
+    client = GTExClient()
+
+    assert client.dataset_id == "gtex_v8"
+    client.get_median_expression("IRS1", "Pancreas")
+    assert seen_dataset_ids == ["gtex_v8"]
 
 
 def test_gtex_client_returns_none_when_gene_symbol_does_not_resolve(monkeypatch):
