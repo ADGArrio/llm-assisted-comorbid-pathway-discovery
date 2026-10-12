@@ -234,6 +234,27 @@ future need for it surfaces.
 3 new tests (following the efoTraits link, stopping early once matched,
 and degrading gracefully if that follow-up is rate-limited), 120
 passing (was 117).
+
+BUG FIX #6, 2026-09-17: a real T2DM->CAD run crashed with an uncaught
+`requests.exceptions.ConnectTimeout` reaching www.ebi.ac.uk (30s timeout,
+no response at all -- not a 429). `_get`'s retry/backoff loop only
+handles a real HTTP 429 *response*; a connection-level failure (timeout,
+DNS hiccup, reset) raises straight out of `requests.get` before a
+response object even exists, so none of bug-fixes #2/#3's retry logic
+ever saw it, and it took the whole run down instead of degrading
+gracefully like every other failure mode this module already handles.
+
+Fixed by wrapping the `requests.get` call itself in a
+`try/except requests.exceptions.RequestException`, using the exact same
+`_MAX_RATE_LIMIT_RETRIES`/backoff loop as the 429 path. If it still
+hasn't succeeded after retries, `_get` returns a synthetic
+`requests.Response` with `status_code = 429` rather than raising --
+every caller already has "if resp.status_code == 429: log, set
+last_check_rate_limited, treat as not-checked" handling from bug-fix #2,
+so this reuses that existing degrade-gracefully path instead of adding a
+second one. A connection failure is conceptually the same as a
+rate-limit failure for this module's purposes: neither means "checked,
+found nothing," both mean "couldn't check this time."
 """
 import os
 import time
@@ -311,11 +332,37 @@ class GWASCatalogClient:
         # one, else exponential backoff) -- see module docstring's bug-fix #2 note. Callers
         # still get the response back even if it's a 429 on the final attempt -- they decide
         # whether to raise or degrade gracefully (this module always degrades; see callers).
+        #
+        # A connection-level failure (timeout, DNS hiccup, reset -- no HTTP response at all,
+        # distinct from a real 429 response) gets the same retry/backoff treatment and, if it
+        # never recovers, comes back as a synthetic 429 response so every caller's existing
+        # "still rate-limited after retries -- skip this part" handling covers it too, instead
+        # of crashing the run. See module docstring's bug-fix #6 note.
         backoff = _RATE_LIMIT_INITIAL_BACKOFF_SECONDS
         resp = None
         for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
             time.sleep(_REQUEST_PACING_SECONDS)
-            resp = requests.get(url, params=params, timeout=self.timeout, headers={"Accept": "application/json"})
+            try:
+                resp = requests.get(url, params=params, timeout=self.timeout, headers={"Accept": "application/json"})
+            except requests.exceptions.RequestException as exc:
+                if attempt == _MAX_RATE_LIMIT_RETRIES:
+                    print(
+                        f"GWAS Catalog: connection failure on {url} after {_MAX_RATE_LIMIT_RETRIES} retries "
+                        f"({exc.__class__.__name__}: {exc}) -- treating as rate-limited so callers skip "
+                        f"this part gracefully instead of crashing the run.",
+                        flush=True,
+                    )
+                    fake_resp = requests.Response()
+                    fake_resp.status_code = 429
+                    return fake_resp
+                print(
+                    f"GWAS Catalog: connection failure on {url} ({exc.__class__.__name__}) -- retrying in "
+                    f"{backoff:.1f}s (attempt {attempt + 1}/{_MAX_RATE_LIMIT_RETRIES})...",
+                    flush=True,
+                )
+                time.sleep(backoff)
+                backoff *= 2
+                continue
             if resp.status_code != 429:
                 return resp
             if attempt == _MAX_RATE_LIMIT_RETRIES:

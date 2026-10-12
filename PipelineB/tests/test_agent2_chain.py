@@ -105,6 +105,11 @@ def test_llm_can_select_a_single_candidate_among_several():
 
 
 def test_llm_can_select_multiple_plausible_candidates():
+    # enable_debate_tournament=False: this test is about stage-1 independent selection
+    # specifically (both candidates endorsed independently) -- the stage-2 pairwise debate
+    # tournament is exercised by its own dedicated tests below, since it needs a second,
+    # differently-shaped LLM response (a "WINNER: A/B ... RATIONALE: ..." debate verdict, not
+    # another PLAUSIBLE/NOT PLAUSIBLE line) that this test's single fixed_response doesn't provide.
     agent1_result, omnipath = _two_path_setup()
     llm = StubLLMClient(
         fixed_response=(
@@ -113,7 +118,7 @@ def test_llm_can_select_multiple_plausible_candidates():
         )
     )
 
-    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm, enable_debate_tournament=False)
 
     assert len(result.chains) == 2
     sources = {c.edges[0].source_gene for c in result.chains}
@@ -553,7 +558,9 @@ def test_bfs_keeps_searching_past_a_goal_gene_for_a_more_specific_one_deeper():
         )
     )
 
-    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    # enable_debate_tournament=False: this test is about BFS goal-gene-expansion behavior, not
+    # the stage-2 debate tournament -- see the comment on test_llm_can_select_multiple_plausible_candidates.
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm, enable_debate_tournament=False)
 
     assert result.candidate_path_count == 2
     lengths = sorted(len(c.edges) for c in result.chains)
@@ -693,3 +700,124 @@ def test_metabolite_edge_to_dict_includes_kind_and_hmdb_fields():
     assert edge_dict["target_kind"] == "metabolite"
     assert edge_dict["target_hmdb_id"] == "HMDB0000122"
     json.dumps(result.to_dict())
+
+
+# --- Pairwise debate ranking (stage 2) ---
+# See agent2_chain.py's module docstring, "Pairwise debate ranking" note, and
+# claude/committee_feedback_round2_coscientist.md section 3b.
+
+
+def _three_path_setup():
+    agent1_result = _agent1_result(
+        disease1_targets=[
+            GeneAssociation("A", "ENSGA", "PA", 0.6),
+            GeneAssociation("B", "ENSGB", "PB", 0.5),
+            GeneAssociation("C", "ENSGC", "PC", 0.4),
+        ],
+        disease2_targets=[
+            GeneAssociation("X", "ENSGX", "PX", 0.8),
+            GeneAssociation("Y", "ENSGY", "PY", 0.7),
+            GeneAssociation("Z", "ENSGZ", "PZ", 0.6),
+        ],
+    )
+    omnipath = StubOmniPathClient(
+        [
+            Interaction("A", "PA", "X", "PX", "activates", "PA->PX"),
+            Interaction("B", "PB", "Y", "PY", "inhibits", "PB->PY"),
+            Interaction("C", "PC", "Z", "PZ", "activates", "PC->PZ"),
+        ]
+    )
+    return agent1_result, omnipath
+
+
+def test_debate_tournament_runs_for_two_endorsed_candidates_and_updates_elo():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        responses=[
+            "1: PLAUSIBLE - Supported by direct literature evidence for A-X.\n"
+            "2: PLAUSIBLE - Also plausible based on known B-Y signaling.",
+            "WINNER: B\nRATIONALE: B-Y is a far better-characterized mechanism than A-X.",
+        ]
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 2
+    assert len(result.debate_log) == 1
+    debate = result.debate_log[0]
+    assert "B-Y is a far better-characterized mechanism" in debate.rationale
+    winner_chain = result.chains[debate.winner_index]
+    loser_chain = result.chains[debate.loser_index]
+    assert winner_chain.edges[0].source_gene == "B"  # B-Y was declared the winner
+    assert winner_chain.elo_rating > loser_chain.elo_rating
+    assert winner_chain.elo_rating > 1200.0
+    assert loser_chain.elo_rating < 1200.0
+    # winner sorts first
+    assert result.chains[0].edges[0].source_gene == "B"
+
+
+def test_single_endorsed_candidate_skips_tournament_entirely():
+    """A StubLLMClient given only ONE queued response would raise if the tournament tried a
+    second call -- proving the tournament is genuinely skipped, not just quietly reusing
+    something, when there's only one candidate to compare against nothing."""
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(responses=["2: PLAUSIBLE - Because B-Y is the more established pathway."])
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 1
+    assert result.chains[0].elo_rating is None
+    assert result.debate_log == []
+
+
+def test_debate_tournament_disabled_via_flag():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        fixed_response=(
+            "1: PLAUSIBLE - Supported by direct literature evidence for A-X.\n"
+            "2: PLAUSIBLE - Also plausible based on known B-Y signaling."
+        )
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm, enable_debate_tournament=False)
+
+    assert len(result.chains) == 2
+    assert result.debate_log == []
+    assert all(c.elo_rating is None for c in result.chains)
+
+
+def test_round_robin_tournament_with_three_candidates_runs_all_three_debates():
+    agent1_result, omnipath = _three_path_setup()
+    llm = StubLLMClient(
+        responses=[
+            "1: PLAUSIBLE - A-X mechanism.\n2: PLAUSIBLE - B-Y mechanism.\n3: PLAUSIBLE - C-Z mechanism.",
+            "WINNER: A\nRATIONALE: A beats B.",  # candidates 0 vs 1
+            "WINNER: A\nRATIONALE: A beats C.",  # candidates 0 vs 2
+            "WINNER: B\nRATIONALE: B beats C.",  # candidates 1 vs 2
+        ]
+    )
+
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    assert len(result.chains) == 3
+    assert len(result.debate_log) == 3  # full round-robin over 3 candidates = 3 pairs
+    # A won both its debates -- highest Elo, sorts first
+    assert result.chains[0].edges[0].source_gene == "A"
+    assert result.chains[0].elo_rating > result.chains[1].elo_rating > result.chains[2].elo_rating
+
+
+def test_unparseable_debate_response_raises():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(
+        responses=[
+            "1: PLAUSIBLE - Supported by direct literature evidence for A-X.\n"
+            "2: PLAUSIBLE - Also plausible based on known B-Y signaling.",
+            "I decline to pick a winner.",
+        ]
+    )
+
+    try:
+        run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "no parseable" in str(e)

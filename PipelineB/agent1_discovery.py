@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from common.config import DISEASE_PAIRS, get_pair
+from common.config import DISEASE_PAIRS, get_pair 
 from PipelineB.opentargets_client import GeneAssociation, OpenTargetsClient
 from PipelineB.pubmed_client import Citation, PubMedClient
 

@@ -5,6 +5,7 @@ from PipelineB.agent2_chain import Agent2ChainResult, ChainCandidate, ChainEdge
 from PipelineB.agent3_confirmation import run_agent3_confirmation
 from PipelineB.crossdb_client import GwasAssociation, StubGWASCatalogClient
 from PipelineB.opentargets_client import GeneAssociation
+from PipelineB.pubmed_client import EdgeCitation, StubPubMedClient
 from PipelineB.tissue_client import StubGTExClient
 
 DISEASE1 = "Type 2 Diabetes Mellitus"
@@ -66,6 +67,17 @@ def _metabolite_bridge_chain():
         target_hmdb_id=None,
     )
     return ChainCandidate(edges=[edge1, edge2], rationale="metabolite bridge rationale")
+
+
+def _three_hop_chain():
+    # INSR (disease1 endpoint) -> PRKCA (bridge) -> ARRB1 (bridge) -> APP (disease2 endpoint).
+    # Modeled on the real T2DM->CAD Pathway 2 chain (INSR->PRKCA->ARRB1->PDE4D) -- two bridge
+    # genes, so exactly one edge (PRKCA-ARRB1) has both ends being bridge genes. See
+    # agent3_confirmation.py's module docstring, "Edge-level literature validation" note.
+    edge1 = ChainEdge("INSR", "P06213", "PRKCA", "P_PRKCA", "activates", "INSR->PRKCA", 0.7, None)
+    edge2 = ChainEdge("PRKCA", "P_PRKCA", "ARRB1", "P_ARRB1", "activates", "PRKCA->ARRB1", None, None)
+    edge3 = ChainEdge("ARRB1", "P_ARRB1", "APP", "P05067", "activates", "ARRB1->APP", None, 0.6)
+    return ChainCandidate(edges=[edge1, edge2, edge3], rationale="three-hop bridge rationale")
 
 
 def _agent2_result(chains):
@@ -207,4 +219,113 @@ def test_to_dict_is_json_serializable():
     results = run_agent3_confirmation(
         agent1_result, agent2_result, gtex_client=StubGTExClient({"INSR|Pancreas": 5.0}), gwas_client=StubGWASCatalogClient({})
     )
+    json.dumps(results[0].to_dict())
+
+
+# --- Edge-level literature validation (added 2026-09-27) ---
+# See module docstring's "Edge-level literature validation" note and
+# claude/committee_feedback_round2_coscientist.md section 3a.
+
+
+def test_single_edge_chain_gets_no_literature_checks_no_bridge_edges_exist():
+    """A 1-hop chain has no edge with both ends being bridge genes (its one edge's both ends ARE
+    the two endpoints) -- zero literature checks is the correct, expected scoping outcome, not a
+    bug. See the module docstring's stated real consequence of this scoping decision."""
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_single_edge_chain()])
+    pubmed = StubPubMedClient(citations_by_gene={})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
+    assert results[0].edge_literature_checks == []
+    assert pubmed.edge_calls == []  # no PubMed query made at all
+
+
+def test_two_hop_chain_gets_no_literature_checks_every_edge_touches_an_endpoint():
+    """A 2-hop chain has exactly one bridge gene (MID) -- both its edges touch an endpoint
+    (INSR-MID, MID-APP), so neither edge has BOTH ends being bridge genes. Still zero checks,
+    same scoping rationale as the 1-hop case above."""
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_two_hop_chain()])
+    pubmed = StubPubMedClient(citations_by_gene={})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
+    assert results[0].edge_literature_checks == []
+    assert pubmed.edge_calls == []
+
+
+def test_three_hop_chain_checks_exactly_the_one_bridge_to_bridge_edge():
+    """INSR->PRKCA->ARRB1->APP: PRKCA and ARRB1 are both bridge genes, so the PRKCA-ARRB1 edge
+    (and only that edge) gets a literature check -- INSR-PRKCA and ARRB1-APP each touch an
+    endpoint and are skipped, per the confirmed scoping decision."""
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_three_hop_chain()])
+    edge_citation = EdgeCitation(
+        pmid="555", title="PRKCA-ARRB1 interaction", full_text_checked=True,
+        matched_text="PRKCA directly activates ARRB1 via GPCR desensitization.", both_genes_confirmed=True,
+    )
+    pubmed = StubPubMedClient(citations_by_gene={}, edge_citations_by_pair={("PRKCA", "ARRB1"): [edge_citation]})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
+    checks = results[0].edge_literature_checks
+    assert len(checks) == 1
+    assert checks[0].gene_a == "PRKCA"
+    assert checks[0].gene_b == "ARRB1"
+    assert checks[0].supported is True
+    assert checks[0].any_full_text_checked is True
+    assert pubmed.edge_calls == [("PRKCA", "ARRB1", 3)]
+
+
+def test_edge_literature_check_not_supported_when_no_confirming_citation():
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_three_hop_chain()])
+    unconfirmed_citation = EdgeCitation(
+        pmid="777", title="A tangentially related paper", full_text_checked=False,
+        matched_text="This abstract discusses PRKCA but not ARRB1.", both_genes_confirmed=False,
+    )
+    pubmed = StubPubMedClient(citations_by_gene={}, edge_citations_by_pair={("PRKCA", "ARRB1"): [unconfirmed_citation]})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
+    assert results[0].edge_literature_checks[0].supported is False
+    assert results[0].edge_literature_checks[0].any_full_text_checked is False
+
+
+def test_metabolite_involved_edges_are_skipped_from_literature_checks():
+    """An edge with a metabolite end has no gene-pair literature search to run, even if the gene
+    end happens to be a bridge gene -- see _edge_literature_checks' gene-kind check."""
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_metabolite_bridge_chain()])
+    pubmed = StubPubMedClient(citations_by_gene={})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
+    assert results[0].edge_literature_checks == []
+    assert pubmed.edge_calls == []
+
+
+def test_edge_literature_check_to_dict_is_json_serializable():
+    agent1_result = _agent1_result()
+    agent2_result = _agent2_result([_three_hop_chain()])
+    edge_citation = EdgeCitation(
+        pmid="555", title="t", full_text_checked=True, matched_text="both genes here", both_genes_confirmed=True
+    )
+    pubmed = StubPubMedClient(citations_by_gene={}, edge_citations_by_pair={("PRKCA", "ARRB1"): [edge_citation]})
+
+    results = run_agent3_confirmation(
+        agent1_result, agent2_result, gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=pubmed
+    )
+
     json.dumps(results[0].to_dict())

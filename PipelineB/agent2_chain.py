@@ -248,11 +248,38 @@ omnipath_client.py's module docstring's "Complex nodes are kept" note
 and claude/open_issues_for_committee.md. BFS sees them again as ordinary
 edges (their "gene" is just never a `goal_genes` member, so they can
 only ever be bridge hops, same as before this note was added).
+
+Pairwise debate ranking (added 2026-09-27, per committee feedback -- see
+claude/committee_feedback_round2_coscientist.md section 3b, and Gottweis
+et al. 2026's "Co-Scientist" Ranking agent): `_select_paths` above (now
+"stage 1") judges every candidate independently against a fixed rubric
+-- it never compares two candidates against each other, so nothing in
+its output actually answers "why would a scientist support this pathway
+OVER that one," only "is this pathway plausible in isolation." Stage 2,
+`_run_tournament` below, adds exactly that: every pair of stage-1-
+endorsed candidates is compared head-to-head via a simulated debate
+(`_run_debate`), the LLM picks a winner with a rationale, and an
+Elo-style rating (starting at 1200, Co-Scientist's own stated default)
+is updated after each debate. Every debate's winner AND its rationale
+are kept in `Agent2ChainResult.debate_log`, not just the final ranking
+-- the rationale is the actual answer to "why," a real head-to-head
+justification on file for every comparison, not one isolated verdict.
+Cost/scaling: comparing every pair costs O(n^2) LLM calls, fine for the
+typical n<=3-4 candidates this pipeline actually produces, but a
+single-elimination bracket (`_single_elimination_bracket_pairs`) is used
+instead once a run has more than `_TOURNAMENT_BRACKET_THRESHOLD`
+candidates, trading full pairwise coverage for bounded cost (~n debates
+instead of ~n^2/2). A single stage-1 selection skips the tournament
+entirely (nothing to compare) and keeps the initial 1200 rating.
+`run_agent2_chain(..., enable_debate_tournament=False)` / `_cli()`'s
+`--no-debate-tournament` disable this stage outright -- it multiplies
+LLM calls on top of an already-slow local Ollama backend, so it's worth
+timing on a real run before treating it as free.
 """
 import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from common.config import DISEASE_PAIRS, get_pair
@@ -265,6 +292,12 @@ from PipelineB.pubmed_client import Citation
 DEFAULT_MAX_HOPS = 5
 DEFAULT_MAX_CANDIDATE_PATHS = 10
 _MAX_FRONTIER_SIZE = 3000  # safety cap per BFS layer; see module docstring's "_MAX_FRONTIER_SIZE raised" note
+
+# Pairwise debate ranking (stage 2) -- see module docstring's "Pairwise debate ranking" note.
+_INITIAL_ELO = 1200.0  # matches Co-Scientist's own stated Ranking-agent default (Gottweis et al. 2026)
+_ELO_K_FACTOR = 32.0  # standard chess/Elo default; not tuned against real pipeline data yet
+_TOURNAMENT_BRACKET_THRESHOLD = 8  # candidate count above which a single-elimination bracket
+# replaces full round-robin, bounding cost to ~n debates instead of ~n^2/2 -- see module docstring.
 
 
 @dataclass
@@ -306,6 +339,9 @@ class ChainCandidate:
 
     edges: List[ChainEdge]
     rationale: Optional[str]
+    elo_rating: Optional[float] = None  # set by the stage-2 pairwise tournament; None if the
+    # tournament didn't run (single-candidate bypass, or enable_debate_tournament=False) -- see
+    # module docstring's "Pairwise debate ranking" note.
 
     @property
     def has_unconfirmed_direction(self) -> bool:
@@ -317,7 +353,24 @@ class ChainCandidate:
             "edges": [e.to_dict() for e in self.edges],
             "rationale": self.rationale,
             "has_unconfirmed_direction": self.has_unconfirmed_direction,
+            "elo_rating": self.elo_rating,
         }
+
+
+@dataclass
+class DebateComparison:
+    """One pairwise debate between two stage-1-endorsed candidate chains, kept in full so the
+    model's rationale for preferring one over the other stays on record -- see module docstring's
+    "Pairwise debate ranking" note. `winner_index`/`loser_index` refer to position in the final
+    `Agent2ChainResult.chains` list (i.e. already re-sorted by final Elo rating), not the
+    mid-tournament ordering, so a comparison can always be matched back to the chains it judged."""
+
+    winner_index: int
+    loser_index: int
+    rationale: str
+
+    def to_dict(self) -> dict:
+        return {"winner_index": self.winner_index, "loser_index": self.loser_index, "rationale": self.rationale}
 
 
 @dataclass
@@ -328,6 +381,7 @@ class Agent2ChainResult:
     candidate_path_count: int
     shared_genes: List[str]
     rejection_reason: Optional[str] = None  # set when chains is empty and the LLM gave a reason for rejecting everything
+    debate_log: List[DebateComparison] = field(default_factory=list)  # [] if the tournament didn't run; see module docstring
 
     def to_dict(self) -> dict:
         return {
@@ -337,6 +391,7 @@ class Agent2ChainResult:
             "candidate_path_count": self.candidate_path_count,
             "shared_genes": self.shared_genes,
             "rejection_reason": self.rejection_reason,
+            "debate_log": [d.to_dict() for d in self.debate_log],
         }
 
 
@@ -610,6 +665,30 @@ line starting with the word NONE, followed by a colon and one sentence explainin
 missing or unconvincing across the candidates as a whole."""
 
 
+_DEBATE_PROMPT_TEMPLATE = """You are a biomedical researcher comparing two candidate molecular \
+pathways head-to-head. Both have already been independently judged biologically plausible, and \
+both link a protein associated with {disease1} to a protein associated with {disease2}.
+
+Candidate A:
+{candidate_a_text}
+
+Candidate B:
+{candidate_b_text}
+
+Argue for which candidate is the MORE biologically plausible mechanism overall. Consider: the \
+specificity and strength of the named mechanism at each step, how well-established each gene's \
+role in {disease1} and {disease2} actually is, and how much any step leans on general reasoning \
+rather than a specific, named interaction. A candidate having more steps is not automatically \
+better or worse than a shorter one -- judge the actual evidence for each.
+
+Respond in exactly this format:
+WINNER: <A or B>
+RATIONALE: <one paragraph explaining why the winner is the stronger candidate, and what \
+specifically the other candidate lacks by comparison>"""
+
+_DEBATE_VERDICT_RE = re.compile(r"WINNER\s*:\s*([AB])\b.*?RATIONALE\s*:\s*(.*)", re.IGNORECASE | re.DOTALL)
+
+
 def _node_label(kind: str, node_id: str) -> str:
     # Input: a node's kind and id. Output: the string used to render it in the LLM prompt.
     return node_id if kind == "gene" else f"[metabolite] {node_id}"
@@ -651,6 +730,10 @@ def _select_paths(
     # tagged every candidate individually, its NOT PLAUSIBLE reasons joined together). Skips the LLM
     # (returns the single path, rationale=None, reason=None) when there's nothing to adjudicate.
     # Callers must still run every returned tuple through _with_unknown_direction_caveat.
+    #
+    # This is "stage 1" of a two-stage selection process -- see module docstring's "Pairwise
+    # debate ranking" note for stage 2 (_run_tournament), which compares these selections against
+    # each other rather than judging each in isolation.
     if len(paths) == 1:
         return [(paths[0], None)], None
 
@@ -711,6 +794,119 @@ def _select_paths(
     return selections, None
 
 
+def _run_debate(
+    candidate_a: Tuple[List[_RawEdge], Optional[str]],
+    candidate_b: Tuple[List[_RawEdge], Optional[str]],
+    disease1: str,
+    disease2: str,
+    citations: Dict[str, List[Citation]],
+    llm_client,
+) -> Tuple[int, str]:
+    # Input: two stage-1-selected (path, rationale) candidates, disease names, citations, LLM
+    # client. Output: (0 or 1 -- which one won: 0=A, 1=B) and the model's rationale text. Raises
+    # RuntimeError if the response can't be parsed -- same "don't silently guess" philosophy as
+    # _select_paths' own parsing above. See module docstring's "Pairwise debate ranking" note.
+    path_a, _ = candidate_a
+    path_b, _ = candidate_b
+    prompt = _DEBATE_PROMPT_TEMPLATE.format(
+        disease1=disease1,
+        disease2=disease2,
+        candidate_a_text=_format_candidate(1, path_a, citations),
+        candidate_b_text=_format_candidate(1, path_b, citations),
+    )
+    response = llm_client.generate(prompt, temperature=0.2)
+    match = _DEBATE_VERDICT_RE.search(response)
+    if not match:
+        raise RuntimeError(
+            f"Agent 2: pairwise debate response had no parseable 'WINNER: A/B ... RATIONALE: ...': {response!r}"
+        )
+    winner = 0 if match.group(1).upper() == "A" else 1
+    rationale = match.group(2).strip()
+    return winner, rationale
+
+
+def _update_elo(winner_rating: float, loser_rating: float, k: float = _ELO_K_FACTOR) -> Tuple[float, float]:
+    # Input: the two candidates' current ratings (winner first). Output: their updated ratings
+    # after one decisive win/loss (no draws -- every debate names exactly one winner). Standard
+    # Elo update; see module docstring's "Pairwise debate ranking" note for the initial-rating
+    # convention this borrows from Co-Scientist.
+    expected_winner = 1.0 / (1.0 + 10 ** ((loser_rating - winner_rating) / 400.0))
+    expected_loser = 1.0 - expected_winner
+    new_winner = winner_rating + k * (1.0 - expected_winner)
+    new_loser = loser_rating + k * (0.0 - expected_loser)
+    return new_winner, new_loser
+
+
+def _round_robin_pairs(n: int) -> List[Tuple[int, int]]:
+    # Input: candidate count. Output: every distinct pair (i, j), i<j -- a full round-robin.
+    return [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+
+def _single_elimination_bracket_pairs(n: int) -> List[Tuple[int, int]]:
+    # Input: a round's remaining-candidate count. Output: that round's pairings only (0v1, 2v3,
+    # ...) -- an odd one out is left unpaired here and given a bye by the caller. Later rounds
+    # depend on who wins each pairing, so `_run_tournament` calls this fresh for every round
+    # rather than precomputing a whole bracket up front.
+    pairs = []
+    i = 0
+    while i + 1 < n:
+        pairs.append((i, i + 1))
+        i += 2
+    return pairs
+
+
+def _run_tournament(
+    selections: List[Tuple[List[_RawEdge], Optional[str]]],
+    disease1: str,
+    disease2: str,
+    citations: Dict[str, List[Citation]],
+    llm_client,
+) -> Tuple[List[float], List[DebateComparison]]:
+    # Input: stage-1-selected candidates (path, rationale), disease names, citations, LLM client.
+    # Output: (elo_ratings parallel to `selections`, full debate log). Every debate's winner and
+    # rationale is kept, not just the final ranking -- see module docstring. A full round-robin is
+    # used when there are few enough candidates to keep cost bounded (n <= _TOURNAMENT_BRACKET_THRESHOLD),
+    # else a single-elimination bracket. A single candidate skips the tournament entirely (nothing
+    # to compare) and keeps the initial rating. `winner_index`/`loser_index` in the returned
+    # DebateComparisons refer to positions in `selections` (the caller re-maps these to the final,
+    # Elo-sorted `chains` order -- see run_agent2_chain).
+    n = len(selections)
+    ratings = [_INITIAL_ELO] * n
+    debate_log: List[DebateComparison] = []
+    if n <= 1:
+        return ratings, debate_log
+
+    if n <= _TOURNAMENT_BRACKET_THRESHOLD:
+        for i, j in _round_robin_pairs(n):
+            winner_offset, rationale = _run_debate(selections[i], selections[j], disease1, disease2, citations, llm_client)
+            winner_idx, loser_idx = (i, j) if winner_offset == 0 else (j, i)
+            ratings[winner_idx], ratings[loser_idx] = _update_elo(ratings[winner_idx], ratings[loser_idx])
+            debate_log.append(DebateComparison(winner_index=winner_idx, loser_index=loser_idx, rationale=rationale))
+        return ratings, debate_log
+
+    # Single-elimination bracket for larger fields -- bounds cost to ~n debates total instead of
+    # ~n^2/2, at the real cost of not comparing every pair. See module docstring.
+    remaining = list(range(n))
+    while len(remaining) > 1:
+        pairs = _single_elimination_bracket_pairs(len(remaining))
+        paired_positions = {pos for pair in pairs for pos in pair}
+        next_round = []
+        for a, b in pairs:
+            idx_a, idx_b = remaining[a], remaining[b]
+            winner_offset, rationale = _run_debate(
+                selections[idx_a], selections[idx_b], disease1, disease2, citations, llm_client
+            )
+            winner_idx, loser_idx = (idx_a, idx_b) if winner_offset == 0 else (idx_b, idx_a)
+            ratings[winner_idx], ratings[loser_idx] = _update_elo(ratings[winner_idx], ratings[loser_idx])
+            debate_log.append(DebateComparison(winner_index=winner_idx, loser_index=loser_idx, rationale=rationale))
+            next_round.append(winner_idx)
+        for pos, idx in enumerate(remaining):
+            if pos not in paired_positions:
+                next_round.append(idx)  # odd one out this round -- advances untouched, no debate
+        remaining = next_round
+    return ratings, debate_log
+
+
 def _to_chain_edges(
     path: List[_RawEdge],
     disease1_scores: Dict[str, float],
@@ -744,12 +940,15 @@ def run_agent2_chain(
     llm_client: Optional[object] = None,
     max_hops: int = DEFAULT_MAX_HOPS,
     max_candidate_paths: int = DEFAULT_MAX_CANDIDATE_PATHS,
+    enable_debate_tournament: bool = True,
 ) -> Agent2ChainResult:
     # Input: Agent 1's result, optional clients (omnipath_client defaults to real OmniPathClient;
     # metalinks_client defaults to None, meaning protein-only search -- pass a real MetalinksClient()
     # or StubMetalinksClient to include gene<->metabolite hops; llm_client defaults to real LLMClient;
-    # pass Stub* clients in tests), hop/candidate limits. Output: Agent2ChainResult.
-    # Raises NoChainFoundError if BFS finds nothing within max_hops.
+    # pass Stub* clients in tests), hop/candidate limits, and whether to run the stage-2 pairwise
+    # debate tournament (see module docstring's "Pairwise debate ranking" note -- on by default,
+    # but multiplies LLM calls; set False to skip it and keep only stage-1 independent selection).
+    # Output: Agent2ChainResult. Raises NoChainFoundError if BFS finds nothing within max_hops.
     omnipath_client = omnipath_client or OmniPathClient()
 
     disease1_scores, disease2_scores = _score_maps(agent1_result)
@@ -774,12 +973,39 @@ def run_agent2_chain(
         paths, agent1_result.disease1, agent1_result.disease2, agent1_result.citations, llm_client
     )
 
+    ratings = [None] * len(selections)
+    debate_log: List[DebateComparison] = []
+    if selections and enable_debate_tournament and len(selections) > 1:
+        ratings, raw_debate_log = _run_tournament(
+            selections, agent1_result.disease1, agent1_result.disease2, agent1_result.citations, llm_client
+        )
+    else:
+        raw_debate_log = []
+
+    # Sort by Elo rating (highest first) when the tournament ran; stable, so ties (and the
+    # untouched case where the tournament never ran, ratings all None) keep original discovery
+    # order -- matches existing tests that assume selection order when no tournament runs.
+    indexed = list(enumerate(selections))
+    tournament_ran = any(r is not None for r in ratings)
+    sort_key = (lambda pair: -ratings[pair[0]]) if tournament_ran else (lambda pair: 0)
+    indexed_sorted = sorted(indexed, key=sort_key)
+    old_to_new_index = {old_i: new_i for new_i, (old_i, _) in enumerate(indexed_sorted)}
+
     chains = [
         ChainCandidate(
             edges=_to_chain_edges(path, disease1_scores, disease2_scores),
             rationale=_with_unknown_direction_caveat(path, rationale),
+            elo_rating=ratings[old_i] if ratings and ratings[old_i] is not None else None,
         )
-        for path, rationale in selections
+        for old_i, (path, rationale) in indexed_sorted
+    ]
+    debate_log = [
+        DebateComparison(
+            winner_index=old_to_new_index[d.winner_index],
+            loser_index=old_to_new_index[d.loser_index],
+            rationale=d.rationale,
+        )
+        for d in raw_debate_log
     ]
 
     return Agent2ChainResult(
@@ -789,6 +1015,7 @@ def run_agent2_chain(
         candidate_path_count=len(paths),
         shared_genes=shared_genes,
         rejection_reason=rejection_reason if not chains else None,
+        debate_log=debate_log,
     )
 
 
@@ -801,6 +1028,11 @@ def _cli():
     parser.add_argument("--max-hops", type=int, default=DEFAULT_MAX_HOPS, help="Max PPI/metabolite hops to search")
     parser.add_argument(
         "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops"
+    )
+    parser.add_argument(
+        "--no-debate-tournament",
+        action="store_true",
+        help="Skip stage 2's pairwise debate tournament -- keep only stage 1's independent PLAUSIBLE/NOT PLAUSIBLE filter (see module docstring)",
     )
     parser.add_argument(
         "--omnipath-datasets",
@@ -834,7 +1066,11 @@ def _cli():
     else:
         omnipath_client = None  # OmniPathClient()'s own default (the core "omnipath" set)
     agent2_result = run_agent2_chain(
-        agent1_result, omnipath_client=omnipath_client, metalinks_client=metalinks_client, max_hops=args.max_hops
+        agent1_result,
+        omnipath_client=omnipath_client,
+        metalinks_client=metalinks_client,
+        max_hops=args.max_hops,
+        enable_debate_tournament=not args.no_debate_tournament,
     )
 
     if not agent2_result.chains:

@@ -14,6 +14,8 @@ instead of silently returning "" if content is still empty. Details:
 https://github.com/ollama/ollama/issues/15288, /15293, /15635.
 """
 import os
+from typing import List
+
 import requests
 
 
@@ -68,13 +70,36 @@ class LLMClient:
 
 
 class StubLLMClient:
-    """Fixed response, no network call. For tests."""
+    """Fixed or queued responses, no network call. For tests.
 
-    def __init__(self, fixed_response: str):
+    Added `responses` 2026-09-27, alongside Agent 2's pairwise debate tournament (see
+    agent2_chain.py's module docstring): a test that exercises more than one LLM call per run
+    (the stage-1 independent filter, then one or more stage-2 debates) needs a different response
+    for each call, which a single `fixed_response` can't provide. `responses` is consumed in
+    order, one per `generate()` call; `fixed_response` (unchanged) still works exactly as before
+    for every existing single/repeated-response test."""
+
+    def __init__(self, fixed_response: str = None, responses: List[str] = None):
+        # Input: either fixed_response (returned on every call) or responses (an ordered queue,
+        # one entry consumed per call) -- at least one is required.
+        if fixed_response is None and responses is None:
+            raise ValueError("StubLLMClient needs fixed_response or responses.")
         self.fixed_response = fixed_response
+        self._responses = list(responses) if responses is not None else None
         self.last_prompt = None
+        self.prompts: List[str] = []  # every prompt seen, in call order -- useful when a test needs to
+        # inspect more than just the most recent one (e.g. asserting on a specific debate's prompt).
 
     def generate(self, prompt: str, temperature: float = 0.3) -> str:
-        # Input: prompt (recorded to self.last_prompt for test assertions). Output: self.fixed_response.
+        # Input: prompt (recorded for test assertions). Output: the next queued response if
+        # `responses` was given, else the fixed one.
         self.last_prompt = prompt
+        self.prompts.append(prompt)
+        if self._responses is not None:
+            if not self._responses:
+                raise RuntimeError(
+                    "StubLLMClient: responses queue exhausted -- this test needs to provide "
+                    "more responses (one per generate() call, e.g. one per pairwise debate)."
+                )
+            return self._responses.pop(0)
         return self.fixed_response

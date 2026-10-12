@@ -544,3 +544,49 @@ def test_gwas_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
     client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
 
     assert 7.0 in _no_real_sleeping  # waited the server-specified Retry-After, not the default backoff
+
+
+def test_gwas_client_retries_connection_failure_and_succeeds(monkeypatch, _no_real_sleeping):
+    """Regression test for bug-fix #6 (see crossdb_client.py's module docstring): a real
+    T2DM->CAD run crashed with an uncaught ConnectTimeout -- a connection-level failure, not a
+    429 response -- because only the 429 path retried. A single transient connection failure
+    must not fail the request -- retry and use the response that eventually comes back."""
+    import requests as requests_module
+
+    search_payload = {"_embedded": {"singleNucleotidePolymorphisms": []}}
+    calls = {"n": 0}
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests_module.exceptions.ConnectTimeout("connection timed out")
+        return _FakeResponse(search_payload, status_code=200)
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", fake_get)
+    client = GWASCatalogClient()
+
+    results = client.get_gene_disease_associations("TCF7L2", "Type 2 Diabetes Mellitus")
+
+    assert results == []  # no SNPs in the (eventually successful) payload -- not an error
+    assert calls["n"] == 2  # first call raised, second call was the retry that succeeded
+
+
+def test_gwas_client_degrades_and_flags_rate_limited_after_exhausting_connection_retries(monkeypatch):
+    """If GWAS Catalog (or the network path to it) never responds at all, the whole pipeline
+    must not crash -- this is exactly the uncaught ConnectTimeout that motivated bug-fix #6.
+    The gene is treated as 'not checked this time' (same shape as a persistent 429), and
+    last_check_rate_limited is set so callers can tell it apart from a clean negative."""
+    import requests as requests_module
+
+    def always_times_out(url, params=None, timeout=None, headers=None):
+        raise requests_module.exceptions.ConnectTimeout("connection timed out")
+
+    monkeypatch.setattr("PipelineB.crossdb_client.requests.get", always_times_out)
+    monkeypatch.setattr("PipelineB.crossdb_client.time.sleep", lambda seconds: None)
+    client = GWASCatalogClient()
+
+    assert client.last_check_rate_limited is False  # nothing checked yet
+    results = client.get_gene_disease_associations("IRS1", "Type 2 Diabetes Mellitus")
+
+    assert results == []
+    assert client.last_check_rate_limited is True

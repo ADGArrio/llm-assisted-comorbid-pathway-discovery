@@ -11,7 +11,7 @@ Every run is saved as JSON under outputs/, named by disease pair id, so
 results persist across interactive sessions and are ready for comparison
 and the thesis writeup.
 
-Metrics (BioPathBench) were purged 2026-09-14 to get the bare pipelines
+Metrics (BioPathBench) were purged 2026-09-14 to get  the bare pipelines
 running cleanly first -- see claude/metrics_purge.md. This file only
 runs and saves both pipelines' raw output side by side; no scoring yet.
 """
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from common.config import get_pair
+from common.llm_client import LLMClient
 from PipelineA.pipeline_a import run_pipeline_a
 from PipelineB.agent1_discovery import run_agent1_discovery
 from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
@@ -34,7 +35,7 @@ OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Change this to "t2dm_cad" to run the other disease pair.
-PAIR_ID = "t2dm_ad"
+PAIR_ID = "t2dm_cad"  # or "t2dm_ad"
 pair = get_pair(PAIR_ID)
 DISEASE1, DISEASE2 = pair["disease1"], pair["disease2"]
 print(f"Disease pair: {DISEASE1} -> {DISEASE2}")
@@ -117,6 +118,27 @@ def _format_confirmation_summary(confirmation: dict) -> str:
     if metabolites:
         lines.append(f"  (metabolite hop(s) not tissue/GWAS-checked -- gene-centric only: {', '.join(metabolites)})")
 
+    edge_checks = confirmation.get("edge_literature_checks") or []
+    if edge_checks:
+        # Bridge edges only -- see agent3_confirmation.py's module docstring, "Edge-level
+        # literature validation" note. A 1- or 2-hop chain has none of these; that's expected,
+        # not printed as a caveat here since it's just an empty list, same as any other check.
+        lines.append("Edge-level literature check (bridge edges only):")
+        for check in edge_checks:
+            label = f"{check['gene_a']}-{check['gene_b']}"
+            if check.get("supported"):
+                confirming = next((c for c in check["citations"] if c.get("both_genes_confirmed")), None)
+                source = "full text" if confirming and confirming.get("full_text_checked") else "abstract"
+                lines.append(f"  {label}: supported by a passage in PMID {confirming['pmid']} ({source})")
+            elif check.get("citations"):
+                text_kind = "full text" if check.get("any_full_text_checked") else "abstract only"
+                lines.append(
+                    f"  {label}: {len(check['citations'])} citation(s) found co-mentioning both genes in "
+                    f"the original search, but no passage in the checked {text_kind} actually named both together"
+                )
+            else:
+                lines.append(f"  {label}: no PubMed citation found co-mentioning both genes at all")
+
     return "\n".join(lines)
 
 
@@ -194,6 +216,12 @@ def agent2_explanation(
     blocks = []
     for i, chain in enumerate(chains, start=1):
         label = f"Pathway {i}" if len(chains) > 1 else "Pathway"
+        # chains are already sorted by Elo rating (highest first) when the stage-2 pairwise
+        # debate tournament ran -- see agent2_chain.py's module docstring, "Pairwise debate
+        # ranking" note -- so an elo_rating here doubles as this pathway's rank among the
+        # endorsed candidates, not just a score.
+        elo = chain.get("elo_rating")
+        elo_text = f" [Elo {elo:.0f}]" if elo is not None else ""
         rationale = chain.get("rationale") or "(no rationale given)"
         caveat = (
             "\n(Note: at least one step's direction of effect is not confirmed by curated "
@@ -201,11 +229,28 @@ def agent2_explanation(
             if chain.get("has_unconfirmed_direction")
             else ""
         )
-        block = f"{label}: {_format_chain_pathway(chain, disease1, disease2)}\n{rationale}{caveat}"
+        block = f"{label}{elo_text}: {_format_chain_pathway(chain, disease1, disease2)}\n{rationale}{caveat}"
         if agent3_data is not None and i - 1 < len(agent3_data):
             block += "\n" + _format_confirmation_summary(agent3_data[i - 1])
         blocks.append(block)
+
+    debate_log = agent2_data.get("debate_log") or []
+    if debate_log:
+        blocks.append(_format_debate_log(debate_log, len(chains)))
+
     return "\n\n".join(blocks)
+
+
+def _format_debate_log(debate_log: list, chain_count: int) -> str:
+    """Every stage-2 pairwise debate Agent 2 ran between its endorsed candidates, in the order
+    they were run -- each debate's winner and the model's own rationale for preferring it, kept
+    in full rather than collapsed into just the final ranking. See agent2_chain.py's module
+    docstring, "Pairwise debate ranking" note. `winner_index`/`loser_index` refer to the final,
+    Elo-sorted Pathway numbers above (0-indexed here, so add 1 for the "Pathway N" label)."""
+    lines = [f"Pairwise debate log ({len(debate_log)} debate(s) among {chain_count} endorsed pathway(s)):"]
+    for d in debate_log:
+        lines.append(f"  Pathway {d['winner_index'] + 1} beat Pathway {d['loser_index'] + 1}: {d['rationale']}")
+    return "\n".join(lines)
 
 
 def pipeline_b_report(b_data: dict) -> str:
@@ -236,9 +281,18 @@ def pipeline_b_report(b_data: dict) -> str:
 
 
 # %% Pipeline A -- Orphaned LLM baseline
-def run_pipeline_a_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2) -> dict:
-    """Runs Pipeline A (one ungrounded LLM call) and saves its output."""
-    result = run_pipeline_a(disease1, disease2)
+def run_pipeline_a_and_save(disease1: str = DISEASE1, disease2: str = DISEASE2, llm_model: str = None) -> dict:
+    """Runs Pipeline A (one ungrounded LLM call) and saves its output.
+
+    llm_model (added 2026-10-04, for the multi-model comparison -- see
+    claude/committee_feedback_round2_coscientist.md action item 1 and
+    scripts/compare_llm_models.py): None (default) uses LLM_MODEL from .env,
+    same as always. Pass a model name (e.g. "qwen3:14b") to run this one call
+    against a different local Ollama model without touching .env -- useful for
+    a quick one-off comparison; the standalone script is the real multi-model
+    harness for a full run across both pipelines and both disease pairs."""
+    client = LLMClient(model=llm_model) if llm_model else None
+    result = run_pipeline_a(disease1, disease2, client=client)
     data = result.to_dict()
     save_json(data, f"pipeline_a_{PAIR_ID}.json")
     return data
@@ -279,6 +333,8 @@ def run_agent2(
     max_hops: int = None,
     include_metabolites: bool = True,
     omnipath_datasets: Optional[str] = None,
+    enable_debate_tournament: bool = True,
+    llm_model: str = None,
 ):
     """Agent 2: BFS chain construction over OmniPath (+ MetalinksDB metabolite
     hops by default), with an LLM adjudicating between equally-short candidates.
@@ -297,6 +353,11 @@ def run_agent2(
     on the same agent1_result, then compare candidate_path_count and the chains
     themselves. See claude/agent2_bfs_and_prompt_recalibration.md."""
     kwargs = {"max_hops": max_hops} if max_hops else {}
+    kwargs["enable_debate_tournament"] = enable_debate_tournament
+    if llm_model:
+        # See run_pipeline_a_and_save's llm_model docstring note -- same idea, applies to both
+        # of Agent 2's LLM calls (stage-1 selection and stage-2 debate, same client either way).
+        kwargs["llm_client"] = LLMClient(model=llm_model)
     metalinks_client = MetalinksClient() if include_metabolites else None
     if omnipath_datasets == "extended":
         kwargs["omnipath_client"] = OmniPathClient(datasets=EXTENDED_DATASETS)
@@ -328,13 +389,26 @@ agent2_result.to_dict() if agent2_result else None
 
 
 # %% Pipeline B -- Agent 3 (Independent Confirmation)
-def run_agent3(agent1_result, agent2_result):
-    """Agent 3: tissue-expression (GTEx) + cross-database (GWAS Catalog)
-    confirmation for each Agent 2 chain candidate. Returns [] if Agent 2
-    found no chain."""
+def run_agent3(agent1_result, agent2_result, enable_edge_literature: bool = True):
+    """Agent 3: tissue-expression (GTEx) + cross-database (GWAS Catalog) +
+    edge-level literature (PubMed/PMC, bridge edges only -- see
+    agent3_confirmation.py's module docstring) confirmation for each Agent
+    2 chain candidate. Returns [] if Agent 2 found no chain.
+    `enable_edge_literature=False` skips the new literature check (saves
+    PubMed/PMC queries) without touching the GTEx/GWAS checks."""
     if agent2_result is None:
         return []
-    return run_agent3_confirmation(agent1_result, agent2_result)
+    pubmed_client = None if enable_edge_literature else _NoOpPubMedClient()
+    return run_agent3_confirmation(agent1_result, agent2_result, pubmed_client=pubmed_client)
+
+
+class _NoOpPubMedClient:
+    """Used only by run_agent3(enable_edge_literature=False) above -- returns no citations for
+    any edge without making a real PubMed request, mirroring agent3_confirmation.py's own CLI
+    `--no-edge-literature` flag."""
+
+    def search_edge_citations(self, gene_a: str, gene_b: str, retmax: int = 3):
+        return []
 
 
 agent3_results = run_agent3(agent1_result, agent2_result)
@@ -449,3 +523,5 @@ def show_side_by_side(a_data: dict, b_data: dict) -> None:
 
 
 show_side_by_side(pipeline_a_output, pipeline_b_output)
+
+# %%

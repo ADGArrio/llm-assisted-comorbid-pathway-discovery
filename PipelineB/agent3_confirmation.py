@@ -1,13 +1,15 @@
 """
 Agent 3 -- Independent Confirmation.
 
-Service: none directly -- orchestrates tissue_client.py (GTEx) and
-crossdb_client.py (GWAS Catalog), both evidence sources Agent 1 never
-looked at during discovery.
-Data: per chain, runs (1) a tissue-expression check and (2) a
-cross-database gene-disease association check; see those modules for
-each service's own data shape. Output is a list of Agent3ConfirmationResult,
-one per chain.
+Service: none directly -- orchestrates tissue_client.py (GTEx),
+crossdb_client.py (GWAS Catalog), and pubmed_client.py (PubMed, for the
+new edge-level literature check below), sources Agent 1 never looked at
+during discovery (PubMed aside -- Agent 1 already uses it gene-level;
+see pubmed_client.py's module docstring).
+Data: per chain, runs (1) a tissue-expression check, (2) a cross-database
+gene-disease association check, and (3, new) an edge-level literature
+check on bridge edges; see those modules for each service's own data
+shape. Output is a list of Agent3ConfirmationResult, one per chain.
 Used by: the top-level pipeline, after Agent 2.
 
 Simplified 2026-09-14 to two sources total -- see
@@ -36,10 +38,35 @@ Findings are reported per-check, not collapsed into one pass/fail
 verdict -- no GWAS Catalog hit is real negative evidence, not proof a
 chain is wrong (a gene can matter mechanistically without registering
 in a genetics-only database).
+
+Edge-level literature validation (added 2026-09-27, per committee
+feedback -- see claude/committee_feedback_round2_coscientist.md section
+3a): the checks above validate individual GENES (is this gene expressed
+where it needs to be, is this gene independently disease-associated).
+None of them validate a specific claimed EDGE -- e.g. whether there is
+any real literature support for "PTPN1 inhibits CAPN1" specifically, as
+opposed to each gene separately being a reasonable biological player.
+`_edge_literature_checks` below adds exactly that, scoped deliberately
+to "bridge edges" only -- an edge whose BOTH ends are bridge/middle
+genes (`roles["middle"]`), not the chain's overall disease-anchored
+endpoints. This scoping was an explicit user decision (2026-09-27): a
+chain's two endpoint genes already have independent GWAS Catalog
+evidence, so bridge-to-bridge interactions are the part of a chain with
+the thinnest independent support today, and that's where a literature
+check adds the most value per PubMed/PMC query spent. A real, stated
+consequence: a 1-hop chain (a single edge, both ends are endpoints) or
+a 2-hop chain (one bridge gene, but every edge still touches an
+endpoint) has NO edge with both ends being bridge genes, so it gets
+zero literature checks -- an expected scoping outcome, not a bug, same
+spirit as this module's other documented scoping choices above. A
+citation existing is not automatically support -- see pubmed_client.py's
+EdgeCitation docstring; `EdgeLiteratureCheck.supported` only counts a
+real co-mentioning passage (full text or abstract), never a bare
+title-only match.
 """
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from common.config import DISEASE_RELEVANT_TISSUES, DISEASE_PAIRS, get_pair
@@ -47,6 +74,7 @@ from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discove
 from PipelineB.agent2_chain import Agent2ChainResult, ChainCandidate, run_agent2_chain
 from PipelineB.crossdb_client import GwasAssociation, GWASCatalogClient
 from PipelineB.metalinks_client import MetalinksClient
+from PipelineB.pubmed_client import EdgeCitation, PubMedClient
 from PipelineB.tissue_client import GTExClient, TissueExpressionResult, check_tissue_expression
 
 
@@ -78,10 +106,50 @@ class EndpointCrossDbCheck:
 
 
 @dataclass
+class EdgeLiteratureCheck:
+    """One bridge edge's literature-support check -- see module docstring's "Edge-level
+    literature validation" note. Only ever built for an edge whose both ends are bridge/middle
+    genes; a chain with no such edge (1- or 2-hop chains) simply has an empty
+    `edge_literature_checks` list on its Agent3ConfirmationResult."""
+
+    gene_a: str
+    gene_b: str
+    searched: bool  # always True today (every bridge edge is searched) -- kept as a field, not a
+    # constant, so a future reason to skip a specific edge (e.g. a transient PubMed failure) has
+    # somewhere honest to record "we meant to check this and couldn't" separately from "there was
+    # nothing here to check" (the 1-/2-hop chain case, which never creates this object at all).
+    citations: List[EdgeCitation]
+
+    @property
+    def supported(self) -> bool:
+        # True only if at least one citation actually confirms both genes named together in a
+        # checked passage -- a citation merely matching the original gene_a AND gene_b PubMed
+        # search is not enough on its own (see pubmed_client.py's EdgeCitation docstring).
+        return any(c.both_genes_confirmed for c in self.citations)
+
+    @property
+    def any_full_text_checked(self) -> bool:
+        # Whether at least one citation's check reached real full text rather than only an
+        # abstract -- useful context for how thorough a `supported=False` result actually was.
+        return any(c.full_text_checked for c in self.citations)
+
+    def to_dict(self) -> dict:
+        return {
+            "gene_a": self.gene_a,
+            "gene_b": self.gene_b,
+            "searched": self.searched,
+            "citations": [c.to_dict() for c in self.citations],
+            "supported": self.supported,
+            "any_full_text_checked": self.any_full_text_checked,
+        }
+
+
+@dataclass
 class Agent3ConfirmationResult:
     tissue_checks: List[TissueExpressionResult]
     endpoint_checks: List[EndpointCrossDbCheck]  # exactly 2: [disease1-endpoint, disease2-endpoint]
     chain_metabolites: List[str]  # metabolite-kind middle hops in this chain; never tissue/cross-db checked
+    edge_literature_checks: List[EdgeLiteratureCheck] = field(default_factory=list)  # bridge edges only; see module docstring
 
     @property
     def tissue_expressed_count(self) -> int:
@@ -99,6 +167,7 @@ class Agent3ConfirmationResult:
             "tissue_checked_count": self.tissue_checked_count,
             "tissue_total_count": len(self.tissue_checks),
             "chain_metabolites": self.chain_metabolites,
+            "edge_literature_checks": [c.to_dict() for c in self.edge_literature_checks],
         }
 
 
@@ -138,16 +207,37 @@ def _chain_gene_roles(chain: ChainCandidate) -> Dict[str, List[str]]:
     }
 
 
+def _edge_literature_checks(chain: ChainCandidate, roles: Dict[str, List[str]], pubmed_client) -> List[EdgeLiteratureCheck]:
+    # Input: a chain, its already-computed roles (see _chain_gene_roles), a PubMed client.
+    # Output: one EdgeLiteratureCheck per bridge edge -- an edge whose both ends are gene-kind
+    # AND both are bridge/middle genes (neither is the chain's disease1 or disease2 endpoint).
+    # See module docstring's "Edge-level literature validation" note for the scoping rationale
+    # and its real consequence for short chains (zero checks is expected, not a bug).
+    bridge_genes = set(roles["middle"])
+    checks: List[EdgeLiteratureCheck] = []
+    for edge in chain.edges:
+        if edge.source_kind != "gene" or edge.target_kind != "gene":
+            continue  # a metabolite-involved edge has no gene-pair literature search to run
+        if edge.source_gene in bridge_genes and edge.target_gene in bridge_genes:
+            citations = pubmed_client.search_edge_citations(edge.source_gene, edge.target_gene)
+            checks.append(
+                EdgeLiteratureCheck(gene_a=edge.source_gene, gene_b=edge.target_gene, searched=True, citations=citations)
+            )
+    return checks
+
+
 def _confirm_chain(
     chain: ChainCandidate,
     disease1: str,
     disease2: str,
     gtex_client,
     gwas_client,
+    pubmed_client,
 ) -> Agent3ConfirmationResult:
     # Input: one chain + both disease names + clients. Output: its Agent3ConfirmationResult
-    # (tissue checks for every gene, cross-db checks for the two endpoint genes only;
-    # metabolite middle hops are skipped for both and listed in chain_metabolites instead).
+    # (tissue checks for every gene, cross-db checks for the two endpoint genes only, edge
+    # literature checks for bridge edges only; metabolite middle hops are skipped for all three
+    # and listed in chain_metabolites instead).
     roles = _chain_gene_roles(chain)
     tissue_checks: List[TissueExpressionResult] = []
 
@@ -176,8 +266,13 @@ def _confirm_chain(
             )
         )
 
+    edge_literature_checks = _edge_literature_checks(chain, roles, pubmed_client)
+
     return Agent3ConfirmationResult(
-        tissue_checks=tissue_checks, endpoint_checks=endpoint_checks, chain_metabolites=roles["middle_metabolites"]
+        tissue_checks=tissue_checks,
+        endpoint_checks=endpoint_checks,
+        chain_metabolites=roles["middle_metabolites"],
+        edge_literature_checks=edge_literature_checks,
     )
 
 
@@ -186,8 +281,9 @@ def run_agent3_confirmation(
     agent2_result: Agent2ChainResult,
     gtex_client: Optional[object] = None,
     gwas_client: Optional[object] = None,
+    pubmed_client: Optional[object] = None,
 ) -> List[Agent3ConfirmationResult]:
-    # Input: Agent 1 + Agent 2 results, optional clients (both default to real clients;
+    # Input: Agent 1 + Agent 2 results, optional clients (all default to real clients;
     # pass Stub* clients in tests). Output: one Agent3ConfirmationResult per chain, same
     # order. [] if Agent 2 found no chain.
     if not agent2_result.chains:
@@ -195,9 +291,10 @@ def run_agent3_confirmation(
 
     gtex_client = gtex_client or GTExClient()
     gwas_client = gwas_client or GWASCatalogClient()
+    pubmed_client = pubmed_client or PubMedClient()
 
     return [
-        _confirm_chain(chain, agent1_result.disease1, agent1_result.disease2, gtex_client, gwas_client)
+        _confirm_chain(chain, agent1_result.disease1, agent1_result.disease2, gtex_client, gwas_client, pubmed_client)
         for chain in agent2_result.chains
     ]
 
@@ -211,6 +308,11 @@ def _cli():
     parser.add_argument("--max-hops", type=int, default=None, help="Max PPI/metabolite hops, passed to Agent 2 (defaults to agent2_chain's own default)")
     parser.add_argument(
         "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops in Agent 2"
+    )
+    parser.add_argument(
+        "--no-edge-literature",
+        action="store_true",
+        help="Skip Agent 3's edge-level literature check on bridge edges (saves PubMed/PMC queries; see module docstring)",
     )
     args = parser.parse_args()
 
@@ -231,7 +333,11 @@ def _cli():
     agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **agent2_kwargs)
 
     print("Running Agent 3 (Independent Confirmation)...", flush=True)
-    agent3_results = run_agent3_confirmation(agent1_result, agent2_result)
+    if args.no_edge_literature:
+        pubmed_client = _NoOpPubMedClient()
+    else:
+        pubmed_client = PubMedClient()
+    agent3_results = run_agent3_confirmation(agent1_result, agent2_result, pubmed_client=pubmed_client)
 
     print(
         json.dumps(
@@ -246,6 +352,15 @@ def _cli():
             indent=2,
         )
     )
+
+
+class _NoOpPubMedClient:
+    """Used only by `--no-edge-literature` above -- returns no citations for any edge, without
+    making a real PubMed request, so the literature-check step is a true no-op rather than a
+    slower search that's discarded."""
+
+    def search_edge_citations(self, gene_a: str, gene_b: str, retmax: int = 3):
+        return []
 
 
 if __name__ == "__main__":
