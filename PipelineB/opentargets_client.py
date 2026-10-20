@@ -79,6 +79,11 @@ def _pick_uniprot_id(protein_ids: List[dict]) -> Optional[str]:
     return None
 
 
+_META_QUERY = """
+query { meta { apiVersion { x y z } dataVersion { year month iteration } } }
+"""
+
+
 class OpenTargetsClient:
     def __init__(self, base_url: str = None, timeout: int = 60):
         self.base_url = base_url or os.environ.get("OPEN_TARGETS_BASE_URL", DEFAULT_BASE_URL)
@@ -96,6 +101,19 @@ class OpenTargetsClient:
         if payload.get("errors"):
             raise RuntimeError(f"Open Targets GraphQL error: {payload['errors']}")
         return payload["data"]
+
+    def get_data_version(self) -> dict:
+        # Output: {"api_version": "26.9.0", "data_version": "26.09"} -- which Open Targets release answered. The
+        # scores Agent 1 returns change between releases, so a saved run is only reproducible with this recorded
+        # (added 2026-10-18; verified live: data release 26.09).
+        meta = self._post(_META_QUERY, {})["meta"]
+        api = meta["apiVersion"]
+        data = meta["dataVersion"]
+        iteration = f".{data['iteration']}" if data.get("iteration") else ""
+        return {
+            "api_version": f"{api['x']}.{api['y']}.{api['z']}",
+            "data_version": f"{data['year']}.{data['month']}{iteration}",
+        }
 
     def search_disease(self, disease_name: str) -> str:
         # Input: free-text disease name. Output: best-matching EFO/MONDO id. Raises if no disease hit is found.
@@ -144,6 +162,9 @@ class StubOpenTargetsClient:
         self.efo_to_targets = efo_to_targets
         self.search_calls = []
         self.target_calls = []
+
+    def get_data_version(self) -> dict:
+        return {"api_version": "stub", "data_version": "stub"}
 
     def search_disease(self, disease_name: str) -> str:
         self.search_calls.append(disease_name)

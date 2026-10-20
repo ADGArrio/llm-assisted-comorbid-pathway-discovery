@@ -5,8 +5,15 @@ Service: OmniPath REST web service (https://omnipathdb.org/interactions),
 no key needed. Docs: pypath.omnipathdb.org/webservice.html.
 Data: tab-separated text; columns include source/target (UniProt ids),
 source_genesymbol/target_genesymbol, is_directed, is_stimulation,
-is_inhibition. Parsed defensively (exact wire format not yet confirmed
-live from this sandbox -- network allowlist blocks it).
+is_inhibition, consensus_stimulation, consensus_inhibition. Wire format
+confirmed live 2026-10-15 (flags are the strings "True"/"False"); the
+query also asks for `fields=sources,curation_effort` (per-edge evidence
+strength, added 2026-10-18).
+
+Direction rule (changed 2026-10-18): one flag -> that direction; neither ->
+"unknown"; BOTH (a tie, 1.6% of core edges) -> OmniPath's consensus columns
+if exactly one is set, else "unknown". It used to be "activates", which was
+wrong for 647 of the 1,418 core-network ties. See _interaction_type.
 Used by: PipelineB.agent2_chain's BFS, to fetch each layer's outgoing
 directed interactions FROM a set of source genes to wherever they
 actually point -- including genes outside that set, so real intermediate
@@ -58,8 +65,9 @@ claude/open_issues_for_committee.md, not resolved by code.
 import csv
 import io
 import os
+import time
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import requests
 
@@ -67,6 +75,9 @@ DEFAULT_BASE_URL = "https://omnipathdb.org/interactions"
 DEFAULT_DATASETS = "omnipath"  # the core curated PPI set
 EXTENDED_DATASETS = "omnipath,pathwayextra,kinaseextra"  # + broader curated signaling/kinase coverage; see module docstring
 _QUERY_BATCH_SIZE = 300  # genes per HTTP request -- see get_outgoing_interactions
+_MAX_REQUEST_ATTEMPTS = 4  # 1 try + 3 retries; added 2026-10-15 (before: any network blip aborted the whole BFS)
+_RETRY_BACKOFF_SECONDS = 1.0  # doubles each retry: 1, 2, 4
+_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 
 
 @dataclass
@@ -77,6 +88,8 @@ class Interaction:
     target_uniprot: str
     interaction_type: str  # "activates" | "inhibits" | "unknown"
     omnipath_edge_id: str
+    curation_effort: Optional[int] = None  # OmniPath's own count of (resource, reference) records behind the edge; None if not returned
+    n_sources: Optional[int] = None  # number of distinct source resources listing the edge; None if not returned
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +99,8 @@ class Interaction:
             "target_protein": self.target_uniprot,
             "interaction_type": self.interaction_type,
             "omnipath_edge_id": self.omnipath_edge_id,
+            "curation_effort": self.curation_effort,
+            "n_sources": self.n_sources,
         }
 
 
@@ -94,14 +109,37 @@ def _truthy(value: str) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes")
 
 
-def _interaction_type(is_stimulation: str, is_inhibition: str) -> str:
-    # Input: the two raw direction flags. Output: "activates"/"inhibits"/"unknown".
-    # Ties (both flags true) resolve to "activates"; neither flag set is "unknown", not dropped.
-    if _truthy(is_stimulation):
+def _interaction_type(
+    is_stimulation: str, is_inhibition: str, consensus_stimulation: str = "", consensus_inhibition: str = ""
+) -> str:
+    # Input: the two raw direction flags, plus OmniPath's own consensus flags (used ONLY to break a tie).
+    # Output: "activates"/"inhibits"/"unknown".
+    # Exactly one flag set -> that direction. Neither -> "unknown" (kept, not dropped).
+    # BOTH set (resources disagree; 1,418 of the 86,189 directed core edges, 1.6%): resolved by OmniPath's
+    # consensus columns when exactly one of them is set, otherwise "unknown". Until 2026-10-18 every tie was
+    # labelled "activates", which was wrong for 647 of the 1,418 (OmniPath's consensus says inhibition) and
+    # unsupported for the 215 whose consensus is neither/both -- see claude/agent2_hardening_provenance_maxhops.md.
+    stim, inhib = _truthy(is_stimulation), _truthy(is_inhibition)
+    if stim and not inhib:
         return "activates"
-    if _truthy(is_inhibition):
+    if inhib and not stim:
+        return "inhibits"
+    if not stim and not inhib:
+        return "unknown"
+    c_stim, c_inhib = _truthy(consensus_stimulation), _truthy(consensus_inhibition)
+    if c_stim and not c_inhib:
+        return "activates"
+    if c_inhib and not c_stim:
         return "inhibits"
     return "unknown"
+
+
+def _optional_int(value) -> Optional[int]:
+    # Input: a raw string field. Output: its integer value, or None if empty/not a number.
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _synthesize_edge_id(source_uniprot: str, target_uniprot: str) -> str:
@@ -137,11 +175,30 @@ class OmniPathClient:
                 "sources": ",".join(batch),
                 "genesymbols": "1",
                 "datasets": self.datasets,
+                "fields": "sources,curation_effort",  # per-edge evidence strength (added 2026-10-18)
             }
-            resp = requests.get(self.base_url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            interactions.extend(self._parse_response(resp.text))
+            interactions.extend(self._parse_response(self._get_with_retry(params)))
         return interactions
+
+    def _get_with_retry(self, params: dict) -> str:
+        # Input: query params for one batch. Output: the response body. Retries a connection error,
+        # timeout, 429 or 5xx with doubling backoff (_MAX_REQUEST_ATTEMPTS tries in all); any other
+        # HTTP error (e.g. 400) is a real bug and raises immediately. After the last attempt the
+        # original error is raised -- a failed layer is never silently treated as "no edges".
+        delay = _RETRY_BACKOFF_SECONDS
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                resp = requests.get(self.base_url, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                return resp.text
+            except requests.exceptions.RequestException as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                retryable = isinstance(error, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) \
+                    or status in _RETRYABLE_STATUS
+                if not retryable or attempt == _MAX_REQUEST_ATTEMPTS:
+                    raise
+                time.sleep(delay)
+                delay *= 2
 
     def _parse_response(self, text: str) -> List[Interaction]:
         # Input: raw TSV response body. Output: parsed Interaction list (directed edges only).
@@ -166,8 +223,15 @@ class OmniPathClient:
                     source_uniprot=source_uniprot,
                     target_gene=target_gene,
                     target_uniprot=target_uniprot,
-                    interaction_type=_interaction_type(row.get("is_stimulation", ""), row.get("is_inhibition", "")),
+                    interaction_type=_interaction_type(
+                        row.get("is_stimulation", ""),
+                        row.get("is_inhibition", ""),
+                        row.get("consensus_stimulation", ""),
+                        row.get("consensus_inhibition", ""),
+                    ),
                     omnipath_edge_id=_synthesize_edge_id(source_uniprot, target_uniprot),
+                    curation_effort=_optional_int(row.get("curation_effort")),
+                    n_sources=len([x for x in (row.get("sources") or "").split(";") if x]) or None,
                 )
             )
         return interactions

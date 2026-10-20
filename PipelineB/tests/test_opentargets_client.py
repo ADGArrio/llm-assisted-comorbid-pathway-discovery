@@ -51,3 +51,22 @@ def test_stub_get_associated_targets_filters_by_min_score():
     result = client.get_associated_targets("EFO_X", min_score=0.1)
     symbols = [t.gene_symbol for t in result]
     assert symbols == ["HIGH"]
+
+
+def test_get_data_version_reads_the_release_from_the_meta_query(monkeypatch):
+    from PipelineB.opentargets_client import OpenTargetsClient
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": {"meta": {"apiVersion": {"x": "26", "y": "9", "z": "0"},
+                                      "dataVersion": {"year": "26", "month": "09", "iteration": None}}}}
+
+    monkeypatch.setattr("PipelineB.opentargets_client.requests.post", lambda *a, **k: _Resp())
+    assert OpenTargetsClient().get_data_version() == {"api_version": "26.9.0", "data_version": "26.09"}
+
+
+def test_stub_client_reports_a_stub_version():
+    assert StubOpenTargetsClient({}, {}).get_data_version()["data_version"] == "stub"

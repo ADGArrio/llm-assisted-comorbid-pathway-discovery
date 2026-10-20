@@ -1,7 +1,7 @@
 """
 Generate thesis figures directly from real saved pipeline outputs.
 
-Reads: outputs/pipeline_b_t2dm_ad.json, outputs/pipeline_b_t2dm_cad.json,
+Reads: outputs/pipeline_b_t2dm_ad{FIG_RUN_SUFFIX}.json, outputs/pipeline_b_t2dm_cad{FIG_RUN_SUFFIX}.json,
        outputs/model_comparison/*.json, outputs/edge_literature_recall/t2dm_cad.json
 Writes: docs/figures/*.png  (also copied to ../Thesis/figures/)
 
@@ -138,8 +138,11 @@ print("wrote fig_multimodel_robustness.png")
 # =====================================================================
 # Figure 2: GTEx tissue-expression confirmation rate per endorsed chain
 # =====================================================================
-ad = load("outputs/pipeline_b_t2dm_ad.json")
-cad = load("outputs/pipeline_b_t2dm_cad.json")
+# Which saved Pipeline B run to plot: FIG_RUN_SUFFIX="_nometab" reads outputs/pipeline_b_<pair>_nometab.json
+# (the run reported in the thesis); empty (default) reads the latest main run.
+RUN_SUFFIX = os.environ.get("FIG_RUN_SUFFIX", "")
+ad = load(f"outputs/pipeline_b_t2dm_ad{RUN_SUFFIX}.json")
+cad = load(f"outputs/pipeline_b_t2dm_cad{RUN_SUFFIX}.json")
 
 rows = []
 for label_prefix, data in [("T2DM→AD", ad), ("T2DM→CAD", cad)]:
@@ -175,14 +178,24 @@ print("wrote fig_gtex_coverage.png")
 ad4 = ad["agent4"]
 cad4 = cad["agent4"]
 groups = ["T2DM → AD", "T2DM → CAD"]
-base_rates = [ad4["disease2_base_rate"], cad4["disease2_base_rate"]]
+from PipelineB.agent4_mimic import _two_by_two_stats  # recompute from counts so old saved results work too
+
+
+def _unexposed_rate(a4):
+    return (a4["n_disease2_patients"] - a4["n_both_patients"]) / (a4["n_total_patients"] - a4["n_disease1_patients"])
+
+
+base_rates = [_unexposed_rate(ad4), _unexposed_rate(cad4)]  # rate among patients WITHOUT T2DM
 cohort_rates = [ad4["disease2_rate_in_disease1_cohort"], cad4["disease2_rate_in_disease1_cohort"]]
-rrs = [ad4["relative_risk"], cad4["relative_risk"]]
+rrs = [
+    _two_by_two_stats(a["n_total_patients"], a["n_disease1_patients"], a["n_disease2_patients"], a["n_both_patients"])["relative_risk"]
+    for a in (ad4, cad4)
+]
 
 fig, ax = plt.subplots(figsize=(6.5, 4.2))
 x = range(len(groups))
 width = 0.32
-b1 = ax.bar([xi - width / 2 for xi in x], base_rates, width=width, color=BLUE, label="General population rate")
+b1 = ax.bar([xi - width / 2 for xi in x], base_rates, width=width, color=BLUE, label="Rate among patients without T2DM")
 b2 = ax.bar([xi + width / 2 for xi in x], cohort_rates, width=width, color=ORANGE, label="Rate among T2DM patients")
 for bars, vals in [(b1, base_rates), (b2, cohort_rates)]:
     for b, v in zip(bars, vals):

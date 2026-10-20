@@ -5,7 +5,9 @@ from PipelineB.pubmed_client import (
     EdgeCitation,
     PubMedClient,
     StubPubMedClient,
+    _abstracts_from_efetch_xml,
     _bioc_collections,
+    citation_query_term,
     _contains_both_genes,
     _first_paragraph_with_both_genes,
 )
@@ -173,3 +175,178 @@ def test_get_pmc_full_text_paragraphs_parses_the_real_response_shape():
         "This paragraph only mentions PRKCA.",
         "This paragraph mentions both PRKCA and ARRB1 together.",
     ]
+
+
+# --- Citation provenance + bibliographic metadata (added 2026-10-15) ---
+# Every Citation records which gene/disease search produced it (so a gene searched against both
+# diseases is never ambiguous) plus the bibliographic fields already present in the esummary
+# response the title was read from.
+
+
+def test_citation_query_term_uses_title_abstract_field_tags():
+    assert citation_query_term("INSR", "Alzheimer's Disease") == "INSR[Title/Abstract] AND Alzheimer's Disease[Title/Abstract]"
+
+
+def test_citation_to_dict_includes_every_provenance_and_metadata_field():
+    import json
+    d = Citation("1", "Old-style citation").to_dict()  # pmid + title only still works
+    assert set(d) == {
+        "pmid", "title", "gene_symbol", "disease_name", "query_term", "search_rank", "search_total_hits",
+        "pubdate", "epubdate", "journal", "authors", "doi", "pmcid", "pubtype", "url",
+    }
+    assert d["disease_name"] is None
+    json.dumps(d)
+
+
+def test_stub_tags_returned_citations_with_the_search_without_mutating_stored_ones():
+    stored = [Citation("1", "A"), Citation("2", "B")]
+    client = StubPubMedClient(citations_by_gene={"APP": stored})
+    result = client.search_citations("APP", "Alzheimer's Disease", retmax=2)
+
+    assert [c.search_rank for c in result] == [1, 2]
+    assert all(c.gene_symbol == "APP" and c.disease_name == "Alzheimer's Disease" for c in result)
+    assert result[0].query_term == "APP[Title/Abstract] AND Alzheimer's Disease[Title/Abstract]"
+    assert all(c.disease_name is None for c in stored)  # the configured objects are left alone
+
+
+# Trimmed from a real request made 2026-10-15: esearch for
+#   INSR[Title/Abstract] AND Alzheimer's Disease[Title/Abstract]  (retmax=2)
+# returned count "41"; the esummary record below keeps the real field names/shapes (authors list
+# shortened to two names, other unused fields dropped).
+_REAL_ESEARCH_RESPONSE = {"esearchresult": {"count": "41", "retmax": "2", "idlist": ["42694370", "42250112"]}}
+_REAL_ESUMMARY_RESPONSE = {
+    "result": {
+        "uids": ["42694370", "42250112"],
+        "42694370": {
+            "uid": "42694370",
+            "title": "A paper about INSR in Alzheimer's disease.",
+            "pubdate": "2026",
+            "epubdate": "2026 Aug 20",
+            "source": "Front Pharmacol",
+            "fulljournalname": "Frontiers in pharmacology",
+            "authors": [
+                {"name": "Song J", "authtype": "Author", "clusterid": ""},
+                {"name": "Yuan Y", "authtype": "Author", "clusterid": ""},
+            ],
+            "pubtype": ["Journal Article"],
+            "articleids": [
+                {"idtype": "pubmed", "idtypen": 1, "value": "42694370"},
+                {"idtype": "pmc", "idtypen": 8, "value": "PMC13538836"},
+                {"idtype": "pmcid", "idtypen": 5, "value": "pmc-id: PMC13538836;"},
+                {"idtype": "doi", "idtypen": 3, "value": "10.3389/fphar.2026.1873606"},
+            ],
+        },
+        # Second record deliberately sparse: no authors/ids/journal, as some real records are.
+        "42250112": {"uid": "42250112", "title": "A sparse record."},
+    }
+}
+
+
+def _client_with_canned_responses(esearch, esummary):
+    client = PubMedClient(api_key="k", email="e@example.com")
+    client.requests_made = []
+
+    def fake_get(path, params):
+        client.requests_made.append((path, params))
+        return esearch if path == "esearch.fcgi" else esummary
+
+    client._get = fake_get
+    return client
+
+
+def test_search_citations_records_provenance_and_bibliographic_metadata():
+    client = _client_with_canned_responses(_REAL_ESEARCH_RESPONSE, _REAL_ESUMMARY_RESPONSE)
+    result = client.search_citations("INSR", "Alzheimer's Disease", retmax=2)
+
+    first = result[0]
+    assert first.pmid == "42694370"
+    assert first.gene_symbol == "INSR"
+    assert first.disease_name == "Alzheimer's Disease"
+    assert first.query_term == "INSR[Title/Abstract] AND Alzheimer's Disease[Title/Abstract]"
+    assert first.search_rank == 1
+    assert first.search_total_hits == 41  # all matching papers, not just the 2 returned
+    assert first.pubdate == "2026" and first.epubdate == "2026 Aug 20"
+    assert first.journal == "Frontiers in pharmacology"
+    assert first.authors == ["Song J", "Yuan Y"]
+    assert first.doi == "10.3389/fphar.2026.1873606"
+    assert first.pmcid == "PMC13538836"
+    assert first.pubtype == ["Journal Article"]
+    assert first.url == "https://pubmed.ncbi.nlm.nih.gov/42694370/"
+
+    # The query actually sent to PubMed is the recorded one.
+    assert client.requests_made[0][1]["term"] == first.query_term
+
+
+def test_search_citations_tolerates_a_sparse_esummary_record():
+    client = _client_with_canned_responses(_REAL_ESEARCH_RESPONSE, _REAL_ESUMMARY_RESPONSE)
+    sparse = client.search_citations("INSR", "Alzheimer's Disease", retmax=2)[1]
+
+    assert sparse.pmid == "42250112" and sparse.search_rank == 2
+    assert sparse.title == "A sparse record."
+    assert sparse.authors is None and sparse.doi is None and sparse.pmcid is None and sparse.journal is None
+    assert sparse.url == "https://pubmed.ncbi.nlm.nih.gov/42250112/"
+
+
+def test_search_citations_returns_empty_list_without_calling_esummary_when_nothing_matches():
+    client = _client_with_canned_responses({"esearchresult": {"count": "0", "idlist": []}}, {})
+    assert client.search_citations("NOHITS", "Some Disease") == []
+    assert [path for path, _ in client.requests_made] == ["esearch.fcgi"]
+
+
+# --- fetch_abstracts (added 2026-10-15, for scripts/classify_citations.py) ---
+# Shape trimmed from a real efetch db=pubmed retmode=xml response (captured 2026-10-15): a structured
+# abstract with <AbstractText Label=...>, inline <i> markup, and an article with no abstract at all.
+_EFETCH_XML = """<?xml version="1.0"?>
+<PubmedArticleSet>
+ <PubmedArticle><MedlineCitation><PMID Version="1">111</PMID><Article>
+  <Abstract>
+   <AbstractText Label="BACKGROUND">Insulin resistance is common.</AbstractText>
+   <AbstractText Label="RESULTS">Knockdown of <i>INSR</i> reduced AKT signalling.</AbstractText>
+  </Abstract></Article></MedlineCitation></PubmedArticle>
+ <PubmedArticle><MedlineCitation><PMID Version="1">222</PMID><Article>
+  <Abstract><AbstractText>An unlabeled abstract.</AbstractText></Abstract>
+ </Article></MedlineCitation></PubmedArticle>
+ <PubmedArticle><MedlineCitation><PMID Version="1">333</PMID><Article>
+  <ArticleTitle>An editorial with no abstract</ArticleTitle>
+ </Article></MedlineCitation></PubmedArticle>
+</PubmedArticleSet>"""
+
+
+def test_abstracts_from_efetch_xml_labels_inline_markup_and_missing():
+    out = _abstracts_from_efetch_xml(_EFETCH_XML)
+    assert out["111"] == "BACKGROUND: Insulin resistance is common. RESULTS: Knockdown of INSR reduced AKT signalling."
+    assert out["222"] == "An unlabeled abstract."
+    assert "333" not in out
+
+
+def test_abstracts_from_efetch_xml_bad_xml_returns_empty():
+    assert _abstracts_from_efetch_xml("<html>rate limited") == {}
+
+
+def test_fetch_abstracts_batches_dedupes_and_tolerates_failed_batch():
+    client = PubMedClient()
+    calls = []
+
+    def fake_get_text(url, params=None):
+        calls.append(params["id"])
+        return _EFETCH_XML if len(calls) == 1 else None  # second batch fails -> just absent
+
+    client._get_text = fake_get_text
+    out = client.fetch_abstracts(["111", "222", "111", "444"], batch_size=2)
+    assert calls == ["111,222", "444"]
+    assert set(out) == {"111", "222"}
+
+
+def test_search_citations_sends_the_sort_only_when_one_is_configured(monkeypatch):
+    from PipelineB.pubmed_client import PubMedClient
+
+    seen = []
+
+    def fake_get(self, path, params):
+        seen.append((path, dict(params)))
+        return {"esearchresult": {"idlist": [], "count": "0"}}
+
+    monkeypatch.setattr(PubMedClient, "_get", fake_get)
+    PubMedClient().search_citations("INSR", "Alzheimer's Disease")
+    PubMedClient(sort="relevance").search_citations("INSR", "Alzheimer's Disease")
+    assert "sort" not in seen[0][1] and seen[1][1]["sort"] == "relevance"

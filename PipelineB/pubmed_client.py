@@ -65,8 +65,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional
+from xml.etree import ElementTree
 
 import requests
 
@@ -84,13 +85,94 @@ _MAX_RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 2.0
 
 
+def citation_query_term(gene_symbol: str, disease_name: str) -> str:
+    # Input: gene symbol + disease name. Output: the exact PubMed query string search_citations
+    # sends for that pair. A module-level function (not buried inside search_citations) so Agent 1
+    # can record the same string for a search that returned zero hits, where there is no Citation
+    # object to carry it.
+    return f"{gene_symbol}[Title/Abstract] AND {disease_name}[Title/Abstract]"
+
+
 @dataclass
 class Citation:
+    """One PubMed paper found by a gene-level search (Agent 1's `search_citations`).
+
+    Provenance fields (added 2026-10-15) record WHICH search produced this citation, so a gene
+    that was searched against both diseases (see agent1_discovery.cite_genes) never has an
+    ambiguous record. Bibliographic fields come from the same esummary response the title was
+    already read from -- no extra API call. Every field after `title` is optional so a citation
+    built by hand or loaded from an older saved run (pmid + title only) still works."""
+
     pmid: str
     title: str
+    # --- search provenance ---
+    gene_symbol: Optional[str] = None  # the gene this search was for
+    disease_name: Optional[str] = None  # the disease this search was for (disease 1 or 2 of the pair)
+    query_term: Optional[str] = None  # exact PubMed query string that found this paper
+    search_rank: Optional[int] = None  # 1 = first result in the order esearch returned. NOTE: that
+    # is PubMed's default order, which a 2026-10-15 probe showed is recency-weighted, NOT relevance
+    # (the same query with sort=relevance returned different, older papers). Rank 1 therefore means
+    # 'among the most recently indexed matches', not 'best match'.
+    search_total_hits: Optional[int] = None  # how many papers matched that search in total (esearch count)
+    # --- bibliographic metadata (from esummary) ---
+    pubdate: Optional[str] = None  # publication date as PubMed reports it (often just the year)
+    epubdate: Optional[str] = None  # electronic publication date, e.g. "2026 Aug 20"
+    journal: Optional[str] = None  # full journal name
+    authors: Optional[List[str]] = None  # every author name, in PubMed's order
+    doi: Optional[str] = None
+    pmcid: Optional[str] = None  # set only if the paper has a PubMed Central (open-access) copy
+    pubtype: Optional[List[str]] = None  # e.g. ["Journal Article", "Review"]
+    url: Optional[str] = None  # https://pubmed.ncbi.nlm.nih.gov/<pmid>/
 
     def to_dict(self) -> dict:
-        return {"pmid": self.pmid, "title": self.title}
+        return {
+            "pmid": self.pmid,
+            "title": self.title,
+            "gene_symbol": self.gene_symbol,
+            "disease_name": self.disease_name,
+            "query_term": self.query_term,
+            "search_rank": self.search_rank,
+            "search_total_hits": self.search_total_hits,
+            "pubdate": self.pubdate,
+            "epubdate": self.epubdate,
+            "journal": self.journal,
+            "authors": self.authors,
+            "doi": self.doi,
+            "pmcid": self.pmcid,
+            "pubtype": self.pubtype,
+            "url": self.url,
+        }
+
+
+def _citation_from_summary(
+    pmid: str,
+    doc: dict,
+    gene_symbol: str,
+    disease_name: str,
+    query_term: str,
+    rank: int,
+    total_hits: Optional[int],
+) -> Citation:
+    # Input: one esummary record (`doc`) plus the search it came from. Output: a fully-tagged Citation.
+    article_ids = {a.get("idtype"): a.get("value") for a in (doc.get("articleids") or [])}
+    authors = [a.get("name") for a in (doc.get("authors") or []) if a.get("name")]
+    return Citation(
+        pmid=pmid,
+        title=doc.get("title", ""),
+        gene_symbol=gene_symbol,
+        disease_name=disease_name,
+        query_term=query_term,
+        search_rank=rank,
+        search_total_hits=total_hits,
+        pubdate=doc.get("pubdate") or None,
+        epubdate=doc.get("epubdate") or None,
+        journal=doc.get("fulljournalname") or doc.get("source") or None,
+        authors=authors or None,
+        doi=article_ids.get("doi"),
+        pmcid=article_ids.get("pmc"),
+        pubtype=doc.get("pubtype") or None,
+        url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+    )
 
 
 @dataclass
@@ -161,6 +243,31 @@ def _bioc_collections(data) -> List[dict]:
     return []
 
 
+def _abstracts_from_efetch_xml(xml_text: str) -> Dict[str, str]:
+    # Input: efetch (db=pubmed, retmode=xml) response text. Output: {pmid: abstract} for every
+    # article that has one. A structured abstract's sections are joined as "LABEL: text" so the
+    # reader (human or LLM) can tell Methods from Conclusions; an unlabeled one is just joined.
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError:
+        return {}
+    out: Dict[str, str] = {}
+    for article in root.iter("PubmedArticle"):
+        pmid_el = article.find("MedlineCitation/PMID")
+        if pmid_el is None or not (pmid_el.text or "").strip():
+            continue
+        parts = []
+        for el in article.findall("MedlineCitation/Article/Abstract/AbstractText"):
+            text = "".join(el.itertext()).strip()  # itertext keeps text inside <i>/<sup> tags
+            if not text:
+                continue
+            label = el.get("Label")
+            parts.append(f"{label}: {text}" if label else text)
+        if parts:
+            out[pmid_el.text.strip()] = " ".join(parts)
+    return out
+
+
 class PubMedClient:
     def __init__(
         self,
@@ -169,12 +276,18 @@ class PubMedClient:
         api_key: str = None,
         email: str = None,
         timeout: int = 30,
+        sort: Optional[str] = None,
     ):
         self.base_url = (base_url or os.environ.get("PUBMED_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
         self.bioc_base_url = (bioc_base_url or os.environ.get("PUBMED_BIOC_BASE_URL", DEFAULT_BIOC_BASE_URL)).rstrip("/")
         self.api_key = api_key or os.environ.get("PUBMED_API_KEY")
         self.email = email or os.environ.get("PUBMED_EMAIL")
         self.timeout = timeout
+        # esearch `sort` for gene-disease citation searches. None keeps PubMed's default (recency) order, which is what
+        # every saved run and the citation classifier's hand-labelling set used; "relevance" asks for PubMed's
+        # Best Match ranking. Left at None on purpose until the classifier has been validated -- changing the search
+        # order changes which 77 papers exist. See claude/citation_evidence_classifier.md. Added 2026-10-18.
+        self.sort = sort
         self._last_request_time = 0.0
 
     def _throttle(self):
@@ -231,19 +344,25 @@ class PubMedClient:
     def search_citations(self, gene_symbol: str, disease_name: str, retmax: int = 3) -> List[Citation]:
         # Input: gene symbol, disease name, max results. Output: up to `retmax` Citations.
         # Returns [] if nothing found -- a normal, expected outcome, not an error.
-        term = f"{gene_symbol}[Title/Abstract] AND {disease_name}[Title/Abstract]"
-        search_data = self._get("esearch.fcgi", {"db": "pubmed", "term": term, "retmax": retmax})
-        pmids = search_data.get("esearchresult", {}).get("idlist", [])
+        term = citation_query_term(gene_symbol, disease_name)
+        search_params = {"db": "pubmed", "term": term, "retmax": retmax}
+        if self.sort:
+            search_params["sort"] = self.sort
+        search_data = self._get("esearch.fcgi", search_params)
+        esearch_result = search_data.get("esearchresult", {})
+        pmids = esearch_result.get("idlist", [])
         if not pmids:
             return []
+        count = str(esearch_result.get("count", ""))
+        total_hits = int(count) if count.isdigit() else None  # all papers matching, not just the retmax returned
 
         summary_data = self._get("esummary.fcgi", {"db": "pubmed", "id": ",".join(pmids)})
         result = summary_data.get("result", {})
         citations = []
-        for pmid in pmids:
+        for rank, pmid in enumerate(pmids, start=1):
             doc = result.get(pmid)
             if doc:
-                citations.append(Citation(pmid=pmid, title=doc.get("title", "")))
+                citations.append(_citation_from_summary(pmid, doc, gene_symbol, disease_name, term, rank, total_hits))
         return citations
 
     def search_edge_citations(self, gene_a: str, gene_b: str, retmax: int = 3) -> List[EdgeCitation]:
@@ -349,6 +468,25 @@ class PubMedClient:
         text = self._get_text(f"{self.base_url}/efetch.fcgi", params)
         return text.strip() if text else None
 
+    def fetch_abstracts(self, pmids: List[str], batch_size: int = 50) -> Dict[str, str]:
+        # Input: PMIDs. Output: {pmid: abstract text} for the ones that have an abstract; a PMID
+        # with no abstract (editorials, some letters) or a failed request is simply absent, so
+        # callers must treat "missing" as a normal outcome. One efetch call per `batch_size`
+        # PMIDs, parsed from efetch's XML so structured abstracts keep their section labels
+        # ("BACKGROUND: ...", "METHODS: ...") and the text has none of the author/affiliation
+        # header that `_get_abstract_text`'s plain-text mode includes.
+        abstracts: Dict[str, str] = {}
+        unique = list(dict.fromkeys(str(p) for p in pmids))
+        for start in range(0, len(unique), batch_size):
+            batch = unique[start:start + batch_size]
+            params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
+            if self.api_key:
+                params["api_key"] = self.api_key
+            text = self._get_text(f"{self.base_url}/efetch.fcgi", params)
+            if text:
+                abstracts.update(_abstracts_from_efetch_xml(text))
+        return abstracts
+
 
 class StubPubMedClient:
     """Fixed, injectable responses for offline tests -- no network call."""
@@ -363,7 +501,15 @@ class StubPubMedClient:
 
     def search_citations(self, gene_symbol: str, disease_name: str, retmax: int = 3) -> List[Citation]:
         self.calls.append((gene_symbol, disease_name, retmax))
-        return self.citations_by_gene.get(gene_symbol, [])[:retmax]
+        # Mirrors the real client's contract: every returned citation is tagged with the search
+        # that produced it. Copies (dataclasses.replace), not the stored objects, so one gene
+        # searched against two diseases yields two independently-tagged records.
+        query_term = citation_query_term(gene_symbol, disease_name)
+        found = self.citations_by_gene.get(gene_symbol, [])[:retmax]
+        return [
+            replace(c, gene_symbol=gene_symbol, disease_name=disease_name, query_term=query_term, search_rank=rank)
+            for rank, c in enumerate(found, start=1)
+        ]
 
     def search_edge_citations(self, gene_a: str, gene_b: str, retmax: int = 3) -> List[EdgeCitation]:
         self.edge_calls.append((gene_a, gene_b, retmax))

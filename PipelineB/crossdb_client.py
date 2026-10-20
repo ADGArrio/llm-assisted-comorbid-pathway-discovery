@@ -1,25 +1,42 @@
 """
 Agent 3, cross-database gene-disease association check -- GWAS Catalog.
 
-Service: GWAS Catalog REST API (https://www.ebi.ac.uk/gwas/rest/api,
-finder path /singleNucleotidePolymorphisms/search/findByGene -- the v1
-HAL pattern; the exact v1/v2 path couldn't be confirmed live from this
-sandbox, so this may 404 on a real run -- check
-https://www.ebi.ac.uk/gwas/rest/docs/api if so).
-Data: HAL JSON (_embedded.singleNucleotidePolymorphisms -> associations
--> efoTraits). This is real, numerical GWAS-study evidence (p-values,
-study accessions) rather than another literature-aggregation source --
-Agent 1's PubMed citations already cover literature evidence.
-Used by: PipelineB.agent3_confirmation, to independently confirm a
-chain's two disease-anchored endpoint genes against a source Open
-Targets doesn't itself aggregate.
+Service: GWAS Catalog REST API v2 (https://www.ebi.ac.uk/gwas/rest/api/v2), one endpoint:
+  GET /associations?mapped_gene=<SYMBOL>&efo_trait=<exact EFO trait name>&size=100&page=N
+Data: each association carries p_value, efo_traits [{efo_id, efo_trait}], mapped_genes,
+accession_id (the GCST study accession), pubmed_id and the SNP alleles. This is real, numerical
+GWAS-study evidence rather than another literature-aggregation source -- Agent 1's PubMed
+citations already cover literature evidence.
+Used by: PipelineB.agent3_confirmation, to independently confirm a chain's two disease-anchored
+endpoint genes against a source Open Targets does not itself aggregate.
 
-Simplified 2026-09-14 to GWAS Catalog only -- DisGeNET was dropped (see
-claude/agent3_simplification.md); the removed DisGeNETClient/
-StubDisGeNETClient/DisgenetAssociation code is still in git history if
-needed later.
+MIGRATION, 2026-10-18 (v1 -> v2). The v1 endpoint this module was built on
+(/singleNucleotidePolymorphisms/search/findByGene) now answers HTTP 410 Gone -- EBI retired it. A
+live run of the whole pipeline crashed Agent 3 on its first gene (FGFR4) with exactly that error.
+It failed LOUDLY (HTTPError), which is the right failure mode: it did not silently report "no
+GWAS evidence". The v2 API is much simpler: one request returns the associations themselves, with
+traits inline, instead of the v1 chain gene -> SNPs -> associations -> efoTraits (up to ~30
+requests per gene). Consequences:
+  * The v1 workarounds (follow each SNP's _links, de-duplicate rsIds, follow each association's
+    efoTraits link, walk up to 10 SNP pages) are gone. The pacing / 429-retry / connection-failure
+    handling in `_get` is kept unchanged.
+  * `study_accession` is now actually filled in (it was always None under v1).
+  * Trait matching is done SERVER-SIDE by exact EFO trait name (DISEASE_GWAS_TRAITS below) and
+    re-checked client-side. Verified live 2026-10-18 (counts of associations in the whole
+    Catalog): "type 2 diabetes mellitus" 8,864; "Alzheimer disease" 6,852; "coronary artery
+    disorder" 3,913. The old label "coronary artery disease" now returns ZERO -- the Catalog's
+    ontology renamed that trait to "coronary artery disorder", so the same name-matching would
+    silently have found nothing for every CAD gene. Narrower traits ("coronary atherosclerosis",
+    "myocardial infarction") are deliberately NOT included: they are different phenotypes.
+  * The old client-side term list contained the substring "cad" (would match e.g. "cadmium") and
+    "t2d"; terms are now matched on word boundaries.
+  * Only the 10 strongest (lowest p-value) associations per gene/disease are returned, to keep
+    the saved JSON small (APOE x Alzheimer has 138). Whether ANY exists is what `confirmed` uses.
+  * Behaviour change to remember when comparing runs: results from before this date came from the
+    v1 API and a different EFO vocabulary; do not mix them with new runs without saying so.
 
-BUG FIX, 2026-09-14: a real T2DM->AD run came back with 0/6 endpoint
+HISTORY of the v1 client (2026-09-14 .. 2026-09-17), kept because it explains the pacing and
+rate-limit design that survives: BUG FIX: a real T2DM->AD run came back with 0/6 endpoint
 checks confirmed -- including well-studied genes (INSR, IRS1, GLP1R)
 that certainly do have real GWAS Catalog hits. Root cause: findByGene's
 response nests SNPs under `_embedded.singleNucleotidePolymorphisms`, but
@@ -256,30 +273,30 @@ second one. A connection failure is conceptually the same as a
 rate-limit failure for this module's purposes: neither means "checked,
 found nothing," both mean "couldn't check this time."
 """
+
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import requests
 
-GWAS_DEFAULT_BASE_URL = "https://www.ebi.ac.uk/gwas/rest/api"
-_ASSOCIATIONS_BY_GENE_PATH = "/singleNucleotidePolymorphisms/search/findByGene"
-# Cap on how many of a gene's *distinct* SNPs (by rsId -- see bug-fix #4) get a follow-up
-# associations request -- a highly studied gene can turn up hundreds of SNPs across many search
-# result pages, and each now costs its own HTTP round trip, so this bounds worst-case request
-# count per gene/disease check. In practice _associations_for_snp stops early once a match is
-# found (see bug-fix #2 note), so this cap is really only exercised in full by genes with no
-# matching evidence at all.
-_MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS = 20
-# Safety cap on how many search *pages* get fetched while pursuing the distinct-SNP cap above --
-# independent of the live totalPages count, in case a gene has far more pages than are worth the
-# request budget to walk fully. See bug-fix #4: IRS1 alone had totalPages=6 for T2DM.
-_MAX_SEARCH_PAGES_PER_GENE = 10
-# Client-side pacing between requests, and 429 retry/backoff settings -- see bug-fix #2 note.
-# GWAS Catalog doesn't publish a documented rate limit, so these are conservative guesses, not
-# a verified real limit.
-_REQUEST_PACING_SECONDS = 1.0  # ~1 request/sec -- see bug-fix #3: 0.34s (~3/sec) was too fast in practice
+GWAS_DEFAULT_BASE_URL = "https://www.ebi.ac.uk/gwas/rest/api/v2"
+_ASSOCIATIONS_PATH = "/associations"
+_PAGE_SIZE = 100
+_MAX_PAGES_PER_TRAIT = 5  # safety cap: 500 associations per gene/trait is far more than needed
+_MAX_ASSOCIATIONS_RETURNED = 10  # strongest (lowest p-value) kept in the result
+
+# disease name -> exact GWAS Catalog EFO trait names to query. See the 2026-10-18 migration note.
+DISEASE_GWAS_TRAITS = {
+    "Type 2 Diabetes Mellitus": ["type 2 diabetes mellitus"],
+    "Alzheimer's Disease": ["Alzheimer disease"],
+    "Coronary Artery Disease": ["coronary artery disorder"],
+}
+
+# Client-side pacing between requests, and 429 retry/backoff settings -- see the v1 history above.
+_REQUEST_PACING_SECONDS = 1.0
 _MAX_RATE_LIMIT_RETRIES = 5
 _RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 5.0
 
@@ -291,6 +308,7 @@ class GwasAssociation:
     efo_id: Optional[str]
     pvalue: Optional[float]
     study_accession: Optional[str]
+    pubmed_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -299,30 +317,32 @@ class GwasAssociation:
             "efo_id": self.efo_id,
             "pvalue": self.pvalue,
             "study_accession": self.study_accession,
+            "pubmed_id": self.pubmed_id,
         }
+
+
+_DISEASE_KEY_TERMS = {
+    "Type 2 Diabetes Mellitus": ["type 2 diabetes", "type ii diabetes", "t2dm", "t2d"],
+    "Alzheimer's Disease": ["alzheimer"],
+    "Coronary Artery Disease": ["coronary artery disease", "coronary artery disorder", "coronary heart disease"],
+}
 
 
 def _trait_matches_disease(trait_name: str, disease_name: str) -> bool:
     # Input: a GWAS Catalog trait string, this project's disease name.
-    # Output: loose substring match (GWAS Catalog trait text isn't a controlled vocabulary) --
-    # a first-pass filter; review matches by hand, don't trust this alone.
-    disease_key_terms = {
-        "Type 2 Diabetes Mellitus": ["type 2 diabetes", "type ii diabetes", "t2dm", "t2d"],
-        "Alzheimer's Disease": ["alzheimer"],
-        "Coronary Artery Disease": ["coronary artery disease", "coronary heart disease", "cad"],
-    }
-    terms = disease_key_terms.get(disease_name, [disease_name.lower()])
+    # Output: True if the trait text contains one of the disease's key terms as whole words. A
+    # first-pass filter on top of the server-side exact-trait query; review matches by hand.
+    terms = _DISEASE_KEY_TERMS.get(disease_name, [disease_name.lower()])
     trait_lower = trait_name.lower()
-    return any(term in trait_lower for term in terms)
+    return any(re.search(r"\b" + re.escape(term) + r"\b", trait_lower) for term in terms)
 
 
 class GWASCatalogClient:
     def __init__(self, base_url: str = None, timeout: int = 30):
         self.base_url = base_url or os.environ.get("GWAS_CATALOG_BASE_URL", GWAS_DEFAULT_BASE_URL)
         self.timeout = timeout
-        # Set True if any part of the most recent get_gene_disease_associations call gave up
-        # after exhausting retries -- see bug-fix #3 in the module docstring. Reset to False at
-        # the start of every call, so it always reflects only the most recent check.
+        # True if the most recent get_gene_disease_associations call gave up after exhausting
+        # retries (rate limit or connection failure) -- "not fully checked", NOT a clean negative.
         self.last_check_rate_limited = False
 
     def _get(self, url: str, params: dict = None):
@@ -379,159 +399,69 @@ class GWASCatalogClient:
         return resp
 
     def get_gene_disease_associations(self, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
-        # Input: gene symbol, disease name. Output: associations whose trait text matches the
-        # disease (see _trait_matches_disease). [] means no hits, no match, or still rate-limited
-        # after retries -- none of these are treated as an error (see module docstring). Check
-        # self.last_check_rate_limited right after calling this if you need to tell "checked,
-        # found nothing" apart from "gave up on some part of this check due to persistent rate
-        # limiting" -- see bug-fix #3 in the module docstring.
+        # Input: gene symbol, disease name. Output: up to _MAX_ASSOCIATIONS_RETURNED associations
+        # (lowest p-value first) between SNPs mapped to that gene and the disease's GWAS traits.
+        # [] means none found OR still rate-limited after retries -- check last_check_rate_limited
+        # to tell them apart. A 404/410 raises (the endpoint moved/was retired): an API change must
+        # fail loudly, never look like "no evidence".
         self.last_check_rate_limited = False
-        results: List[GwasAssociation] = []
-        seen_rsids = set()
-        first_page_payload = None
-
-        for page_number in range(_MAX_SEARCH_PAGES_PER_GENE):
-            resp = self._get(
-                f"{self.base_url}{_ASSOCIATIONS_BY_GENE_PATH}",
-                params={"geneName": gene_symbol, "page": page_number},
-            )
-            if resp.status_code == 404:
-                raise RuntimeError(
-                    f"GWAS Catalog: {_ASSOCIATIONS_BY_GENE_PATH} 404'd for gene {gene_symbol!r} -- the "
-                    f"v1/v2 endpoint shape may have changed. Check https://www.ebi.ac.uk/gwas/rest/docs/api "
-                    f"and update crossdb_client.py's _ASSOCIATIONS_BY_GENE_PATH."
+        found: Dict[str, GwasAssociation] = {}
+        for trait in DISEASE_GWAS_TRAITS.get(disease_name, [disease_name]):
+            for page_number in range(_MAX_PAGES_PER_TRAIT):
+                resp = self._get(
+                    f"{self.base_url}{_ASSOCIATIONS_PATH}",
+                    params={"mapped_gene": gene_symbol, "efo_trait": trait, "size": _PAGE_SIZE, "page": page_number},
                 )
-            if resp.status_code == 429:
-                print(
-                    f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries for gene "
-                    f"{gene_symbol!r} (page {page_number}) -- skipping the rest of this gene's check this "
-                    f"run (treated as 'not checked', not a real negative).",
-                    flush=True,
-                )
-                self.last_check_rate_limited = True
-                return results
-            resp.raise_for_status()
-            payload = resp.json()
-            if first_page_payload is None:
-                first_page_payload = payload
-
-            snps = payload.get("_embedded", {}).get("singleNucleotidePolymorphisms", [])
-            for snp in snps:
-                rsid = snp.get("rsId")
-                if rsid is not None:
-                    if rsid in seen_rsids:
-                        # findByGene repeats the same rsId more than once within a page in
-                        # practice (a confirmed live-response quirk, not a diagnostic artifact --
-                        # see bug-fix #4) -- skip the duplicate rather than pay for a second
-                        # identical follow-up request.
-                        continue
-                    seen_rsids.add(rsid)
-                results.extend(self._associations_for_snp(snp, gene_symbol, disease_name))
-                if results:
-                    # One matching association is enough to prove `confirmed=True` -- stop paying
-                    # for further per-SNP follow-up requests to this gene. See bug-fix #2 note.
+                if resp.status_code in (404, 410):
+                    raise RuntimeError(
+                        f"GWAS Catalog: {_ASSOCIATIONS_PATH} returned HTTP {resp.status_code} for gene "
+                        f"{gene_symbol!r} -- the API path has changed or been retired. Check "
+                        f"https://www.ebi.ac.uk/gwas/rest/docs and update crossdb_client.py."
+                    )
+                if resp.status_code == 429:
+                    print(
+                        f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries for gene "
+                        f"{gene_symbol!r} -- treated as 'not checked', not a real negative.",
+                        flush=True,
+                    )
+                    self.last_check_rate_limited = True
+                    return self._best(found)
+                resp.raise_for_status()
+                payload = resp.json()
+                for assoc in payload.get("_embedded", {}).get("associations", []):
+                    self._collect(assoc, gene_symbol, disease_name, found)
+                if page_number + 1 >= payload.get("page", {}).get("totalPages", 1):
                     break
-                if len(seen_rsids) >= _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS:
-                    break
+        return self._best(found)
 
-            if results or len(seen_rsids) >= _MAX_SNPS_PER_GENE_FOR_ASSOCIATIONS:
-                break
+    @staticmethod
+    def _best(found: Dict[str, GwasAssociation]) -> List[GwasAssociation]:
+        ranked = sorted(found.values(), key=lambda a: (a.pvalue is None, a.pvalue if a.pvalue is not None else 0.0))
+        return ranked[:_MAX_ASSOCIATIONS_RETURNED]
 
-            total_pages = payload.get("page", {}).get("totalPages", 1)
-            if page_number + 1 >= total_pages:
-                break  # no more pages to walk
-
-        # Defensive fallback for the other plausible HAL shape (associations embedded directly
-        # at the top level rather than nested per-SNP) -- see bug-fix note in the module
-        # docstring on why the exact live shape couldn't be confirmed from this sandbox. Checked
-        # against the first page only -- if this shape is ever what a real response actually
-        # uses, it wouldn't be paginated the same way as the per-SNP shape above.
-        if not results and first_page_payload is not None:
-            for assoc in first_page_payload.get("_embedded", {}).get("associations", []):
-                results.extend(self._parse_association(assoc, gene_symbol, disease_name))
-
-        return results
-
-    def _associations_for_snp(self, snp: dict, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
-        # Input: one SNP entry from the findByGene response. Output: its matching associations,
-        # or [] if this SNP has no HAL link to follow, or if the follow-up request is still
-        # rate-limited after retries (see module docstring's bug-fix #2 note -- never raises for
-        # a rate limit; the caller treats [] as "no evidence found here" either way).
-        embedded = snp.get("_embedded", {})
-        raw_associations = embedded.get("associations")
-        if raw_associations is None and "associations" in snp:
-            raw_associations = snp["associations"]  # older/alternate flat shape, if it ever appears
-
-        if raw_associations is None:
-            href = snp.get("_links", {}).get("associations", {}).get("href")
-            if not href:
-                return []
-            assoc_resp = self._get(href)
-            if assoc_resp.status_code == 429:
-                print(
-                    f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries following "
-                    f"{href} -- skipping this SNP.",
-                    flush=True,
-                )
-                self.last_check_rate_limited = True
-                return []
-            assoc_resp.raise_for_status()
-            raw_associations = assoc_resp.json().get("_embedded", {}).get("associations", [])
-
-        results: List[GwasAssociation] = []
-        for assoc in raw_associations:
-            results.extend(self._parse_association(assoc, gene_symbol, disease_name))
-            if results:
-                # One matching trait is enough -- stop paying for further per-association
-                # efoTraits follow-up requests for this SNP. A single busy SNP can have dozens
-                # of associations (rs2943641 had 32 in a live run) -- see bug-fix #5 note.
-                break
-        return results
-
-    def _parse_association(self, assoc: dict, gene_symbol: str, disease_name: str) -> List[GwasAssociation]:
-        # Input: one association resource (embedded or fetched separately). Output: the
-        # GwasAssociation entries among its efoTraits that match disease_name. `efoTraits` is
-        # NOT embedded inline on a live association resource -- see bug-fix #5 in the module
-        # docstring -- so this follows the association's own `_links.efoTraits.href` (same HAL
-        # "embed on request only" pattern as _associations_for_snp above) unless a test or some
-        # other shape already provides it directly.
-        raw_efo_traits = assoc.get("efoTraits")
-        if raw_efo_traits is None:
-            href = assoc.get("_links", {}).get("efoTraits", {}).get("href")
-            if not href:
-                return []
-            resp = self._get(href)
-            if resp.status_code == 429:
-                print(
-                    f"GWAS Catalog: still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries following "
-                    f"{href} -- skipping this association's traits.",
-                    flush=True,
-                )
-                self.last_check_rate_limited = True
-                return []
-            resp.raise_for_status()
-            raw_efo_traits = resp.json().get("_embedded", {}).get("efoTraits", [])
-
-        results: List[GwasAssociation] = []
-        for efo_trait in raw_efo_traits:
-            trait_name = efo_trait.get("trait", "")
-            if not _trait_matches_disease(trait_name, disease_name):
-                continue
-            results.append(
-                GwasAssociation(
+    @staticmethod
+    def _collect(assoc: dict, gene_symbol: str, disease_name: str, found: Dict[str, GwasAssociation]) -> None:
+        # Input: one v2 association record. Adds a GwasAssociation to `found` (keyed by association
+        # id, so a repeat across pages/traits is counted once) if the gene is among its mapped genes
+        # and one of its EFO traits matches the disease.
+        if gene_symbol not in assoc.get("mapped_genes", []):
+            return
+        key = str(assoc.get("association_id") or id(assoc))
+        if key in found:
+            return
+        for efo_trait in assoc.get("efo_traits", []):
+            trait_name = efo_trait.get("efo_trait", "")
+            if _trait_matches_disease(trait_name, disease_name):
+                pubmed = assoc.get("pubmed_id")
+                found[key] = GwasAssociation(
                     gene_symbol=gene_symbol,
                     trait_name=trait_name,
-                    efo_id=efo_trait.get("shortForm"),
-                    pvalue=assoc.get("pvalue"),
-                    # NOTE: a live association resource has no top-level "studyAccession" field
-                    # (only a `_links.study.href` pointer, never followed) -- this is always None
-                    # in practice. Left as a known gap since nothing downstream (main.py's
-                    # readable report, agent3_confirmation.py) reads it yet; follow that link too
-                    # if a future need actually surfaces this field.
-                    study_accession=assoc.get("studyAccession"),
+                    efo_id=efo_trait.get("efo_id"),
+                    pvalue=assoc.get("p_value"),
+                    study_accession=assoc.get("accession_id"),
+                    pubmed_id=str(pubmed) if pubmed is not None else None,
                 )
-            )
-        return results
+                return
 
 
 class StubGWASCatalogClient:

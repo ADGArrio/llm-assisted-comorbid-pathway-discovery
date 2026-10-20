@@ -1,10 +1,30 @@
 from PipelineB.agent1_discovery import Agent1DiscoveryResult
-from PipelineB.agent2_chain import NoChainFoundError, run_agent2_chain
+from PipelineB.agent2_chain import (
+    EdgeProvenanceError,
+    NoChainFoundError,
+    _RawEdge,
+    _assert_chain_edges_come_from_bfs,
+    _assert_selected_paths_are_code_found,
+    run_agent2_chain as _run_agent2_chain,
+)
 from PipelineB.metalinks_client import MetaboliteEdge, StubMetalinksClient
 from PipelineB.omnipath_client import Interaction, StubOmniPathClient
 from PipelineB.opentargets_client import GeneAssociation
 from PipelineB.pubmed_client import Citation
 from common.llm_client import StubLLMClient
+
+
+
+def run_agent2_chain(*args, **kwargs):
+    """The tests below were written for the single-pass behaviour (one stage-1 call, one call per debate, no
+    per-start-gene cap). The 2026-10-18 hardening made two stage-1 passes, swapped-order debates and a
+    per-start-gene cap the defaults, so these tests pin the legacy settings explicitly; the new behaviour is
+    tested in test_agent2_hardening.py."""
+    kwargs.setdefault("stage1_passes", 1)
+    kwargs.setdefault("swap_debate_order", False)
+    kwargs.setdefault("max_per_start_gene", None)
+    return _run_agent2_chain(*args, **kwargs)
+
 
 DISEASE1 = "Type 2 Diabetes Mellitus"
 DISEASE2 = "Alzheimer's Disease"
@@ -345,7 +365,7 @@ def test_bfs_does_not_stop_exploring_once_max_paths_shallow_hits_are_found():
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
     assert result.candidate_path_count == 10  # trimmed down from 12 real candidates found
-    assert "MID --inhibits--> DEEP" in llm.last_prompt  # the depth-2 candidate survived the trim
+    assert "MID --inhibits--> DEEP" in llm.prompts[0]  # the depth-2 candidate survived the trim
 
 
 def test_frontier_truncation_protects_disease_scored_genes_over_alphabetical_order():
@@ -382,7 +402,7 @@ def test_frontier_truncation_protects_disease_scored_genes_over_alphabetical_ord
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
-    assert "ZZZGOAL --activates--> DEEPER_GOAL" in llm.last_prompt
+    assert "ZZZGOAL --activates--> DEEPER_GOAL" in llm.prompts[0]
 
 
 def test_citations_for_path_genes_are_included_in_the_llm_prompt():
@@ -401,8 +421,8 @@ def test_citations_for_path_genes_are_included_in_the_llm_prompt():
 
     run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
-    assert "A causes X via some mechanism" in llm.last_prompt
-    assert "1. A --activates--> X" in llm.last_prompt
+    assert "A causes X via some mechanism" in llm.prompts[0]
+    assert "1. A --activates--> X" in llm.prompts[0]
 
 
 def test_unknown_direction_edge_is_marked_in_the_llm_prompt():
@@ -420,8 +440,8 @@ def test_unknown_direction_edge_is_marked_in_the_llm_prompt():
 
     run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
-    assert "A --UNKNOWN DIRECTION--> X" in llm.last_prompt
-    assert "B --inhibits--> Y" in llm.last_prompt
+    assert "A --UNKNOWN DIRECTION--> X" in llm.prompts[0]
+    assert "B --inhibits--> Y" in llm.prompts[0]
 
 
 def test_no_path_raises_no_chain_found_error():
@@ -498,8 +518,8 @@ def test_bfs_continues_past_first_successful_depth_to_find_other_goals_deeper():
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
     assert result.candidate_path_count == 2
-    assert "1. A --activates--> X" in llm.last_prompt
-    assert "B --activates--> MID -> MID --inhibits--> Y" in llm.last_prompt
+    assert "1. A --activates--> X" in llm.prompts[0]
+    assert "B --activates--> MID -> MID --inhibits--> Y" in llm.prompts[0]
 
 
 def test_bfs_does_not_find_the_same_goal_gene_twice_at_different_depths():
@@ -669,7 +689,7 @@ def test_metabolite_bridge_and_protein_path_of_equal_length_both_surface_as_cand
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, metalinks_client=metalinks, llm_client=llm)
 
     assert result.candidate_path_count == 2
-    assert "[metabolite] Cholesterol" in llm.last_prompt
+    assert "[metabolite] Cholesterol" in llm.prompts[0]
     assert len(result.chains) == 1
     edges = result.chains[0].edges
     assert edges[0].source_gene == "A"
@@ -761,7 +781,7 @@ def test_single_endorsed_candidate_skips_tournament_entirely():
     second call -- proving the tournament is genuinely skipped, not just quietly reusing
     something, when there's only one candidate to compare against nothing."""
     agent1_result, omnipath = _two_path_setup()
-    llm = StubLLMClient(responses=["2: PLAUSIBLE - Because B-Y is the more established pathway."])
+    llm = StubLLMClient(responses=["1: NOT PLAUSIBLE - weak.\n2: PLAUSIBLE - Because B-Y is the more established pathway."])
 
     result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
 
@@ -806,18 +826,147 @@ def test_round_robin_tournament_with_three_candidates_runs_all_three_debates():
     assert result.chains[0].elo_rating > result.chains[1].elo_rating > result.chains[2].elo_rating
 
 
-def test_unparseable_debate_response_raises():
+def test_unparseable_debate_response_is_a_flagged_draw_not_a_crash():
+    # Changed 2026-10-18: this used to raise RuntimeError and abort the whole run (a real run died on a "RATIONE:" typo).
     agent1_result, omnipath = _two_path_setup()
     llm = StubLLMClient(
         responses=[
             "1: PLAUSIBLE - Supported by direct literature evidence for A-X.\n"
             "2: PLAUSIBLE - Also plausible based on known B-Y signaling.",
             "I decline to pick a winner.",
+            "Still declining.",  # the retry (added 2026-10-15) also fails -> a draw flagged `unparsed`
         ]
     )
 
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+
+    d = result.debate_log[0]
+    assert d.draw is True and d.unparsed is True and "no parseable" in d.rationale
+    assert result.bfs_stats["debates_unparsed"] == 1
+    assert [c.elo_rating for c in result.chains] == [1200.0, 1200.0]  # a draw between equals moves nobody
+
+
+# =====================================================================
+# 2026-10-15 hardening: the LLM can only SELECT code-found paths (edge provenance), plus parser/retry
+# tolerance and the new bfs_stats. "Adversarial" LLM replies below try to smuggle in ungrounded content;
+# none of it may change the edges in the result.
+# =====================================================================
+
+def _edge_set(result):
+    return {(e.source_gene, e.target_gene, e.interaction_type, e.omnipath_edge_id) for c in result.chains for e in c.edges}
+
+
+_BFS_EDGES_OF_TWO_PATH_SETUP = {("A", "X", "activates", "PA->PX"), ("B", "Y", "inhibits", "PB->PY")}
+
+
+def test_adversarial_llm_inventing_candidates_and_genes_cannot_add_an_edge():
+    """The model endorses a candidate that does not exist (#7, #99), and its rationale asserts a gene
+    interaction OmniPath never returned. Only the real candidate #1 may appear, with its real edge."""
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response=(
+        "1: PLAUSIBLE - A activates X, and X also activates the made-up gene ZZZ9 via a known pathway.\n"
+        "7: PLAUSIBLE - A --activates--> ZZZ9 --inhibits--> APP is textbook biology.\n"
+        "99: PLAUSIBLE - TCF7L2 inhibits APP."
+    ))
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm, enable_debate_tournament=False)
+    assert _edge_set(result) == {("A", "X", "activates", "PA->PX")}
+    assert len(result.chains) == 1
+    # The rationale text IS the model's free text (not checked here) -- only the edges are guaranteed.
+    assert "ZZZ9" in result.chains[0].rationale
+
+
+def test_every_chain_edge_is_a_bfs_edge_even_when_the_llm_endorses_everything():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(responses=["1: PLAUSIBLE - ok.\n2: PLAUSIBLE - ok.", "WINNER: A\nRATIONALE: because."])
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert _edge_set(result) <= _BFS_EDGES_OF_TWO_PATH_SETUP and len(result.chains) == 2
+
+
+def test_provenance_guard_rejects_a_selected_path_the_bfs_never_found():
+    foreign = [_RawEdge("gene", "A", "PA", None, "gene", "ZZZ9", "PZ", None, "activates", "PA->PZ")]
+    real = [_RawEdge("gene", "A", "PA", None, "gene", "X", "PX", None, "activates", "PA->PX")]
+    _assert_selected_paths_are_code_found([(real, None)], [real])  # fine
     try:
-        run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
-        assert False, "expected RuntimeError"
-    except RuntimeError as e:
-        assert "no parseable" in str(e)
+        _assert_selected_paths_are_code_found([(foreign, "made up")], [real])
+        assert False, "expected EdgeProvenanceError"
+    except EdgeProvenanceError:
+        pass
+
+
+def test_provenance_guard_rejects_a_chain_edge_not_in_the_bfs_edges():
+    from PipelineB.agent2_chain import ChainCandidate, ChainEdge
+    real = [_RawEdge("gene", "A", "PA", None, "gene", "X", "PX", None, "activates", "PA->PX")]
+    tampered = ChainCandidate(edges=[ChainEdge("A", "PA", "X", "PX", "inhibits", "PA->PX", None, None)], rationale=None)
+    try:
+        _assert_chain_edges_come_from_bfs([tampered], [real])
+        assert False, "expected EdgeProvenanceError"
+    except EdgeProvenanceError:
+        pass
+
+
+def test_duplicate_verdict_lines_for_one_candidate_yield_one_chain():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - first.\n1: PLAUSIBLE - again.\n2: NOT PLAUSIBLE - no.")
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert len(result.chains) == 1 and result.chains[0].rationale == "first."
+
+
+def test_first_verdict_wins_when_the_model_contradicts_itself():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response="1: NOT PLAUSIBLE - weak.\n1: PLAUSIBLE - changed my mind.\n2: NOT PLAUSIBLE - weak.")
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert result.chains == []
+
+
+def test_markdown_and_candidate_prefix_verdict_lines_are_parsed():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response="**1: PLAUSIBLE** - bold reply.\n- Candidate 2: NOT PLAUSIBLE - weak.")
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert len(result.chains) == 1 and result.chains[0].edges[0].source_gene == "A"
+    assert result.chains[0].rationale == "bold reply."  # asterisks stripped from the rationale too
+
+
+def test_stage1_unparseable_reply_is_retried_once():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(responses=["Sorry, no.", "2: PLAUSIBLE - fine.\n1: NOT PLAUSIBLE - weak."])
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert len(llm.prompts) == 2 and len(result.chains) == 1
+
+
+def test_debate_unparseable_reply_is_retried_once():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(responses=[
+        "1: PLAUSIBLE - ok.\n2: PLAUSIBLE - ok.", "I cannot decide.", "WINNER: B\nRATIONALE: B-Y has better support.",
+    ])
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm)
+    assert len(llm.prompts) == 3 and result.chains[0].edges[0].source_gene == "B"
+
+
+def test_bfs_stats_report_the_funnel_and_data_provenance():
+    agent1_result, omnipath = _two_path_setup()
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - ok.\n2: NOT PLAUSIBLE - no.")
+    result = run_agent2_chain(agent1_result, omnipath_client=omnipath, llm_client=llm, max_candidate_paths=10)
+    st = result.bfs_stats
+    assert st["n_paths_before_trim"] == 2 and st["n_paths_after_trim"] == 2 and st["n_stage1_endorsed"] == 1
+    assert st["paths_by_hops"] == {"1": 2} and st["n_paths_with_unknown_direction"] == 0
+    assert st["n_start_genes"] == 2 and st["n_goal_genes"] == 2 and st["n_distinct_goal_genes"] == 2
+    assert st["layers"][0]["depth"] == 1 and st["layers"][0]["new_goal_paths"] == 2
+    assert st["max_hops"] == 5 and st["metabolites_included"] is False and "retrieved_at_utc" in st
+    assert result.to_dict()["bfs_stats"]["n_paths_before_trim"] == 2
+
+
+def test_bfs_stats_count_paths_that_the_max_paths_trim_drops():
+    targets1 = [GeneAssociation(f"S{i}", f"E{i}", f"PS{i}", 0.5) for i in range(5)]
+    targets2 = [GeneAssociation(f"T{i}", f"F{i}", f"PT{i}", 0.5) for i in range(5)]
+    omnipath = StubOmniPathClient([Interaction(f"S{i}", f"PS{i}", f"T{i}", f"PT{i}", "activates", f"PS{i}->PT{i}") for i in range(5)])
+    llm = StubLLMClient(fixed_response="1: PLAUSIBLE - ok.")
+    result = run_agent2_chain(_agent1_result(targets1, targets2), omnipath_client=omnipath, llm_client=llm,
+                              max_candidate_paths=2, enable_debate_tournament=False)
+    assert result.candidate_path_count == 2
+    assert result.bfs_stats["n_paths_before_trim"] == 5 and result.bfs_stats["n_paths_after_trim"] == 2
+
+
+def test_result_saved_before_bfs_stats_existed_still_serialises():
+    from PipelineB.agent2_chain import Agent2ChainResult
+    old_style = Agent2ChainResult(disease1="a", disease2="b", chains=[], candidate_path_count=0, shared_genes=[])
+    assert old_style.to_dict()["bfs_stats"] == {}

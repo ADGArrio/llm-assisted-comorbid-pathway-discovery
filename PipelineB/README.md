@@ -98,6 +98,18 @@ python -m PipelineB.agent1_discovery --disease1 "X" --disease2 "Y" --min-score 0
   boolean -- not a single winning chain -- so that a genuinely ambiguous
   mechanism (e.g. two independently plausible routes, each with its own
   supporting literature) doesn't get artificially collapsed into one answer.
+- **Hardening (2026-10-18)**, details in `claude/agent2_hardening_provenance_maxhops.md`:
+  OmniPath direction ties are resolved by OmniPath's consensus columns, else
+  `unknown`; the 10 kept candidates are chosen longest-first, fully-signed
+  first, at most 3 per start gene (`--max-per-start-gene`, 0 = off); stage 1
+  is judged in two candidate orders (`--stage1-passes 2`) and each debate in
+  both A/B orders (`--no-swap-debates` to turn off; disagreement = draw);
+  every chain carries a code-generated `evidence` block, its LLM rationale is
+  "model commentary (unverified)", and `rationale_off_path_genes` lists other
+  genes the commentary names. `bfs_stats` records the funnel, trim policy,
+  order-bias and position-bias counts, data dates and the model used.
+  Defaults to the hardened behaviour; use `--stage1-passes 1 --no-swap-debates
+  --max-per-start-gene 0` for the earlier single-pass behaviour.
 - Edges follow project_architecture.md's schema (source_gene, source_protein,
   target_gene, target_protein, interaction_type, omnipath_edge_id,
   source_disease_assoc_score, target_disease_assoc_score), with the score

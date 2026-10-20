@@ -63,9 +63,25 @@ citation existing is not automatically support -- see pubmed_client.py's
 EdgeCitation docstring; `EdgeLiteratureCheck.supported` only counts a
 real co-mentioning passage (full text or abstract), never a bare
 title-only match.
+
+Independence of the evidence (revised 2026-10-18). Agent 1 selects each disease's genes by Open Targets' OVERALL
+association score, and that score includes a `genetic_association` datatype built partly from GWAS data (checked
+live: 140 of the top 200 T2DM genes and 152 of the top 200 CAD genes have genetic_association >= 0.3). A GWAS
+Catalog hit on a chain ENDPOINT therefore largely repeats the evidence that selected the endpoint, and is reported
+as "consistent with the selection evidence" (`independent_of_selection: false`), not as independent confirmation.
+Two additions keep a real, non-circular verification:
+  1. BRIDGE genes get the GWAS check too (`bridge_gwas_checks`, both diseases). Bridge genes were found by the
+     OmniPath search and never ranked by Open Targets, so a GWAS hit on a bridge gene is evidence the selection did
+     not use.
+  2. A random-gene baseline (`null_baseline`). Tissue-expression and GWAS hit rates are computed for a seeded random
+     sample of genes drawn from the pool of genes the BFS could have used as bridges (Agent 2's
+     `bfs_stats["candidate_bridge_genes"]`) and compared with the chains' own bridge genes, so "16/18 expressed" or
+     "1 of 3 bridge genes has a GWAS hit" is read against what a comparable random bridge gene would score. The pool
+     shares the chains' topology bias (well-connected genes), which a uniformly random gene would not.
 """
 import argparse
 import json
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -91,6 +107,11 @@ class EndpointCrossDbCheck:
     # distinction was discovered to matter. Always False for StubGWASCatalogClient (see there).
     possibly_incomplete: bool = False
 
+    # False for a chain endpoint: Agent 1 picked it by an Open Targets score that already includes GWAS-derived
+    # genetic evidence, so a hit is "consistent with the selection evidence", not independent confirmation.
+    # True for a bridge gene (never ranked by Open Targets).
+    independent_of_selection: bool = True
+
     @property
     def confirmed(self) -> bool:
         return bool(self.gwas_associations)
@@ -102,6 +123,7 @@ class EndpointCrossDbCheck:
             "gwas_associations": [a.to_dict() for a in self.gwas_associations],
             "confirmed": self.confirmed,
             "possibly_incomplete": self.possibly_incomplete,
+            "independent_of_selection": self.independent_of_selection,
         }
 
 
@@ -150,6 +172,8 @@ class Agent3ConfirmationResult:
     endpoint_checks: List[EndpointCrossDbCheck]  # exactly 2: [disease1-endpoint, disease2-endpoint]
     chain_metabolites: List[str]  # metabolite-kind middle hops in this chain; never tissue/cross-db checked
     edge_literature_checks: List[EdgeLiteratureCheck] = field(default_factory=list)  # bridge edges only; see module docstring
+    bridge_gwas_checks: List[EndpointCrossDbCheck] = field(default_factory=list)  # one per bridge gene x disease (independent of selection)
+    null_baseline: Optional[dict] = None  # random-gene baseline + chain comparison; same dict on every chain of a run
 
     @property
     def tissue_expressed_count(self) -> int:
@@ -168,6 +192,8 @@ class Agent3ConfirmationResult:
             "tissue_total_count": len(self.tissue_checks),
             "chain_metabolites": self.chain_metabolites,
             "edge_literature_checks": [c.to_dict() for c in self.edge_literature_checks],
+            "bridge_gwas_checks": [c.to_dict() for c in self.bridge_gwas_checks],
+            "null_baseline": self.null_baseline,
         }
 
 
@@ -226,6 +252,20 @@ def _edge_literature_checks(chain: ChainCandidate, roles: Dict[str, List[str]], 
     return checks
 
 
+def _gwas_check(gene: str, disease: str, gwas_client, independent_of_selection: bool) -> EndpointCrossDbCheck:
+    # Input: a gene, a disease, a GWAS client. Output: its EndpointCrossDbCheck (also used for bridge genes).
+    associations = gwas_client.get_gene_disease_associations(gene, disease)
+    # getattr with a default: only GWASCatalogClient/StubGWASCatalogClient are known to define this (see
+    # crossdb_client.py's bug-fix #3 note); don't hard-fail against some other future client that doesn't.
+    return EndpointCrossDbCheck(
+        gene_symbol=gene,
+        disease_name=disease,
+        gwas_associations=associations,
+        possibly_incomplete=getattr(gwas_client, "last_check_rate_limited", False),
+        independent_of_selection=independent_of_selection,
+    )
+
+
 def _confirm_chain(
     chain: ChainCandidate,
     disease1: str,
@@ -252,19 +292,13 @@ def _confirm_chain(
 
     endpoint_checks: List[EndpointCrossDbCheck] = []
     for gene, disease in ((roles["disease1_endpoint"], disease1), (roles["disease2_endpoint"], disease2)):
-        gwas_associations = gwas_client.get_gene_disease_associations(gene, disease)
-        # getattr with a default: only GWASCatalogClient/StubGWASCatalogClient are known to
-        # define this (see crossdb_client.py's bug-fix #3 note); don't hard-fail against some
-        # other future client that doesn't.
-        possibly_incomplete = getattr(gwas_client, "last_check_rate_limited", False)
-        endpoint_checks.append(
-            EndpointCrossDbCheck(
-                gene_symbol=gene,
-                disease_name=disease,
-                gwas_associations=gwas_associations,
-                possibly_incomplete=possibly_incomplete,
-            )
-        )
+        endpoint_checks.append(_gwas_check(gene, disease, gwas_client, independent_of_selection=False))
+
+    # Bridge genes (never ranked by Open Targets) are checked against BOTH diseases.
+    bridge_gwas_checks: List[EndpointCrossDbCheck] = []
+    for gene in roles["middle"]:
+        for disease in (disease1, disease2):
+            bridge_gwas_checks.append(_gwas_check(gene, disease, gwas_client, independent_of_selection=True))
 
     edge_literature_checks = _edge_literature_checks(chain, roles, pubmed_client)
 
@@ -273,7 +307,100 @@ def _confirm_chain(
         endpoint_checks=endpoint_checks,
         chain_metabolites=roles["middle_metabolites"],
         edge_literature_checks=edge_literature_checks,
+        bridge_gwas_checks=bridge_gwas_checks,
     )
+
+
+DEFAULT_NULL_SIZE = 30  # ~6.5 s per live GWAS check x 2 diseases -> roughly 6-7 minutes per pair
+NULL_SEED = 20261018
+
+
+def _rate(hits: int, n: int) -> Optional[float]:
+    return (hits / n) if n else None
+
+
+def compute_null_baseline(
+    pool: List[str],
+    exclude: List[str],
+    disease1: str,
+    disease2: str,
+    gtex_client,
+    gwas_client,
+    size: int = DEFAULT_NULL_SIZE,
+    seed: int = NULL_SEED,
+) -> dict:
+    # Input: the pool of genes the BFS could have used as bridges, genes to exclude (the chains' own genes), both
+    # disease names, clients, sample size and RNG seed. Output: a dict with the sampled genes and the hit rates a
+    # random bridge-like gene gets: tissue expression across the same tissues bridge genes are checked in (both
+    # diseases' tissues), and GWAS Catalog hits for each disease. Checks that gave up after rate limiting are left out
+    # of the denominators (inconclusive, not negative) and counted separately.
+    candidates = sorted(set(pool) - set(exclude))
+    sample = random.Random(seed).sample(candidates, min(size, len(candidates)))
+    tissues = list(dict.fromkeys(DISEASE_RELEVANT_TISSUES.get(disease1, []) + DISEASE_RELEVANT_TISSUES.get(disease2, [])))
+
+    tissue_with_data = tissue_expressed = 0
+    gwas = {disease1: [0, 0], disease2: [0, 0]}  # disease -> [checked, hits]
+    incomplete = 0
+    for gene in sample:
+        for tissue in tissues:
+            check = check_tissue_expression(gene, tissue, gtex_client)
+            if check.expressed is not None:
+                tissue_with_data += 1
+                tissue_expressed += int(check.expressed)
+        for disease in (disease1, disease2):
+            check = _gwas_check(gene, disease, gwas_client, independent_of_selection=True)
+            if check.possibly_incomplete and not check.confirmed:
+                incomplete += 1
+                continue
+            gwas[disease][0] += 1
+            gwas[disease][1] += int(check.confirmed)
+    return {
+        "seed": seed,
+        "pool_size": len(candidates),
+        "n_genes": len(sample),
+        "genes": sample,
+        "tissues": tissues,
+        "tissue_checks_with_data": tissue_with_data,
+        "tissue_expressed": tissue_expressed,
+        "tissue_expressed_rate": _rate(tissue_expressed, tissue_with_data),
+        "gwas": {
+            disease: {"genes_checked": n, "genes_with_hit": hits, "hit_rate": _rate(hits, n)}
+            for disease, (n, hits) in gwas.items()
+        },
+        "gwas_checks_inconclusive": incomplete,
+    }
+
+
+def _chain_bridge_summary(results: List[Agent3ConfirmationResult], disease1: str, disease2: str) -> dict:
+    # Input: all chains' results. Output: the same rates for the chains' own DISTINCT bridge genes, so they can be read
+    # side by side with the baseline (a gene shared by several chains counts once).
+    bridge_genes = sorted({c.gene_symbol for r in results for c in r.bridge_gwas_checks})
+    tissue_by_gene_tissue: Dict[Tuple[str, str], Optional[bool]] = {}
+    for r in results:
+        for t in r.tissue_checks:
+            if t.gene_symbol in bridge_genes:
+                tissue_by_gene_tissue[(t.gene_symbol, t.tissue)] = t.expressed
+    with_data = [v for v in tissue_by_gene_tissue.values() if v is not None]
+    gwas: Dict[str, Dict[str, bool]] = {disease1: {}, disease2: {}}
+    incomplete = 0
+    for r in results:
+        for c in r.bridge_gwas_checks:
+            if c.possibly_incomplete and not c.confirmed:
+                incomplete += 1
+                continue
+            gwas[c.disease_name][c.gene_symbol] = c.confirmed
+    return {
+        "bridge_genes": bridge_genes,
+        "tissue_checks_with_data": len(with_data),
+        "tissue_expressed": sum(with_data),
+        "tissue_expressed_rate": _rate(sum(with_data), len(with_data)),
+        "gwas": {
+            disease: {"genes_checked": len(found), "genes_with_hit": sum(found.values()),
+                      "hit_rate": _rate(sum(found.values()), len(found))}
+            for disease, found in gwas.items()
+        },
+        "gwas_checks_inconclusive": incomplete,
+    }
 
 
 def run_agent3_confirmation(
@@ -282,10 +409,11 @@ def run_agent3_confirmation(
     gtex_client: Optional[object] = None,
     gwas_client: Optional[object] = None,
     pubmed_client: Optional[object] = None,
+    null_baseline_size: int = DEFAULT_NULL_SIZE,
 ) -> List[Agent3ConfirmationResult]:
     # Input: Agent 1 + Agent 2 results, optional clients (all default to real clients;
-    # pass Stub* clients in tests). Output: one Agent3ConfirmationResult per chain, same
-    # order. [] if Agent 2 found no chain.
+    # pass Stub* clients in tests), and null_baseline_size (random genes for the baseline; 0 = skip it).
+    # Output: one Agent3ConfirmationResult per chain, same order. [] if Agent 2 found no chain.
     if not agent2_result.chains:
         return []
 
@@ -293,10 +421,20 @@ def run_agent3_confirmation(
     gwas_client = gwas_client or GWASCatalogClient()
     pubmed_client = pubmed_client or PubMedClient()
 
-    return [
+    results = [
         _confirm_chain(chain, agent1_result.disease1, agent1_result.disease2, gtex_client, gwas_client, pubmed_client)
         for chain in agent2_result.chains
     ]
+
+    pool = (getattr(agent2_result, "bfs_stats", None) or {}).get("candidate_bridge_genes") or []
+    if null_baseline_size and pool:
+        disease1, disease2 = agent1_result.disease1, agent1_result.disease2
+        chain_genes = sorted({t.gene_symbol for r in results for t in r.tissue_checks})
+        baseline = compute_null_baseline(pool, chain_genes, disease1, disease2, gtex_client, gwas_client, size=null_baseline_size)
+        baseline["chains"] = _chain_bridge_summary(results, disease1, disease2)
+        for r in results:
+            r.null_baseline = baseline
+    return results
 
 
 def _cli():
@@ -307,13 +445,15 @@ def _cli():
     parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Agent 1")
     parser.add_argument("--max-hops", type=int, default=None, help="Max PPI/metabolite hops, passed to Agent 2 (defaults to agent2_chain's own default)")
     parser.add_argument(
-        "--no-metabolites", action="store_true", help="Protein-only search -- skip MetalinksDB gene<->metabolite hops in Agent 2"
+        "--with-metabolites", action="store_true", help="Opt in to MetalinksDB gene<->metabolite hops in Agent 2 (default: protein-only)"
     )
+    parser.add_argument("--no-metabolites", action="store_true", help="Deprecated no-op: protein-only is now the default")
     parser.add_argument(
         "--no-edge-literature",
         action="store_true",
         help="Skip Agent 3's edge-level literature check on bridge edges (saves PubMed/PMC queries; see module docstring)",
     )
+    parser.add_argument("--null-size", type=int, default=DEFAULT_NULL_SIZE, help="Random genes in the baseline (0 = skip it)")
     args = parser.parse_args()
 
     if args.pair:
@@ -329,7 +469,7 @@ def _cli():
 
     print("Running Agent 2 (Chain Construction)...", flush=True)
     agent2_kwargs = {"max_hops": args.max_hops} if args.max_hops else {}
-    metalinks_client = None if args.no_metabolites else MetalinksClient()
+    metalinks_client = MetalinksClient() if args.with_metabolites else None
     agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **agent2_kwargs)
 
     print("Running Agent 3 (Independent Confirmation)...", flush=True)
@@ -337,7 +477,9 @@ def _cli():
         pubmed_client = _NoOpPubMedClient()
     else:
         pubmed_client = PubMedClient()
-    agent3_results = run_agent3_confirmation(agent1_result, agent2_result, pubmed_client=pubmed_client)
+    agent3_results = run_agent3_confirmation(
+        agent1_result, agent2_result, pubmed_client=pubmed_client, null_baseline_size=args.null_size
+    )
 
     print(
         json.dumps(

@@ -329,3 +329,109 @@ def test_edge_literature_check_to_dict_is_json_serializable():
     )
 
     json.dumps(results[0].to_dict())
+
+
+# ---- 2026-10-18: independence of the evidence -------------------------------------------------------------------
+
+def _gwas_hit(gene, trait="trait"):
+    return [GwasAssociation(gene, trait, "EFO_1", 1e-9, "GCST1")]
+
+
+def test_endpoint_gwas_checks_are_flagged_as_not_independent_of_selection():
+    result = run_agent3_confirmation(
+        _agent1_result(), _agent2_result([_two_hop_chain()]),
+        gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({("INSR", DISEASE1): _gwas_hit("INSR")}),
+        pubmed_client=StubPubMedClient({}),
+    )[0]
+    assert all(e.independent_of_selection is False for e in result.endpoint_checks)
+    assert all(e["independent_of_selection"] is False for e in result.to_dict()["endpoint_checks"])
+
+
+def test_bridge_genes_are_gwas_checked_against_both_diseases_and_flagged_independent():
+    gwas = StubGWASCatalogClient({("PRKCA", DISEASE2): _gwas_hit("PRKCA")})
+    result = run_agent3_confirmation(
+        _agent1_result(), _agent2_result([_three_hop_chain()]),
+        gtex_client=StubGTExClient({}), gwas_client=gwas, pubmed_client=StubPubMedClient({}),
+    )[0]
+    assert {(c.gene_symbol, c.disease_name) for c in result.bridge_gwas_checks} == {
+        ("PRKCA", DISEASE1), ("PRKCA", DISEASE2), ("ARRB1", DISEASE1), ("ARRB1", DISEASE2),
+    }
+    assert all(c.independent_of_selection for c in result.bridge_gwas_checks)
+    assert [c.confirmed for c in result.bridge_gwas_checks if c.gene_symbol == "PRKCA" and c.disease_name == DISEASE2] == [True]
+    assert ("PRKCA", DISEASE1) in gwas.calls and ("ARRB1", DISEASE2) in gwas.calls
+
+
+def test_single_edge_chain_has_no_bridge_gwas_checks():
+    result = run_agent3_confirmation(
+        _agent1_result(), _agent2_result([_single_edge_chain()]),
+        gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=StubPubMedClient({}),
+    )[0]
+    assert result.bridge_gwas_checks == []
+
+
+def _agent2_with_pool(chains, pool):
+    r = _agent2_result(chains)
+    r.bfs_stats = {"candidate_bridge_genes": pool}
+    return r
+
+
+def test_null_baseline_samples_from_the_pool_excluding_chain_genes_and_computes_rates():
+    pool = ["PRKCA", "ARRB1"] + [f"G{i}" for i in range(10)]
+    # every pool gene expressed in every tissue except G0..G4, which have no GTEx record at all
+    expression = {f"G{i}|{t}": 5.0 for i in range(5, 10) for t in
+                  ["Pancreas", "Liver", "Muscle_Skeletal", "Adipose_Subcutaneous", "Brain_Cortex", "Brain_Hippocampus"]}
+    gwas = StubGWASCatalogClient({("G7", DISEASE1): _gwas_hit("G7"), ("G8", DISEASE2): _gwas_hit("G8")})
+    results = run_agent3_confirmation(
+        _agent1_result(), _agent2_with_pool([_three_hop_chain()], pool),
+        gtex_client=StubGTExClient(expression), gwas_client=gwas, pubmed_client=StubPubMedClient({}),
+        null_baseline_size=10,
+    )
+    null = results[0].null_baseline
+    assert null is results[0].to_dict()["null_baseline"] or null == results[0].to_dict()["null_baseline"]
+    assert sorted(null["genes"]) == sorted(f"G{i}" for i in range(10))  # chain genes PRKCA/ARRB1/INSR/APP excluded
+    assert null["pool_size"] == 10 and null["n_genes"] == 10
+    assert null["tissue_checks_with_data"] == 30 and null["tissue_expressed_rate"] == 1.0  # no-record checks excluded
+    assert null["gwas"][DISEASE1] == {"genes_checked": 10, "genes_with_hit": 1, "hit_rate": 0.1}
+    assert null["gwas"][DISEASE2]["genes_with_hit"] == 1
+    assert null["chains"]["bridge_genes"] == ["ARRB1", "PRKCA"]
+
+
+def test_null_baseline_is_reproducible_and_skippable():
+    pool = [f"G{i}" for i in range(50)]
+    kwargs = dict(gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=StubPubMedClient({}))
+    a = run_agent3_confirmation(_agent1_result(), _agent2_with_pool([_two_hop_chain()], pool), null_baseline_size=7, **kwargs)[0]
+    b = run_agent3_confirmation(_agent1_result(), _agent2_with_pool([_two_hop_chain()], pool), null_baseline_size=7, **kwargs)[0]
+    assert a.null_baseline["genes"] == b.null_baseline["genes"] and len(a.null_baseline["genes"]) == 7
+    skipped = run_agent3_confirmation(_agent1_result(), _agent2_with_pool([_two_hop_chain()], pool), null_baseline_size=0, **kwargs)[0]
+    assert skipped.null_baseline is None
+
+
+def test_no_baseline_when_agent2_result_has_no_bridge_pool():
+    r = run_agent3_confirmation(
+        _agent1_result(), _agent2_result([_two_hop_chain()]),
+        gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=StubPubMedClient({}),
+    )[0]
+    assert r.null_baseline is None
+
+
+def test_rate_limited_null_checks_are_inconclusive_not_negative():
+    class Limited(StubGWASCatalogClient):
+        def get_gene_disease_associations(self, gene_symbol, disease_name):
+            self.last_check_rate_limited = gene_symbol == "G0"
+            return []
+
+    pool = ["G0", "G1"]
+    r = run_agent3_confirmation(
+        _agent1_result(), _agent2_with_pool([_single_edge_chain()], pool),
+        gtex_client=StubGTExClient({}), gwas_client=Limited({}), pubmed_client=StubPubMedClient({}), null_baseline_size=2,
+    )[0]
+    assert r.null_baseline["gwas_checks_inconclusive"] == 2  # G0 x 2 diseases
+    assert r.null_baseline["gwas"][DISEASE1]["genes_checked"] == 1
+
+
+def test_result_with_baseline_is_json_serializable():
+    r = run_agent3_confirmation(
+        _agent1_result(), _agent2_with_pool([_three_hop_chain()], ["A", "B", "C"]),
+        gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=StubPubMedClient({}), null_baseline_size=3,
+    )
+    json.dumps([x.to_dict() for x in r])

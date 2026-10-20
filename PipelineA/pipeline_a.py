@@ -7,21 +7,15 @@ Used by: standalone CLI, and as the control arm compared against Pipeline B.
 
 Usage:
     python -m PipelineA.pipeline_a --pair t2dm_ad
-    python -m PipelineA.pipeline_a --disease1 "Type 2 Diabetes Mellitus" --disease2 "Alzheimer's Disease"
-
-Metrics (BioPathBench: gene/protein extraction, protein recall,
-hallucination rate) were purged 2026-09-14 to get the bare pipelines
-running cleanly first -- see claude/metrics_purge.md. Pipeline A returns
-just the raw narrative for now; extraction/scoring can be layered back on
-once the metric design is settled.
+    python -m PipelineA.pipeline_a --disease1 "Type 2 Diabetes Mellitus" --disease2 "Alzheimer's Disease"  
 """
 import argparse
 import json
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-from common.config import DISEASE_PAIRS, get_pair
-from common.llm_client import LLMClient
+from common.config import DISEASE_PAIRS, get_pair # This is where the two pairs live. It also holds the GTEx tissue lists and the MIMIC ICD mappings
+from common.llm_client import LLMClient # LLMClient is the interface to the LLM. It has a generate() method that takes a prompt and returns a string.
 
 PROMPT_TEMPLATE = """You are a biomedical researcher. Explain the most likely molecular \
 mechanism connecting these two diseases:

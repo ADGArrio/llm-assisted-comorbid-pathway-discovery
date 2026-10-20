@@ -1,0 +1,465 @@
+"""
+Citation evidence classifier -- answers "does this paper actually show a mechanism, or does it only
+mention the gene and the disease?" for the papers Agent 1 attaches to its top genes.
+(Prototype added 2026-10-15; standalone, nothing in the pipeline imports it.)
+
+Why this exists: Agent 1's PubMed search (PipelineB/pubmed_client.py's `search_citations`) is a
+keyword match -- `GENE[Title/Abstract] AND Disease[Title/Abstract]`. A hit only means both strings
+appear in the title or abstract, not that the paper shows the gene doing anything in the disease.
+This script reads each retrieved paper's abstract with the LLM and assigns one evidence label.
+
+Data: Agent 1's saved citations (outputs/pipeline_b_<pair>.json, old or new format), abstracts from
+PubMed efetch (PubMedClient.fetch_abstracts), and the LLM from common/llm_client.py.
+Used by: nothing yet -- run by hand (see main()) and read alongside claude/codebase_walkthrough.md.
+
+How a label is made trustworthy rather than just asserted:
+  1. The model must return one label from a fixed set plus a VERBATIM quote from the abstract.
+  2. `quote_is_grounded` checks (whitespace/case-insensitive) that the quote really is in the
+     title/abstract. A label whose quote is not found is flagged `needs_review`, never silently kept.
+  3. Papers with no abstract are labeled "no_abstract" without calling the LLM (nothing to read).
+  4. A hand-labeled sample is still required before any number from this is reported -- the model's
+     label is a measurement to be validated, not ground truth. `--sample-for-review` writes a
+     blank-labeled CSV for that.
+
+Run (needs Ollama up, same .env as the pipeline):
+    python -m scripts.classify_citations --pair t2dm_ad
+    python -m scripts.classify_citations --pair t2dm_cad --limit 5   # quick smoke test
+    python -m scripts.classify_citations --pair t2dm_ad --resume     # continue an interrupted run
+"""
+import argparse
+import csv
+import json
+import os
+import random
+import re
+import sys
+import time
+from collections import Counter
+from typing import Dict, List, Optional
+
+# label -> definition shown to the model. Ordered strongest -> weakest evidence of a mechanism.
+# Kept as one dict so the prompt, the validator, and the summary can never disagree on the set.
+EVIDENCE_TYPES: Dict[str, str] = {
+    "mechanism": (
+        "The paper experimentally manipulates or directly measures what the gene DOES in the disease "
+        "biology (knockout/knockdown/overexpression, cell or animal model, signalling or pathway "
+        "shown, protein function). Testing a compound or extract is NOT mechanism, even if pathways "
+        "change: that is compound_study."
+    ),
+    "genetic_association": (
+        "The paper links variants or genetic risk of the gene to the disease (GWAS, candidate-gene "
+        "or polymorphism study, Mendelian randomization, meta-analysis of such studies) without "
+        "showing what the gene does."
+    ),
+    "expression_or_biomarker": (
+        "The paper reports the gene's expression, protein level, methylation or serum level being "
+        "different or correlated in patients/samples, with no manipulation and no genetic test."
+    ),
+    "clinical_study": (
+        "A patient or trial study in which the gene is a genotype, a stratifier or a clinical drug "
+        "target (e.g. genotype-guided therapy, carriers vs non-carriers, an approved drug tested in "
+        "patients) but the gene's own function is not tested."
+    ),
+    "compound_study": (
+        "The paper's main subject is a drug, natural product, herbal extract or other compound: "
+        "designing, docking, network-pharmacology-predicting or testing it in cells/animals. The gene "
+        "is a target or readout of the compound. It shows what the COMPOUND does, not what the gene does."
+    ),
+    "review": (
+        "A narrative or systematic review, perspective, commentary, regulatory/framework analysis or "
+        "overview that summarises or discusses OTHER work and reports no new experiment, cohort or "
+        "analysis of its own. A review is a review even when a drug or compound is its subject."
+    ),
+    "incidental_mention": (
+        "The gene and the disease both appear, but the gene is not what the paper is about "
+        "(e.g. it is one gene in a long list, or part of a panel/background sentence)."
+    ),
+}
+NO_ABSTRACT = "no_abstract"
+PARSE_FAILED = "parse_failed"
+ALL_LABELS = list(EVIDENCE_TYPES) + [NO_ABSTRACT, PARSE_FAILED]
+
+# Saved in every output file. Bump it whenever the prompt or label set changes: --resume refuses to
+# mix papers labelled under different prompts. Files written before this field existed are "v1".
+#   v1: first label set (no compound_study)           v2: + compound_study (2026-10-15)
+#   v3: review beats compound_study (2026-10-18): the hand-label check (claude/citation_classifier_second_rater_validation.md)
+#       found v2 labelled reviews/perspectives about a drug as compound_study (9 of 18 disagreements)
+PROMPT_VERSION = "v3-review-beats-compound"
+
+DEFAULT_PAPERS_PER_GENE_LIMIT = None  # classify everything in the saved file unless --limit is given
+DEFAULT_OUT_DIR = os.path.join("outputs", "citation_evidence")
+
+
+def build_prompt(gene: str, disease: str, title: str, abstract: str) -> str:
+    # Input: the gene/disease the search was run for, and the paper's title+abstract.
+    # Output: the prompt text. The label set comes from EVIDENCE_TYPES so it cannot drift.
+    definitions = "\n".join(f'- "{label}": {text}' for label, text in EVIDENCE_TYPES.items())
+    return f"""You are classifying what kind of evidence a single PubMed paper provides about one gene in one disease.
+
+Gene: {gene}
+Disease: {disease}
+
+Title: {title}
+Abstract: {abstract}
+
+Choose exactly ONE evidence_type for how this paper relates {gene} to {disease}:
+{definitions}
+
+Rules:
+- Judge only from the title and abstract above. Do not use outside knowledge about the gene.
+- If several apply, choose the strongest one the abstract actually supports (mechanism > genetic_association > expression_or_biomarker). Do not infer a mechanism that is not stated.
+- First ask: does the paper report its OWN new experiment, cohort or analysis? If it instead summarises, discusses or proposes a framework from other work (the abstract says "this review", "we review", "perspective", "overview", "this article examines"), choose review, even when a drug, compound or drug class is its subject.
+- Only if it does report its own work: if the main subject is a compound, drug candidate or extract (docking, network pharmacology, an extract tested in a model), choose compound_study, even when it also reports pathway or expression changes.
+- "quote" must be copied EXACTLY, word for word, from the title or abstract (at most 40 words) and must be the sentence that best justifies your label. For "incidental_mention" it may be the sentence where the gene appears.
+- "gene_is_focus" is true only if {gene} is one of the main subjects of the paper (not one gene in a long list).
+- "disease_is_focus" is true only if the paper studies {disease} itself. It is false when the paper is really about a different outcome (for example a Mendelian-randomization study of this gene's drug target on pneumonia or heart failure).
+
+Answer with ONLY a JSON object, no other text:
+{{"evidence_type": "<one of: {', '.join(EVIDENCE_TYPES)}>", "quote": "<verbatim sentence>", "gene_is_focus": true or false, "disease_is_focus": true or false}}"""
+
+
+def parse_response(text: str) -> dict:
+    # Input: the model's raw reply. Output: {"evidence_type", "quote", "gene_is_focus", "disease_is_focus"}, validated.
+    # Raises ValueError if no JSON object is found, the label is not in EVIDENCE_TYPES, or fields
+    # are missing -- the caller turns that into a retry, then a "parse_failed" record.
+    if not text:
+        raise ValueError("empty response")
+    start, end = text.find("{"), text.rfind("}")  # tolerates ```json fences and chatty preambles
+    if start == -1 or end <= start:
+        raise ValueError(f"no JSON object in response: {text[:120]!r}")
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("JSON is not an object")
+    label = data.get("evidence_type")
+    if label not in EVIDENCE_TYPES:
+        raise ValueError(f"evidence_type {label!r} is not one of {list(EVIDENCE_TYPES)}")
+    quote = data.get("quote", "")
+    if not isinstance(quote, str):
+        raise ValueError("quote is not a string")
+    flags = {}
+    for key in ("gene_is_focus", "disease_is_focus"):
+        if not isinstance(data.get(key), bool):
+            raise ValueError(f"{key} is not a boolean")
+        flags[key] = data[key]
+    return {"evidence_type": label, "quote": quote.strip(), **flags}
+
+
+def _normalize(text: str) -> str:
+    # Lower-case, unify quotes/dashes, collapse whitespace so harmless formatting differences
+    # between the model's copy and the source do not fail the check.
+    text = text.lower()
+    for a, b in (("‘", "'"), ("’", "'"), ("“", '"'), ("”", '"'),
+                 ("–", "-"), ("—", "-"), ("−", "-")):
+        text = text.replace(a, b)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_ELLIPSIS = re.compile(r"\.{3,}|\u2026")
+
+
+def quote_is_grounded(quote: str, title: str, abstract: str) -> bool:
+    # Input: the model's quote and the source text. Output: True if the quote appears verbatim
+    # (after normalisation) in the title or in the abstract. An empty quote is NOT grounded.
+    # Models often shorten a long sentence with "..." (seen live 2026-10-15: "observed in ... GRIN3B
+    # near the known AD risk gene"). Such a quote is split at each ellipsis and counts as grounded
+    # only if EVERY fragment is found, in order, in the same text. When there are several fragments
+    # each must be at least 3 words, so "...a..." cannot pass by matching anything.
+    fragments = [f.strip(" .") for f in _ELLIPSIS.split(_normalize(quote or ""))]
+    fragments = [f for f in fragments if f]
+    if not fragments:
+        return False
+    if len(fragments) > 1 and any(len(f.split()) < 3 for f in fragments):
+        return False
+    for text in (_normalize(title or ""), _normalize(abstract or "")):
+        position, found_all = 0, True
+        for fragment in fragments:
+            at = text.find(fragment, position)
+            if at == -1:
+                found_all = False
+                break
+            position = at + len(fragment)
+        if found_all:
+            return True
+    return False
+
+
+def gene_in_text(gene: str, title: str, abstract: str) -> bool:
+    # True if the literal gene symbol appears as a whole token in the title/abstract. PubMed's
+    # [Title/Abstract] match can be satisfied by a synonym or phrase expansion, so this records
+    # whether the symbol itself is really there.
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(gene)}(?![A-Za-z0-9])", f"{title} {abstract}", re.I) is not None
+
+
+def classify_paper(client, record: dict, abstract: Optional[str], max_attempts: int = 2) -> dict:
+    # Input: an LLM client (LLMClient or StubLLMClient), a citation record (gene_symbol,
+    # disease_name, pmid, title, ...), and its abstract (None if PubMed has none).
+    # Output: the record extended with evidence_type, quote, gene_is_focus, disease_is_focus, quote_verified,
+    # gene_in_text, needs_review and n_attempts. Never raises on bad model output.
+    out = dict(record)
+    out["abstract"] = abstract
+    out["gene_in_text"] = gene_in_text(record["gene_symbol"], record.get("title", ""), abstract or "")
+    if not abstract:
+        out.update(evidence_type=NO_ABSTRACT, quote="", gene_is_focus=None, disease_is_focus=None,
+                   quote_verified=False, needs_review=True, n_attempts=0, error="PubMed returned no abstract for this PMID")
+        return out
+
+    prompt = build_prompt(record["gene_symbol"], record["disease_name"], record.get("title", ""), abstract)
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            parsed = parse_response(client.generate(prompt, temperature=0.0))
+        except ValueError as e:
+            last_error = str(e)
+            continue
+        verified = quote_is_grounded(parsed["quote"], record.get("title", ""), abstract)
+        out.update(parsed, quote_verified=verified, n_attempts=attempt, error=None,
+                   needs_review=not verified)  # an unverifiable quote means the label rests on nothing
+        return out
+    out.update(evidence_type=PARSE_FAILED, quote="", gene_is_focus=None, disease_is_focus=None,
+               quote_verified=False, needs_review=True, n_attempts=max_attempts, error=last_error)
+    return out
+
+
+def load_citation_records(result: dict, top_n: int = 10) -> List[dict]:
+    # Input: a saved pipeline_b_<pair>.json dict. Output: one record per (gene, paper) with the
+    # disease the search used. New-format citations carry gene_symbol/disease_name themselves.
+    # Old-format ones (saved before 2026-10-15) only have pmid/title, so the disease is inferred
+    # from which disease's top-N target list the gene is in; a gene in both is marked
+    # "ambiguous (shared gene, old format)" rather than guessed.
+    a1 = result["agent1"]
+    top = {}
+    for key, name_key in (("disease1_targets", "disease1"), ("disease2_targets", "disease2")):
+        ranked = sorted(a1.get(key, []), key=lambda t: t["disease_assoc_score"], reverse=True)[:top_n]
+        top[a1[name_key]] = {t["gene_symbol"] for t in ranked}
+
+    records = []
+    for gene, papers in a1["citations"].items():
+        for paper in papers:
+            disease = paper.get("disease_name")
+            if not disease:
+                owners = [d for d, genes in top.items() if gene in genes]
+                disease = owners[0] if len(owners) == 1 else "ambiguous (shared gene, old format)"
+            records.append({
+                "gene_symbol": gene,
+                "disease_name": disease,
+                "pmid": paper["pmid"],
+                "title": paper.get("title", ""),
+                "pubtype": paper.get("pubtype"),
+                "search_rank": paper.get("search_rank"),
+            })
+    return records
+
+
+def supports_pair(r: dict, require_gene_focus: bool = False) -> bool:
+    # Does this paper count as literature for the (gene, disease) pair Agent 1 searched?
+    # Rule: the paper is about the disease (disease_is_focus) and the gene is more than a passing
+    # mention (label is not incidental_mention / no_abstract / parse_failed). A review counts
+    # (it is literature about the pair) but is not primary evidence. With require_gene_focus the
+    # gene must also be one of the paper's main subjects -- the strict version, and the one to
+    # report: a network-pharmacology paper that lists 20 targets can still be "mechanistic" yet say
+    # little about any one of them.
+    if r.get("disease_is_focus") is not True:
+        return False
+    if r.get("evidence_type") not in EVIDENCE_TYPES or r["evidence_type"] == "incidental_mention":
+        return False
+    return not require_gene_focus or r.get("gene_is_focus") is True
+
+
+def is_gene_focused_mechanism(r: dict) -> bool:
+    # A paper that shows mechanism AND is about this gene AND about this disease -- the strongest label.
+    return (r.get("evidence_type") == "mechanism" and r.get("gene_is_focus") is True
+            and r.get("disease_is_focus") is True)
+
+
+def summarize(classified: List[dict]) -> dict:
+    # Input: classified records. Output: label counts overall and per disease, how many need review,
+    # and the pair-level numbers that matter (see supports_pair): papers where the gene/disease is the
+    # focus, papers supporting the pair, and -- per disease -- how many of the searched GENES have at
+    # least one supporting paper (the gene-level question, which is what Agent 1's "evidence" claims).
+    overall = Counter(r["evidence_type"] for r in classified)
+    by_disease: Dict[str, Counter] = {}
+    genes_by_disease: Dict[str, Dict[str, List[dict]]] = {}
+    for r in classified:
+        by_disease.setdefault(r["disease_name"], Counter())[r["evidence_type"]] += 1
+        genes_by_disease.setdefault(r["disease_name"], {}).setdefault(r["gene_symbol"], []).append(r)
+    n = len(classified)
+
+    def pair_level(rows: List[dict]) -> dict:
+        return {
+            "n_papers": len(rows),
+            "n_gene_is_focus": sum(1 for r in rows if r.get("gene_is_focus") is True),
+            "n_supports_pair": sum(1 for r in rows if supports_pair(r)),
+            "n_supports_pair_gene_focus": sum(1 for r in rows if supports_pair(r, require_gene_focus=True)),
+            "n_mechanism_gene_focus": sum(1 for r in rows if is_gene_focused_mechanism(r)),
+        }
+
+    gene_level = {}
+    for disease, genes in genes_by_disease.items():
+        gene_level[disease] = {
+            "n_genes": len(genes),
+            "n_genes_with_supporting_paper": sum(1 for rows in genes.values() if any(supports_pair(r) for r in rows)),
+            "n_genes_with_gene_focused_supporting_paper": sum(
+                1 for rows in genes.values() if any(supports_pair(r, require_gene_focus=True) for r in rows)),
+            "n_genes_with_gene_focused_mechanism": sum(
+                1 for rows in genes.values() if any(is_gene_focused_mechanism(r) for r in rows)),
+        }
+    return {
+        "n_papers": n,
+        "overall": {label: overall.get(label, 0) for label in ALL_LABELS},
+        "by_disease": {d: {label: c.get(label, 0) for label in ALL_LABELS} for d, c in by_disease.items()},
+        "pair_level": {"overall": pair_level(classified),
+                       "by_disease": {d: pair_level([r for r in classified if r["disease_name"] == d]) for d in by_disease}},
+        "gene_level": gene_level,
+        "n_needs_review": sum(1 for r in classified if r["needs_review"]),
+        "n_gene_not_literally_in_text": sum(1 for r in classified if not r["gene_in_text"]),
+        "n_disease_not_the_focus": sum(1 for r in classified if r.get("disease_is_focus") is False),
+        "fraction_mechanism": round(overall.get("mechanism", 0) / n, 3) if n else None,
+        "fraction_mechanism_gene_focus": round(sum(1 for r in classified if is_gene_focused_mechanism(r)) / n, 3) if n else None,
+    }
+
+
+def regrade_saved(out_path: str) -> dict:
+    # Recomputes the purely code-side fields of an already-saved output (quote_verified, needs_review,
+    # gene_in_text, summary) WITHOUT calling the LLM. Use it after changing the quote check or the
+    # summary rules: the model's labels, quotes and flags are untouched, only the grading changes.
+    with open(out_path) as f:
+        payload = json.load(f)
+    for r in payload["papers"]:
+        if r["evidence_type"] in (NO_ABSTRACT, PARSE_FAILED):
+            continue
+        r["quote_verified"] = quote_is_grounded(r.get("quote", ""), r.get("title", ""), r.get("abstract") or "")
+        r["needs_review"] = not r["quote_verified"]
+        r["gene_in_text"] = gene_in_text(r["gene_symbol"], r.get("title", ""), r.get("abstract") or "")
+    payload["summary"] = summarize(payload["papers"])
+    payload["regraded"] = True
+    _write_payload(out_path, payload)
+    return payload
+
+
+def write_review_sample(classified: List[dict], path: str, n: int = 50, seed: int = 0):
+    # Writes a CSV of up to n randomly chosen papers WITHOUT the model's label, for hand-labeling.
+    # Comparing the hand labels to evidence_type is the validation step. Seeded so it is reproducible.
+    rng = random.Random(seed)
+    rows = rng.sample(classified, min(n, len(classified)))
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["pmid", "gene_symbol", "disease_name", "title", "abstract", "your_label", "notes"])
+        for r in rows:
+            w.writerow([r["pmid"], r["gene_symbol"], r["disease_name"], r["title"], r["abstract"] or "", "", ""])
+
+
+def _record_key(r: dict) -> tuple:
+    # A (gene, disease, paper) triple identifies one classification; the same paper retrieved for
+    # two genes is two records because the prompt (and the answer) depend on the gene.
+    return (r["gene_symbol"], r["disease_name"], str(r["pmid"]))
+
+
+def _write_payload(out_path: str, payload: dict):
+    # Write via a temp file + rename so a Ctrl-C mid-write cannot leave a half-written json.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, out_path)
+
+
+def run(result_path: str, out_path: str, client, pubmed_client, limit: Optional[int] = None,
+        top_n: int = 10, resume: bool = False, progress=None) -> dict:
+    # Input: saved pipeline json, where to write, an LLM client, a PubMed client (anything with
+    # fetch_abstracts), optional cap on papers. Output: the written dict {"summary", "papers"}.
+    #
+    # The output file is rewritten after EVERY paper (with "complete": false until the last one),
+    # because each paper is one slow local-LLM call: an interrupted run keeps what it finished.
+    # resume=True reads the existing out_path and skips papers already classified (a "parse_failed"
+    # one is retried), so a re-run only pays for what is missing. Without resume the file is
+    # overwritten from scratch. `progress(i, n, classified_record, seconds, skipped)` is called
+    # after each paper (the CLI prints it).
+    with open(result_path) as f:
+        records = load_citation_records(json.load(f), top_n=top_n)
+    if limit:
+        records = records[:limit]
+
+    done: Dict[tuple, dict] = {}
+    if resume and os.path.exists(out_path):
+        with open(out_path) as f:
+            saved = json.load(f)
+        saved_version = saved.get("prompt_version", "v1")
+        if saved_version != PROMPT_VERSION:
+            raise ValueError(
+                f"{out_path} was labelled with prompt {saved_version!r}, current is {PROMPT_VERSION!r}. "
+                "Resuming would mix labels from two prompts. Rename the old file to keep it "
+                "(e.g. t2dm_ad_v1.json) and run again without --resume.")
+        for prior in saved.get("papers", []):
+            if prior.get("evidence_type") != PARSE_FAILED:
+                done[_record_key(prior)] = prior
+
+    todo = [r for r in records if _record_key(r) not in done]
+    abstracts = pubmed_client.fetch_abstracts([r["pmid"] for r in todo]) if todo else {}
+
+    def payload_for(classified, complete):
+        return {"source": result_path, "model": getattr(client, "model", None), "prompt_version": PROMPT_VERSION,
+                "complete": complete,
+                "summary": summarize(classified), "papers": classified}
+
+    classified: List[dict] = []
+    for i, r in enumerate(records, start=1):
+        prior = done.get(_record_key(r))
+        if prior is not None:
+            classified.append(prior)
+            if progress:
+                progress(i, len(records), prior, 0.0, True)
+            continue
+        started = time.monotonic()
+        classified.append(classify_paper(client, r, abstracts.get(str(r["pmid"]))))
+        _write_payload(out_path, payload_for(classified, complete=(i == len(records))))
+        if progress:
+            progress(i, len(records), classified[-1], time.monotonic() - started, False)
+    payload = payload_for(classified, complete=True)
+    _write_payload(out_path, payload)
+    return payload
+
+
+def _print_progress(i, n, rec, seconds, skipped):
+    # CLI progress line, to stderr so it never mixes with the JSON summary on stdout.
+    what = "skipped (already done)" if skipped else f"{seconds:.0f}s"
+    print(f"[{i}/{n}] {rec['gene_symbol']} / PMID {rec['pmid']}: {rec['evidence_type']} ({what})",
+          file=sys.stderr, flush=True)
+
+
+def main():
+    # CLI entry. Imports are local so importing this module (e.g. in tests) needs no network or .env.
+    from common.llm_client import LLMClient
+    from PipelineB.pubmed_client import PubMedClient
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--pair", required=True, help="t2dm_ad or t2dm_cad (reads outputs/pipeline_b_<pair>.json)")
+    ap.add_argument("--result", help="override the input json path")
+    ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    ap.add_argument("--limit", type=int, help="classify only the first N papers (smoke test)")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep papers already classified in the existing output file; only do the rest")
+    ap.add_argument("--regrade", action="store_true",
+                    help="no LLM: recompute quote checks and the summary of the existing output file, then exit")
+    ap.add_argument("--sample-for-review", type=int, default=0, metavar="N",
+                    help="also write a blank-labeled CSV of N random papers for hand validation")
+    args = ap.parse_args()
+
+    result_path = args.result or os.path.join("outputs", f"pipeline_b_{args.pair}.json")
+    out_path = os.path.join(args.out_dir, f"{args.pair}.json")
+    if args.regrade:
+        print(json.dumps(regrade_saved(out_path)["summary"], indent=2))
+        return
+    payload = run(result_path, out_path, LLMClient(), PubMedClient(), limit=args.limit,
+                  resume=args.resume, progress=_print_progress)
+    if args.sample_for_review:
+        write_review_sample(payload["papers"], os.path.join(args.out_dir, f"{args.pair}_review_sample.csv"),
+                            n=args.sample_for_review)
+    print(json.dumps(payload["summary"], indent=2))
+    print(f"wrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()

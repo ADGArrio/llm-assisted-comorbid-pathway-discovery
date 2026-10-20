@@ -88,7 +88,7 @@ def run_one_model(pair_id: str, disease1: str, disease2: str, model: str, agent1
 
     pipeline_a_result = run_pipeline_a(disease1, disease2, client=client)
 
-    metalinks_client = MetalinksClient()
+    metalinks_client = None  # protein-only: the metabolite graph was evaluated and removed from the default search
     try:
         agent2_result = run_agent2_chain(
             agent1_result, metalinks_client=metalinks_client, llm_client=client

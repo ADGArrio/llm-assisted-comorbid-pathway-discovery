@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from common.report_format import _format_chain_evidence, _format_debate_log
 from common.config import get_pair
 from common.llm_client import LLMClient
 from PipelineA.pipeline_a import run_pipeline_a
@@ -30,6 +31,7 @@ from PipelineB.agent3_confirmation import run_agent3_confirmation
 from PipelineB.agent4_mimic import run_agent4_mimic
 from PipelineB.metalinks_client import MetalinksClient
 from PipelineB.omnipath_client import EXTENDED_DATASETS, OmniPathClient
+from PipelineB.pubmed_client import PubMedClient
 
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -98,7 +100,8 @@ def _format_confirmation_summary(confirmation: dict) -> str:
         genes_with_no_record = sorted({t["gene_symbol"] for t in no_record})
         lines.append(f"  No GTEx record at all for: {', '.join(genes_with_no_record)}")
 
-    lines.append("GWAS Catalog endpoint check:")
+    lines.append("GWAS Catalog endpoint check (consistent with the selection evidence, not independent: Agent 1 chose these "
+                 "genes by an Open Targets score that already includes GWAS-derived evidence):")
     for e in confirmation.get("endpoint_checks") or []:
         if e.get("confirmed"):
             traits = ", ".join(sorted({a["trait_name"] for a in e.get("gwas_associations", [])}))
@@ -113,6 +116,37 @@ def _format_confirmation_summary(confirmation: dict) -> str:
             )
         else:
             lines.append(f"  {e['gene_symbol']}: no GWAS Catalog hit for {e['disease_name']}")
+
+    bridge_gwas = confirmation.get("bridge_gwas_checks") or []
+    if bridge_gwas:
+        lines.append("GWAS Catalog bridge-gene check (independent of how the genes were selected):")
+        for g in sorted({b["gene_symbol"] for b in bridge_gwas}):
+            parts = []
+            for b in (x for x in bridge_gwas if x["gene_symbol"] == g):
+                if b.get("confirmed"):
+                    parts.append(f"hit for {b['disease_name']}")
+                elif b.get("possibly_incomplete"):
+                    parts.append(f"{b['disease_name']}: inconclusive (rate-limited)")
+                else:
+                    parts.append(f"no hit for {b['disease_name']}")
+            lines.append(f"  {g}: " + "; ".join(parts))
+    null = confirmation.get("null_baseline")
+    if null:
+        def pct(x):
+            return "n/a" if x is None else f"{x:.0%}"
+        chains = null.get("chains") or {}
+        lines.append(
+            f"Random-gene baseline ({null['n_genes']} genes drawn from {null['pool_size']} genes the search could have used as bridges):"
+        )
+        lines.append(
+            f"  tissue expression: chain bridge genes {pct(chains.get('tissue_expressed_rate'))} vs baseline {pct(null.get('tissue_expressed_rate'))}"
+        )
+        for disease, b in (null.get("gwas") or {}).items():
+            c = (chains.get("gwas") or {}).get(disease, {})
+            lines.append(
+                f"  GWAS hit for {disease}: chain bridge genes {c.get('genes_with_hit', 0)}/{c.get('genes_checked', 0)} "
+                f"vs baseline {pct(b.get('hit_rate'))} ({b.get('genes_with_hit', 0)}/{b.get('genes_checked', 0)})"
+            )
 
     metabolites = confirmation.get("chain_metabolites") or []
     if metabolites:
@@ -172,14 +206,21 @@ def agent4_explanation(agent4_data: Optional[dict]) -> str:
         return ""
 
     d1, d2 = agent4_data.get("disease1", ""), agent4_data.get("disease2", "")
-    rr = agent4_data.get("relative_risk")
-    rr_text = f"{rr:.2f}x" if rr is not None else "undefined (disease2 base rate is 0 in this cohort)"
+    n_total, n1, n2, both = (agent4_data.get(k, 0) for k in
+                             ("n_total_patients", "n_disease1_patients", "n_disease2_patients", "n_both_patients"))
+    # old saved results don't have the corrected statistics -- recompute them from the counts
+    from PipelineB.agent4_mimic import _two_by_two_stats
+    stats = _two_by_two_stats(n_total, n1, n2, both) if n_total else {}
+    rr, ci, orr, p = stats.get("relative_risk"), stats.get("relative_risk_ci95"), stats.get("odds_ratio"), stats.get("p_value")
+    unexposed = n_total - n1
+    unexposed_rate = (n2 - both) / unexposed if unexposed else 0.0
+    rr_text = (f"{rr:.2f} (95% CI {ci[0]:.2f}-{ci[1]:.2f}; odds ratio {orr:.2f}"
+               + ((f"; p={p:.1e}" if p > 0 else "; p<1e-300") if p is not None else "") + ")") if rr is not None and ci and orr is not None else "undefined"
     return (
-        f"Agent 4 (MIMIC-IV Cohort Check): of {agent4_data.get('n_total_patients', 0):,} total patients, "
-        f"{agent4_data.get('n_disease1_patients', 0):,} had {d1}, {agent4_data.get('n_disease2_patients', 0):,} "
-        f"had {d2}, and {agent4_data.get('n_both_patients', 0):,} had both. Patients with {d1} had {d2} at a "
-        f"rate of {agent4_data.get('disease2_rate_in_disease1_cohort', 0.0):.2%}, vs. a base rate of "
-        f"{agent4_data.get('disease2_base_rate', 0.0):.2%} across the full cohort -- a relative risk of {rr_text}. "
+        f"Agent 4 (MIMIC-IV Cohort Check): of {n_total:,} total patients, "
+        f"{n1:,} had {d1}, {n2:,} had {d2}, and {both:,} had both. Patients with {d1} had {d2} at a "
+        f"rate of {agent4_data.get('disease2_rate_in_disease1_cohort', 0.0):.2%}, vs. {unexposed_rate:.2%} among patients "
+        f"without {d1} -- a relative risk of {rr_text}. "
         f"(Crude, unadjusted co-occurrence -- no age/sex matching, no causal claim; see agent4_mimic.py.)"
     )
 
@@ -223,6 +264,12 @@ def agent2_explanation(
         elo = chain.get("elo_rating")
         elo_text = f" [Elo {elo:.0f}]" if elo is not None else ""
         rationale = chain.get("rationale") or "(no rationale given)"
+        # The rationale is the model's own free text: nothing checks it against a database, so it is labelled
+        # as commentary. The evidence line below it is generated by code from the database records.
+        rationale = f"Model commentary (unverified): {rationale}" if chain.get("rationale") else rationale
+        evidence_line = _format_chain_evidence(chain)
+        if evidence_line:
+            rationale = f"{evidence_line}\n{rationale}"
         caveat = (
             "\n(Note: at least one step's direction of effect is not confirmed by curated "
             "evidence -- treat this pathway as tentative.)"
@@ -239,18 +286,6 @@ def agent2_explanation(
         blocks.append(_format_debate_log(debate_log, len(chains)))
 
     return "\n\n".join(blocks)
-
-
-def _format_debate_log(debate_log: list, chain_count: int) -> str:
-    """Every stage-2 pairwise debate Agent 2 ran between its endorsed candidates, in the order
-    they were run -- each debate's winner and the model's own rationale for preferring it, kept
-    in full rather than collapsed into just the final ranking. See agent2_chain.py's module
-    docstring, "Pairwise debate ranking" note. `winner_index`/`loser_index` refer to the final,
-    Elo-sorted Pathway numbers above (0-indexed here, so add 1 for the "Pathway N" label)."""
-    lines = [f"Pairwise debate log ({len(debate_log)} debate(s) among {chain_count} endorsed pathway(s)):"]
-    for d in debate_log:
-        lines.append(f"  Pathway {d['winner_index'] + 1} beat Pathway {d['loser_index'] + 1}: {d['rationale']}")
-    return "\n".join(lines)
 
 
 def pipeline_b_report(b_data: dict) -> str:
@@ -331,13 +366,13 @@ agent1_result.to_dict()
 def run_agent2(
     agent1_result,
     max_hops: int = None,
-    include_metabolites: bool = True,
+    include_metabolites: bool = False,
     omnipath_datasets: Optional[str] = None,
     enable_debate_tournament: bool = True,
     llm_model: str = None,
 ):
-    """Agent 2: BFS chain construction over OmniPath (+ MetalinksDB metabolite
-    hops by default), with an LLM adjudicating between equally-short candidates.
+    """Agent 2: BFS chain construction over OmniPath (protein-only by default;
+    pass include_metabolites=True to add MetalinksDB metabolite hops), with an LLM adjudicating between equally-short candidates.
     Returns None if no structural path exists within max_hops (NoChainFoundError
     from BFS itself). A non-None result with an EMPTY chains list is a different,
     equally valid outcome: BFS found real candidates, but the LLM judged none of
@@ -354,6 +389,8 @@ def run_agent2(
     themselves. See claude/agent2_bfs_and_prompt_recalibration.md."""
     kwargs = {"max_hops": max_hops} if max_hops else {}
     kwargs["enable_debate_tournament"] = enable_debate_tournament
+    # 2026-10-18 options (same as scripts/run_all.py): noise-control stage-1 pass, and edge strength + bridge-gene titles for the judge
+    kwargs.update(stage1_control_pass=True, judge_evidence=True, pubmed_client=PubMedClient())
     if llm_model:
         # See run_pipeline_a_and_save's llm_model docstring note -- same idea, applies to both
         # of Agent 2's LLM calls (stage-1 selection and stage-2 debate, same client either way).

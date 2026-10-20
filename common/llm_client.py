@@ -26,6 +26,10 @@ class LLMClient:
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "http://localhost:11434")).rstrip("/")
         self.api_key = api_key or os.environ.get("LLM_API_KEY")
         self.timeout = timeout
+        # finish_reason of the most recent reply ("stop" = finished; "length" = cut off because the output budget or the
+        # model's context window ran out -- Ollama's default context is small, and a long prompt leaves almost no room
+        # for the reply). Callers record it so a truncated reply is visible instead of looking like a model verdict.
+        self.last_finish_reason = None
 
     def generate(self, prompt: str, temperature: float = 0.3) -> str:
         # Input: prompt text + sampling temperature. Output: the model's response text.
@@ -49,6 +53,14 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         message = data["choices"][0]["message"]
+        self.last_finish_reason = data["choices"][0].get("finish_reason")
+        if self.last_finish_reason == "length":
+            print(
+                f"WARNING: LLM reply was cut off (finish_reason=length) after {len(message.get('content') or '')} characters "
+                f"for a {len(prompt)}-character prompt -- the model's context window is probably too small; see "
+                f"claude/agent4_stats_fix_and_stage1_retry.md.",
+                flush=True,
+            )
         content = (message.get("content") or "").strip()
 
         if not content:
@@ -87,6 +99,7 @@ class StubLLMClient:
         self.fixed_response = fixed_response
         self._responses = list(responses) if responses is not None else None
         self.last_prompt = None
+        self.last_finish_reason = None
         self.prompts: List[str] = []  # every prompt seen, in call order -- useful when a test needs to
         # inspect more than just the most recent one (e.g. asserting on a specific debate's prompt).
 
