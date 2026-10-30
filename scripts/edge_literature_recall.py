@@ -7,7 +7,7 @@ claude/possible_metrics.md for how this fits alongside the pipeline's other metr
 
 Why this is a separate script and a separate metric, not just re-reading the pipeline's own
 `supported` flag: the production edge-literature check
-(PipelineB/agent3_confirmation.py's `_edge_literature_checks`, backed by
+(PipelineB/stage3_confirmation.py's `_edge_literature_checks`, backed by
 PipelineB/pubmed_client.py's `search_edge_citations`/`_check_edge_support`) is deliberately
 frugal -- retmax=3 papers per edge, and "supported" means only "both gene symbols appear together
 in the same retrieved paragraph/abstract," with no check that the surrounding text actually
@@ -138,7 +138,7 @@ def load_pipeline_edge_checks(pair_id: str) -> List[dict]:
         )
     data = json.loads(path.read_text())
     checks = []
-    for chain_result in data.get("agent3", []):
+    for chain_result in data.get("stage3", []):
         for check in chain_result.get("edge_literature_checks", []):
             checks.append(
                 {

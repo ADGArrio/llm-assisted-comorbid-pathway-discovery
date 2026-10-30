@@ -1,5 +1,5 @@
 """
-Agent 2 -- Chain Construction.
+Stage 2 -- LLM-based Judging (path search in code, then an LLM judge and debate).
 
 Service: OmniPathClient (omnipath_client.py) for real PPI edges,
 MetalinksClient (metalinks_client.py, optional) for real gene<->metabolite
@@ -18,7 +18,7 @@ metabolite graph was evaluated and removed from the default search (it added
 two calcium paths and nothing else; see the thesis). The LLM never invents edges -- it only selects which of the
 code-found real candidates are biologically plausible (zero, one, or
 several), and is skipped entirely when there's only one candidate.
-Used by: PipelineB.agent3_confirmation, and the top-level pipeline.
+Used by: PipelineB.stage3_confirmation, and the top-level pipeline.
 
 Edge score fields (schema per project_architecture.md):
 source_disease_assoc_score = source gene's Open Targets score vs disease1;
@@ -124,7 +124,7 @@ BFS depth-exhaustion bug, fixed 2026-09-14: the loop used to also stop
 entirely the moment ANY goal gene was reached, even at depth 1, never
 proceeding to depth 2+ to look for other goal genes only reachable
 deeper -- regardless of `max_hops`. A real T2DM->AD run surfaced this:
-Agent 1's gene pools happened to have several disease2 genes one
+Stage 1's gene pools happened to have several disease2 genes one
 generic, uncurated-direction OmniPath interaction away from a disease1
 gene (e.g. INSR -unknown-> AXL/ATP1A1/CLTC/NEU1/PIKFYVE), so BFS reported
 those 6 depth-1 candidates and quit, never even attempting depth 2-5
@@ -135,12 +135,12 @@ so a deeper, more specific candidate to a *different* goal gene now gets
 a chance to be found too, up to `max_hops`/`max_paths`. This does not
 remove the shallow candidates (they're often real edges, just weakly
 characterized) -- it adds better ones alongside them for the LLM to
-actually choose between. See claude/agent2_bfs_and_prompt_recalibration.md.
+actually choose between. See the Stage 2 BFS and prompt recalibration note.
 
 DEFAULT_MAX_HOPS = 5: deep enough to usually surface more than one
 candidate for the LLM to actually adjudicate between, per a real
 max_hops=10 run that returned 10 candidates but 100% LLM endorsement
-(see claude/agent2_findings_maxhops10_run.md). `--max-hops` overrides.
+(see the Stage 2 max_hops=10 findings note). `--max-hops` overrides.
 
 Unknown-direction handling: an edge with no curated activation/inhibition
 mode (interaction_type == "unknown") -- from OmniPath OR MetalinksDB's
@@ -154,20 +154,20 @@ rationale text.
 
 Rejection transparency (added 2026-09-14): when the LLM rejects every
 candidate (responds NONE), it's now asked to give one sentence saying why,
-so an empty `chains` list isn't a dead end -- `Agent2ChainResult.rejection_reason`
+so an empty `chains` list isn't a dead end -- `Stage2JudgingResult.rejection_reason`
 carries that sentence (None if the LLM gave a bare "NONE" with no reason,
 which is tolerated rather than treated as a formatting error).
 
 Plausibility bar loosened, then recalibrated (both 2026-09-14): the
 original bar required a specific, named mechanism for every single hop,
 which was rejecting all 10 candidates outright on real T2DM->AD runs (see
-claude/agent2_findings_maxhops10_run.md). Loosening it to "a coherent
+the Stage 2 max_hops=10 findings note). Loosening it to "a coherent
 overall story, general reasoning is enough per hop" over-corrected: on
 the very next real run it endorsed all 6 depth-1, uncurated-direction
 candidates from the BFS bug above with near-identical templated
 rationale text -- effectively the same 100%-acceptance,
 no-real-discrimination failure mode already documented in
-claude/agent2_findings_maxhops10_run.md's Finding 1, just reproduced
+the Stage 2 max_hops=10 findings note Finding 1, just reproduced
 under a different prompt. The bar is now hop-count-tiered: a single-hop
 candidate (the whole "chain" is one interaction) must have a specific,
 real, named mechanism to be endorsed -- "these proteins are known to
@@ -179,7 +179,7 @@ Rationale: a single unqualified interaction has no internal structure to
 lean on, so it needs to clear the high bar on its own; a real multi-step
 mechanism can have a genuinely strong anchor hop plus weaker-but-plausible
 supporting hops, which is a different (more defensible) thing than a
-lone guess. See claude/agent2_bfs_and_prompt_recalibration.md for the
+lone guess. See the Stage 2 BFS and prompt recalibration note for the
 full diagnosis (this is the second time this same local model has
 defaulted to near-0% or near-100% acceptance depending on prompt
 wording, worth flagging honestly in the thesis methods/limitations
@@ -243,7 +243,7 @@ even this cap, raising it further is a reasonable next step, watching
 for OmniPath request/runtime issues as the signal to stop.
 
 Complex nodes: tried filtering them out the same day (they can't carry
-an Open Targets score, can't be confirmed by Agent 3, and rendered as
+an Open Targets score, can't be confirmed by Stage 3, and rendered as
 confusing long strings), then reverted per explicit direction -- see
 omnipath_client.py's module docstring's "Complex nodes are kept" note
 and claude/open_issues_for_committee.md. BFS sees them again as ordinary
@@ -252,17 +252,16 @@ only ever be bridge hops, same as before this note was added).
 
 Pairwise debate ranking (added 2026-09-27, per committee feedback -- see
 claude/committee_feedback_round2_coscientist.md section 3b, and Gottweis
-et al. 2026's "Co-Scientist" Ranking agent): `_select_paths` above (now
-"stage 1") judges every candidate independently against a fixed rubric
+et al. 2026's "Co-Scientist" Ranking agent): `_select_paths` above (the judge) judges every candidate independently against a fixed rubric
 -- it never compares two candidates against each other, so nothing in
 its output actually answers "why would a scientist support this pathway
-OVER that one," only "is this pathway plausible in isolation." Stage 2,
-`_run_tournament` below, adds exactly that: every pair of stage-1-
+OVER that one," only "is this pathway plausible in isolation." The debate,
+`_run_tournament` below, adds exactly that: every pair of judge-
 endorsed candidates is compared head-to-head via a simulated debate
 (`_run_debate`), the LLM picks a winner with a rationale, and an
 Elo-style rating (starting at 1200, Co-Scientist's own stated default)
 is updated after each debate. Every debate's winner AND its rationale
-are kept in `Agent2ChainResult.debate_log`, not just the final ranking
+are kept in `Stage2JudgingResult.debate_log`, not just the final ranking
 -- the rationale is the actual answer to "why," a real head-to-head
 justification on file for every comparison, not one isolated verdict.
 Cost/scaling: comparing every pair costs O(n^2) LLM calls, fine for the
@@ -270,25 +269,25 @@ typical n<=3-4 candidates this pipeline actually produces, but a
 single-elimination bracket (`_single_elimination_bracket_pairs`) is used
 instead once a run has more than `_TOURNAMENT_BRACKET_THRESHOLD`
 candidates, trading full pairwise coverage for bounded cost (~n debates
-instead of ~n^2/2). A single stage-1 selection skips the tournament
+instead of ~n^2/2). A single judge selection skips the tournament
 entirely (nothing to compare) and keeps the initial 1200 rating.
-`run_agent2_chain(..., enable_debate_tournament=False)` / `_cli()`'s
+`run_stage2_judging(..., enable_debate_tournament=False)` / `_cli()`'s
 `--no-debate-tournament` disable this stage outright -- it multiplies
 LLM calls on top of an already-slow local Ollama backend, so it's worth
 timing on a real run before treating it as free.
 
 Hardening changes, 2026-10-18 (full reasoning and measurements in
-claude/agent2_hardening_provenance_maxhops.md and thesis Ch. 2/3):
+the Stage 2 hardening note and thesis Ch. 2/3):
   * OmniPath tie rule: an edge with both the stimulation and inhibition flag set is now resolved by
     OmniPath's own consensus columns, else "unknown" (omnipath_client.py). It used to be "activates".
   * Candidate trim (`_trim_candidates`): still longest-first, but among equal lengths fully-signed paths
     come first, and no start gene may supply more than `max_per_start_gene` (default 3) of the kept
     candidates unless slots would otherwise go empty -- a counter to INSR/PPARG-rooted candidates
     filling every slot.
-  * Stage 1 is judged in two candidate orders (original and reversed; `stage1_passes`); a candidate
-    endorsed in either pass survives, and `stage1_votes` records how many passes endorsed it. The
+  * The judge is run in two candidate orders (original and reversed; `judge_passes`); a candidate
+    endorsed in either pass survives, and `judge_votes` records how many passes endorsed it. The
     share of candidates whose verdict flips with order is saved as a measured order-bias statistic.
-  * Stage 2 debates are run in both A/B orders (`swap_debate_order`); a win counts only if the same
+  * Debates are run in both A/B orders (`swap_debate_order`); a win counts only if the same
     candidate wins both times, otherwise the debate is a draw (Elo score 0.5). The share of draws is
     the measured position-bias statistic.
   * Every chain carries a code-generated `evidence` block (edge directions, OmniPath curation effort,
@@ -308,7 +307,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from common.config import DISEASE_PAIRS, get_pair
 from common.llm_client import LLMClient
-from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
+from PipelineB.stage1_discovery import Stage1DiscoveryResult, run_stage1_discovery
 from PipelineB.metalinks_client import MetaboliteEdge, MetalinksClient
 from PipelineB.omnipath_client import EXTENDED_DATASETS, Interaction, OmniPathClient
 from PipelineB.pubmed_client import Citation, PubMedClient
@@ -316,8 +315,8 @@ from PipelineB.pubmed_client import Citation, PubMedClient
 DEFAULT_MAX_HOPS = 5
 DEFAULT_MAX_CANDIDATE_PATHS = 10
 DEFAULT_MAX_PER_START_GENE = 3  # at most this many of the kept candidates may share a start gene (0/None = no cap)
-DEFAULT_STAGE1_PASSES = 2  # stage-1 judgements per run: original order, then reversed (1 = single pass)
-DEFAULT_STAGE1_MIN_VOTES = 1  # passes that must endorse a candidate for it to survive stage 1
+DEFAULT_JUDGE_PASSES = 2  # judge judgements per run: original order, then reversed (1 = single pass)
+DEFAULT_JUDGE_MIN_VOTES = 1  # passes that must endorse a candidate for it to survive judge
 _CITATIONS_SHOWN_PER_GENE = 2  # literature titles shown to the model per gene (and recorded in `evidence`)
 # Disease abbreviations that are also gene symbols (CAD = carbamoyl-phosphate synthetase) or common words;
 # never counted as an "other gene named in a rationale".
@@ -326,7 +325,7 @@ _GENE_TOKEN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,}(?:_[A-Z0-9]+)*(?![a
 _MAX_FRONTIER_SIZE = 3000  # safety cap per BFS layer; see module docstring's "_MAX_FRONTIER_SIZE raised" note
 _PARSE_ATTEMPTS = 2  # an LLM reply that cannot be parsed is retried once before raising (added 2026-10-15)
 
-# Pairwise debate ranking (stage 2) -- see module docstring's "Pairwise debate ranking" note.
+# Pairwise debate ranking -- see module docstring's "Pairwise debate ranking" note.
 _INITIAL_ELO = 1200.0  # matches Co-Scientist's own stated Ranking-agent default (Gottweis et al. 2026)
 _ELO_K_FACTOR = 32.0  # standard chess/Elo default; not tuned against real pipeline data yet
 _TOURNAMENT_BRACKET_THRESHOLD = 8  # candidate count above which a single-elimination bracket
@@ -372,14 +371,14 @@ class ChainEdge:
 @dataclass
 class ChainCandidate:
     """One LLM-endorsed plausible chain, with its rationale. A single
-    Agent2ChainResult can hold more than one of these."""
+    Stage2JudgingResult can hold more than one of these."""
 
     edges: List[ChainEdge]
     rationale: Optional[str]
-    elo_rating: Optional[float] = None  # set by the stage-2 pairwise tournament; None if the
+    elo_rating: Optional[float] = None  # set by the pairwise tournament; None if the
     # tournament didn't run (single-candidate bypass, or enable_debate_tournament=False) -- see
     # module docstring's "Pairwise debate ranking" note.
-    stage1_votes: Optional[int] = None  # how many stage-1 passes endorsed it; None = never judged (lone candidate)
+    judge_votes: Optional[int] = None  # how many judge passes endorsed it; None = never judged (lone candidate)
     rationale_off_path_genes: List[str] = field(default_factory=list)  # other genes the LLM text names (unverified claims)
     evidence: dict = field(default_factory=dict)  # code-generated, grounded facts about the chain -- see _build_evidence
 
@@ -395,7 +394,7 @@ class ChainCandidate:
             "rationale_source": "LLM commentary, not verified against any database",
             "has_unconfirmed_direction": self.has_unconfirmed_direction,
             "elo_rating": self.elo_rating,
-            "stage1_votes": self.stage1_votes,
+            "judge_votes": self.judge_votes,
             "rationale_off_path_genes": self.rationale_off_path_genes,
             "evidence": self.evidence,
         }
@@ -403,10 +402,10 @@ class ChainCandidate:
 
 @dataclass
 class DebateComparison:
-    """One pairwise debate between two stage-1-endorsed candidate chains, kept in full so the
+    """One pairwise debate between two judge-endorsed candidate chains, kept in full so the
     model's rationale for preferring one over the other stays on record -- see module docstring's
     "Pairwise debate ranking" note. `winner_index`/`loser_index` refer to position in the final
-    `Agent2ChainResult.chains` list (i.e. already re-sorted by final Elo rating), not the
+    `Stage2JudgingResult.chains` list (i.e. already re-sorted by final Elo rating), not the
     mid-tournament ordering, so a comparison can always be matched back to the chains it judged."""
 
     winner_index: int
@@ -433,7 +432,7 @@ class DebateComparison:
 
 
 @dataclass
-class Agent2ChainResult:
+class Stage2JudgingResult:
     disease1: str
     disease2: str
     chains: List[ChainCandidate]
@@ -464,7 +463,7 @@ class NoChainFoundError(RuntimeError):
 
 
 class EdgeProvenanceError(RuntimeError):
-    """Raised if anything in Agent 2's output is not traceable to an edge the BFS pulled from
+    """Raised if anything in Stage 2's output is not traceable to an edge the BFS pulled from
     OmniPath/MetalinksDB. This should be impossible by construction (the LLM only returns candidate
     numbers and text); the check exists so that a future code change that breaks the invariant fails
     loudly instead of silently shipping an ungrounded edge."""
@@ -531,10 +530,10 @@ def _metalinks_to_raw(edges: List[MetaboliteEdge]) -> List[_RawEdge]:
     ]
 
 
-def _score_maps(agent1_result: Agent1DiscoveryResult) -> Tuple[Dict[str, float], Dict[str, float]]:
-    # Input: Agent1DiscoveryResult. Output: (disease1 gene->score dict, disease2 gene->score dict).
-    d1 = {t.gene_symbol: t.disease_assoc_score for t in agent1_result.disease1_targets}
-    d2 = {t.gene_symbol: t.disease_assoc_score for t in agent1_result.disease2_targets}
+def _score_maps(stage1_result: Stage1DiscoveryResult) -> Tuple[Dict[str, float], Dict[str, float]]:
+    # Input: Stage1DiscoveryResult. Output: (disease1 gene->score dict, disease2 gene->score dict).
+    d1 = {t.gene_symbol: t.disease_assoc_score for t in stage1_result.disease1_targets}
+    d2 = {t.gene_symbol: t.disease_assoc_score for t in stage1_result.disease2_targets}
     return d1, d2
 
 
@@ -566,7 +565,7 @@ def _bfs_shortest_paths(
     # distinct goal gene reached (tracked via found_targets, so a goal already satisfied at a
     # shallower depth can't also be found again at a deeper one). If `stats` (a dict) is given it is
     # filled with the search funnel -- per-layer sizes, how many paths existed BEFORE the max_paths
-    # trim, hop-count distribution, unknown-direction count -- see run_agent2_chain's bfs_stats.
+    # trim, hop-count distribution, unknown-direction count -- see run_stage2_judging's bfs_stats.
     # `max_per_start_gene` (None/0 = off) and the trim order: see _trim_candidates. If `gene_universe` (a set)
     # is given, every gene symbol the search saw on any returned edge is added to it (used to spot gene
     # names in LLM text that are not on the chain). A path's first and last node
@@ -593,7 +592,7 @@ def _bfs_shortest_paths(
 
         if len(frontier) > _MAX_FRONTIER_SIZE:
             print(
-                f"WARNING: Agent 2 BFS depth {depth}: frontier of {len(frontier)} nodes exceeds "
+                f"WARNING: Stage 2 BFS depth {depth}: frontier of {len(frontier)} nodes exceeds "
                 f"the {_MAX_FRONTIER_SIZE}-node safety cap; truncating -- keeping disease-scored "
                 f"genes first, then the rest deterministically by id (see module docstring's "
                 f"'frontier truncation prioritized' note).",
@@ -660,7 +659,7 @@ def _bfs_shortest_paths(
     if stats is not None:
         stats["layers"] = layers_stats
         stats["n_paths_before_trim"] = len(found)
-        # Every gene that sits BETWEEN the endpoints of some goal-reaching path, before trimming. Agent 3 draws its
+        # Every gene that sits BETWEEN the endpoints of some goal-reaching path, before trimming. Stage 3 draws its
         # random-gene baseline from this pool (genes the search could have used as bridges), so the baseline has the
         # same topology bias (hub-like, well-connected genes) as the chains it is compared against.
         stats["candidate_bridge_genes"] = sorted({e.target_id for p in found for e in p[:-1] if e.target_kind == "gene"})
@@ -682,7 +681,7 @@ def _bfs_shortest_paths(
         # every max_paths slot before a deeper, more specific mechanism is ever found defeats the point of
         # searching past a goal gene at all.
         print(
-            f"WARNING: Agent 2 BFS found {len(found)} candidate path(s), more than "
+            f"WARNING: Stage 2 BFS found {len(found)} candidate path(s), more than "
             f"max_candidate_paths={max_paths}; keeping {max_paths} (longest first, fully-signed first among "
             f"equal lengths, at most {max_per_start_gene or 'unlimited'} per start gene) and dropping the rest.",
             flush=True,
@@ -729,14 +728,14 @@ def _trim_candidates(
 
 
 def _assert_selected_paths_are_code_found(selections, paths: List[List[_RawEdge]]) -> None:
-    # Input: stage-1 selections [(path, rationale)] and the BFS's own path list. Raises
+    # Input: judge selections [(path, rationale)] and the BFS's own path list. Raises
     # EdgeProvenanceError unless every selected path is, by identity, one of the BFS paths. The LLM only
     # ever supplies a candidate NUMBER (looked up in `paths`) and rationale text, so this holds by
     # construction; it is checked so a future refactor cannot silently break it.
     code_found = {id(p) for p in paths}
     for path, _ in selections:
         if id(path) not in code_found:
-            raise EdgeProvenanceError("Agent 2: a selected chain is not one of the paths the BFS found.")
+            raise EdgeProvenanceError("Stage 2: a selected chain is not one of the paths the BFS found.")
 
 
 def _assert_chain_edges_come_from_bfs(chains, paths: List[List[_RawEdge]]) -> None:
@@ -747,7 +746,7 @@ def _assert_chain_edges_come_from_bfs(chains, paths: List[List[_RawEdge]]) -> No
         for e in chain.edges:
             if (e.source_gene, e.target_gene, e.interaction_type, e.omnipath_edge_id) not in allowed:
                 raise EdgeProvenanceError(
-                    f"Agent 2: chain edge {e.source_gene} -> {e.target_gene} ({e.interaction_type}) "
+                    f"Stage 2: chain edge {e.source_gene} -> {e.target_gene} ({e.interaction_type}) "
                     "was not found by the BFS in OmniPath/MetalinksDB."
                 )
 
@@ -862,7 +861,7 @@ def _parse_debate_verdict(response: str) -> Optional[Tuple[int, str]]:
     # Input: a debate reply. Output: (0 for A / 1 for B, rationale text), or None if no clear
     # "WINNER: A" / "WINNER: B" line exists. ONLY the winner line is required: the rationale label is
     # matched loosely (RATIONALE:, and the misspelling "RATIONE:" that gemma4 emitted in a real run on
-    # 2026-10-18, which crashed an entire Agent 2 run), and if no rationale label is present at all the
+    # 2026-10-18, which crashed an entire Stage 2 run), and if no rationale label is present at all the
     # text after the winner line is used. The verdict itself is never guessed -- no winner line, no parse.
     winner_match = _DEBATE_WINNER_RE.search(response)
     if not winner_match:
@@ -889,7 +888,7 @@ def _format_candidate(
     index: int, path: List[_RawEdge], citations: Dict[str, List[Citation]], show_edge_strength: bool = False
 ) -> str:
     # Input: candidate index, path edges, gene->citations dict, and whether to print each edge's OmniPath evidence
-    # strength (added 2026-10-18, see run_agent2_chain's judge_evidence). Output: prompt text block for this candidate.
+    # strength (added 2026-10-18, see run_stage2_judging's judge_evidence). Output: prompt text block for this candidate.
     def _step(e: _RawEdge) -> str:
         label = "UNKNOWN DIRECTION" if e.interaction_type == "unknown" else e.interaction_type
         text = f"{_node_label(e.source_kind, e.source_id)} --{label}--> {_node_label(e.target_kind, e.target_id)}"
@@ -899,7 +898,7 @@ def _format_candidate(
         return text
 
     steps = " -> ".join(_step(e) for e in path)
-    # Citations are keyed by gene symbol only -- metabolites never have PubMed lookups (Agent 1 only
+    # Citations are keyed by gene symbol only -- metabolites never have PubMed lookups (Stage 1 only
     # cites genes), so only gene-kind node ids are worth looking up here.
     genes_in_path = sorted(
         {e.source_id for e in path if e.source_kind == "gene"} | {e.target_id for e in path if e.target_kind == "gene"}
@@ -933,8 +932,8 @@ def _select_paths(
     # (returns the single path, rationale=None, reason=None) when there's nothing to adjudicate.
     # Callers must still run every returned tuple through _with_unknown_direction_caveat.
     #
-    # This is "stage 1" of a two-stage selection process -- see module docstring's "Pairwise
-    # debate ranking" note for stage 2 (_run_tournament), which compares these selections against
+    # This is the judge, the first half of a two-part selection process -- see module docstring's "Pairwise
+    # debate ranking" note for the debate (_run_tournament), which compares these selections against
     # each other rather than judging each in isolation.
     if len(paths) == 1:
         return [(paths[0], None)], None
@@ -968,7 +967,7 @@ def _select_paths(
     # "isn't specifically detailed" -- i.e. a rejection in substance -- and the old regex (which
     # accepted any "<number>: <anything>" line) endorsed all of them anyway, because it had no way
     # to tell a discussed-but-rejected candidate apart from an endorsed one. See
-    # claude/agent2_bfs_and_prompt_recalibration.md.
+    # the Stage 2 BFS and prompt recalibration note.
     #
     # Number/verdict separator, widened 2026-09-14 (same day): the prompt asks for
     # "<number>: <verdict>", but a real run had the model write "<number>. <verdict>" instead
@@ -1014,7 +1013,7 @@ def _select_paths(
     parse_reply(response, set(range(len(paths))))
     if not selections and not not_plausible:
         raise RuntimeError(
-            f"Agent 2: LLM path-selection response had no parseable "
+            f"Stage 2: LLM path-selection response had no parseable "
             f"'<number>: PLAUSIBLE/NOT PLAUSIBLE - <rationale>' lines and wasn't 'NONE' either: {response!r}"
         )
 
@@ -1056,12 +1055,12 @@ def _select_paths_both_orders(
     disease2: str,
     citations: Dict[str, List[Citation]],
     llm_client,
-    passes: int = DEFAULT_STAGE1_PASSES,
-    min_votes: int = DEFAULT_STAGE1_MIN_VOTES,
+    passes: int = DEFAULT_JUDGE_PASSES,
+    min_votes: int = DEFAULT_JUDGE_MIN_VOTES,
     control_pass: bool = False,
     show_edge_strength: bool = False,
 ):
-    # Input: candidate paths and the usual stage-1 inputs, plus `passes` (1 = the original single judgement;
+    # Input: candidate paths and the usual judge inputs, plus `passes` (1 = the original single judgement;
     # 2 = also judge the REVERSED candidate list), `min_votes` (passes that must endorse a candidate),
     # `control_pass` (with passes=2: judge the ORIGINAL order a second time, as a noise control) and
     # show_edge_strength (see _format_candidate).
@@ -1099,10 +1098,10 @@ def _select_paths_both_orders(
     first_selections, first_reason = one_pass(paths, "forward")
     if len(paths) == 1 or passes <= 1:
         votes = {id(path): 1 for path, _ in first_selections}
-        stats = {"stage1_passes": 1 if len(paths) > 1 else 0}
+        stats = {"judge_passes": 1 if len(paths) > 1 else 0}
         if len(paths) > 1:
-            stats["stage1_unjudged_forward"] = unjudged["forward"]
-            stats["stage1_diagnostics"] = diagnostics
+            stats["judge_unjudged_forward"] = unjudged["forward"]
+            stats["judge_diagnostics"] = diagnostics
         return first_selections, first_reason, votes, stats
 
     second_selections, second_reason = one_pass(list(reversed(paths)), "reversed")
@@ -1116,27 +1115,27 @@ def _select_paths_both_orders(
     in_second = {id(path) for path, _ in second_selections}
     kept = [(path, rationale_of[id(path)]) for path in paths if votes.get(id(path), 0) >= min_votes]
     stats = {
-        "stage1_passes": 2,
-        "stage1_min_votes": min_votes,
-        "stage1_endorsed_forward": len(in_first),
-        "stage1_endorsed_reversed": len(in_second),
-        "stage1_endorsed_both": len(in_first & in_second),
-        "stage1_order_disagreements": len(in_first ^ in_second),
-        "stage1_candidates": len(paths),
-        "stage1_unjudged_forward": unjudged["forward"],
-        "stage1_unjudged_reversed": unjudged["reversed"],
+        "judge_passes": 2,
+        "judge_min_votes": min_votes,
+        "judge_endorsed_forward": len(in_first),
+        "judge_endorsed_reversed": len(in_second),
+        "judge_endorsed_both": len(in_first & in_second),
+        "judge_order_disagreements": len(in_first ^ in_second),
+        "judge_candidates": len(paths),
+        "judge_unjudged_forward": unjudged["forward"],
+        "judge_unjudged_reversed": unjudged["reversed"],
     }
     if control_pass:
         repeat_selections, _ = one_pass(paths, "forward_repeat")
         in_repeat = {id(path) for path, _ in repeat_selections}
         stats.update({
-            "stage1_control_pass": True,
-            "stage1_endorsed_forward_repeat": len(in_repeat),
+            "judge_control_pass": True,
+            "judge_endorsed_forward_repeat": len(in_repeat),
             # forward vs forward-again: any difference here is sampling noise, not order
-            "stage1_noise_disagreements": len(in_first ^ in_repeat),
-            "stage1_unjudged_forward_repeat": unjudged["forward_repeat"],
+            "judge_noise_disagreements": len(in_first ^ in_repeat),
+            "judge_unjudged_forward_repeat": unjudged["forward_repeat"],
         })
-    stats["stage1_diagnostics"] = diagnostics
+    stats["judge_diagnostics"] = diagnostics
     reason = None if kept else (first_reason or second_reason)
     return kept, reason, votes, stats
 
@@ -1150,12 +1149,12 @@ def _run_debate(
     llm_client,
     show_edge_strength: bool = False,
 ) -> Tuple[Optional[int], str]:
-    # Input: two stage-1-selected (path, rationale) candidates, disease names, citations, LLM client.
+    # Input: two judge-selected (path, rationale) candidates, disease names, citations, LLM client.
     # Output: (0 if A won / 1 if B won / None if the reply had no parseable verdict twice, rationale text). Changed
-    # 2026-10-18: this used to RAISE on an unparseable reply, which aborted a whole ~20-minute Agent 2 run over one
+    # 2026-10-18: this used to RAISE on an unparseable reply, which aborted a whole ~20-minute Stage 2 run over one
     # garbled debate (a real run, "RATIONE:"). Now a missing verdict is returned as None and the caller records the
     # debate as a draw flagged `unparsed`: "no verdict" is reported as exactly that, no winner is guessed, and the
-    # unparseable reply (truncated) is kept in the rationale text. Contrast stage 1, where an unparseable reply still
+    # unparseable reply (truncated) is kept in the rationale text. Contrast the judge, where an unparseable reply still
     # raises because there is nothing sensible to fall back to.
     path_a, _ = candidate_a
     path_b, _ = candidate_b
@@ -1261,14 +1260,14 @@ def _run_tournament(
     swap_order: bool = True,
     show_edge_strength: bool = False,
 ) -> Tuple[List[float], List[DebateComparison]]:
-    # Input: stage-1-selected candidates (path, rationale), disease names, citations, LLM client.
+    # Input: judge-selected candidates (path, rationale), disease names, citations, LLM client.
     # Output: (elo_ratings parallel to `selections`, full debate log). Every debate's winner and
     # rationale is kept, not just the final ranking -- see module docstring. A full round-robin is
     # used when there are few enough candidates to keep cost bounded (n <= _TOURNAMENT_BRACKET_THRESHOLD),
     # else a single-elimination bracket. A single candidate skips the tournament entirely (nothing
     # to compare) and keeps the initial rating. `winner_index`/`loser_index` in the returned
     # DebateComparisons refer to positions in `selections` (the caller re-maps these to the final,
-    # Elo-sorted `chains` order -- see run_agent2_chain).
+    # Elo-sorted `chains` order -- see run_stage2_judging).
     n = len(selections)
     ratings = [_INITIAL_ELO] * n
     debate_log: List[DebateComparison] = []
@@ -1393,7 +1392,7 @@ def _build_evidence(
 
 
 def _off_path_genes(rationale: Optional[str], path: List[_RawEdge], universe: Set[str]) -> List[str]:
-    # Input: an LLM rationale, the chain it describes, the set of gene symbols the search saw (plus Agent 1's
+    # Input: an LLM rationale, the chain it describes, the set of gene symbols the search saw (plus Stage 1's
     # lists and the cited genes). Output: sorted gene symbols that appear in the text but are NOT on this chain
     # (disease abbreviations excluded). Such mentions are claims about biology the chain's data do not contain;
     # they are listed so a reader or a later check can verify them, not used to reject the chain.
@@ -1405,13 +1404,13 @@ def _off_path_genes(rationale: Optional[str], path: List[_RawEdge], universe: Se
 
 
 def _fetch_bridge_citations(paths, citations, disease1, disease2, pubmed_client, stats) -> Dict[str, List[Citation]]:
-    # Input: the candidate paths, Agent 1's gene->citations dict, both disease names, a PubMed client, and the
+    # Input: the candidate paths, Stage 1's gene->citations dict, both disease names, a PubMed client, and the
     # bfs_stats dict. Output: a COPY of the citations dict extended with up to one paper per disease (so at most 2)
-    # for every gene on a candidate path that Agent 1 gave no literature for -- in practice the bridge genes in the
+    # for every gene on a candidate path that Stage 1 gave no literature for -- in practice the bridge genes in the
     # middle of chains, which previously reached the judge with nothing but the model's own memory. Same gene-AND-
-    # disease search Agent 1 uses (titles, PubMed's default order). Deliberately NOT an edge co-mention search
-    # ("geneA AND geneB"): that is exactly Agent 3's independent edge-literature check, and showing it to the Agent 2
-    # judge would make Agent 3's confirmation circular. A failed search is skipped and counted, never fatal.
+    # disease search Stage 1 uses (titles, PubMed's default order). Deliberately NOT an edge co-mention search
+    # ("geneA AND geneB"): that is exactly Stage 3's independent edge-literature check, and showing it to the Stage 2
+    # judge would make Stage 3's confirmation circular. A failed search is skipped and counted, never fatal.
     merged = {gene: list(cs) for gene, cs in citations.items()}
     genes = sorted({e.source_id for p in paths for e in p if e.source_kind == "gene"}
                    | {e.target_id for p in paths for e in p if e.target_kind == "gene"})
@@ -1436,8 +1435,8 @@ def _fetch_bridge_citations(paths, citations, disease1, disease2, pubmed_client,
     return merged
 
 
-def run_agent2_chain(
-    agent1_result: Agent1DiscoveryResult,
+def run_stage2_judging(
+    stage1_result: Stage1DiscoveryResult,
     omnipath_client: Optional[object] = None,
     metalinks_client: Optional[object] = None,
     llm_client: Optional[object] = None,
@@ -1445,31 +1444,31 @@ def run_agent2_chain(
     max_candidate_paths: int = DEFAULT_MAX_CANDIDATE_PATHS,
     enable_debate_tournament: bool = True,
     max_per_start_gene: Optional[int] = DEFAULT_MAX_PER_START_GENE,
-    stage1_passes: int = DEFAULT_STAGE1_PASSES,
-    stage1_min_votes: int = DEFAULT_STAGE1_MIN_VOTES,
+    judge_passes: int = DEFAULT_JUDGE_PASSES,
+    judge_min_votes: int = DEFAULT_JUDGE_MIN_VOTES,
     swap_debate_order: bool = True,
-    stage1_control_pass: bool = False,
+    judge_control_pass: bool = False,
     judge_evidence: bool = False,
     pubmed_client: Optional[object] = None,
-) -> Agent2ChainResult:
-    # Input: Agent 1's result, optional clients (omnipath_client defaults to real OmniPathClient;
+) -> Stage2JudgingResult:
+    # Input: Stage 1's result, optional clients (omnipath_client defaults to real OmniPathClient;
     # metalinks_client defaults to None, meaning protein-only search -- pass a real MetalinksClient()
     # or StubMetalinksClient to include gene<->metabolite hops; llm_client defaults to real LLMClient;
-    # pass Stub* clients in tests), hop/candidate limits, and whether to run the stage-2 pairwise
+    # pass Stub* clients in tests), hop/candidate limits, and whether to run the pairwise
     # debate tournament (see module docstring's "Pairwise debate ranking" note -- on by default,
-    # but multiplies LLM calls; set False to skip it and keep only stage-1 independent selection).
-    # 2026-10-18 options: max_per_start_gene (trim diversity cap, None/0 = off), stage1_passes (2 = also judge the
-    # reversed candidate order; 1 = single pass), stage1_min_votes, swap_debate_order (run each debate in both
+    # but multiplies LLM calls; set False to skip it and keep only judge independent selection).
+    # 2026-10-18 options: max_per_start_gene (trim diversity cap, None/0 = off), judge_passes (2 = also judge the
+    # reversed candidate order; 1 = single pass), judge_min_votes, swap_debate_order (run each debate in both
     # A/B orders; disagreement = draw). Defaults = the hardened behaviour; pass 1/1/False for the old one.
-    # Also added 2026-10-18: stage1_control_pass (judge the original order a second time and record how often the two
+    # Also added 2026-10-18: judge_control_pass (judge the original order a second time and record how often the two
     # forward verdicts differ -- separates sampling noise from order bias; does not affect which chains are kept) and
     # judge_evidence (show the judge each edge's OmniPath evidence strength and, when pubmed_client is given, one
-    # PubMed title per disease for every path gene Agent 1 gave no literature; see _fetch_bridge_citations). All three
+    # PubMed title per disease for every path gene Stage 1 gave no literature; see _fetch_bridge_citations). All three
     # default to OFF here so the function behaves as before for existing callers; the CLI and scripts/run_all turn them on.
-    # Output: Agent2ChainResult. Raises NoChainFoundError if BFS finds nothing within max_hops.
+    # Output: Stage2JudgingResult. Raises NoChainFoundError if BFS finds nothing within max_hops.
     omnipath_client = omnipath_client or OmniPathClient()
 
-    disease1_scores, disease2_scores = _score_maps(agent1_result)
+    disease1_scores, disease2_scores = _score_maps(stage1_result)
     disease1_genes = list(disease1_scores.keys())
     disease2_genes = set(disease2_scores.keys())
     shared_genes = sorted(disease1_scores.keys() & disease2_scores.keys())
@@ -1488,38 +1487,38 @@ def run_agent2_chain(
     )
     if not paths:
         raise NoChainFoundError(
-            f"Agent 2: no directed path found between any {agent1_result.disease1}-associated "
-            f"protein and any {agent1_result.disease2}-associated protein, within {max_hops} hops, "
+            f"Stage 2: no directed path found between any {stage1_result.disease1}-associated "
+            f"protein and any {stage1_result.disease2}-associated protein, within {max_hops} hops, "
             f"starting from {len(disease1_genes)} disease1 genes and {len(disease2_genes)} disease2 genes "
-            f"Agent 1 surfaced (search could pass through other genes OmniPath connects them to, and "
+            f"Stage 1 surfaced (search could pass through other genes OmniPath connects them to, and "
             f"metabolites if a MetalinksDB client was provided)."
         )
 
     llm_client = llm_client or LLMClient()
-    judge_citations = agent1_result.citations
+    judge_citations = stage1_result.citations
     bfs_stats["judge_evidence"] = "none"
     if judge_evidence:
         bfs_stats["judge_evidence"] = "omnipath_edge_strength"
         if pubmed_client is not None:
             judge_citations = _fetch_bridge_citations(
-                paths, agent1_result.citations, agent1_result.disease1, agent1_result.disease2, pubmed_client, bfs_stats
+                paths, stage1_result.citations, stage1_result.disease1, stage1_result.disease2, pubmed_client, bfs_stats
             )
             bfs_stats["judge_evidence"] += "+bridge_gene_citations"
-    selections, rejection_reason, stage1_votes, order_stats = _select_paths_both_orders(
-        paths, agent1_result.disease1, agent1_result.disease2, judge_citations, llm_client,
-        passes=stage1_passes, min_votes=stage1_min_votes, control_pass=stage1_control_pass,
+    selections, rejection_reason, judge_votes, order_stats = _select_paths_both_orders(
+        paths, stage1_result.disease1, stage1_result.disease2, judge_citations, llm_client,
+        passes=judge_passes, min_votes=judge_min_votes, control_pass=judge_control_pass,
         show_edge_strength=judge_evidence,
     )
     bfs_stats.update(order_stats)
     _assert_selected_paths_are_code_found(selections, paths)
-    bfs_stats["n_stage1_endorsed"] = len(selections)
+    bfs_stats["n_judge_endorsed"] = len(selections)
     bfs_stats["llm_model"] = getattr(llm_client, "model", None)
 
     ratings = [None] * len(selections)
     debate_log: List[DebateComparison] = []
     if selections and enable_debate_tournament and len(selections) > 1:
         ratings, raw_debate_log = _run_tournament(
-            selections, agent1_result.disease1, agent1_result.disease2, judge_citations, llm_client,
+            selections, stage1_result.disease1, stage1_result.disease2, judge_citations, llm_client,
             swap_order=swap_debate_order, show_edge_strength=judge_evidence,
         )
         bfs_stats["debates_run"] = len(raw_debate_log)
@@ -1548,7 +1547,7 @@ def run_agent2_chain(
             edges=_to_chain_edges(path, disease1_scores, disease2_scores),
             rationale=_with_unknown_direction_caveat(path, rationale),
             elo_rating=ratings[old_i] if ratings and ratings[old_i] is not None else None,
-            stage1_votes=stage1_votes.get(id(path)) if len(paths) > 1 else None,
+            judge_votes=judge_votes.get(id(path)) if len(paths) > 1 else None,
             rationale_off_path_genes=_off_path_genes(rationale, path, known_genes),
             evidence=_build_evidence(path, disease1_scores, disease2_scores, judge_citations),
         )
@@ -1569,9 +1568,9 @@ def run_agent2_chain(
         for d in raw_debate_log
     ]
 
-    return Agent2ChainResult(
-        disease1=agent1_result.disease1,
-        disease2=agent1_result.disease2,
+    return Stage2JudgingResult(
+        disease1=stage1_result.disease1,
+        disease2=stage1_result.disease2,
         chains=chains,
         candidate_path_count=len(paths),
         shared_genes=shared_genes,
@@ -1582,11 +1581,11 @@ def run_agent2_chain(
 
 
 def _cli():
-    parser = argparse.ArgumentParser(description="Run Agent 1 then Agent 2 (Chain Construction) for one disease pair.")
+    parser = argparse.ArgumentParser(description="Run Stage 1 then Stage 2 (LLM-based Judging) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
-    parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Agent 1")
+    parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Stage 1")
     parser.add_argument("--max-hops", type=int, default=DEFAULT_MAX_HOPS, help="Max PPI/metabolite hops to search")
     parser.add_argument(
         "--with-metabolites", action="store_true", help="Opt in to MetalinksDB gene<->metabolite hops (default: protein-only)"
@@ -1595,16 +1594,16 @@ def _cli():
     parser.add_argument(
         "--no-debate-tournament",
         action="store_true",
-        help="Skip stage 2's pairwise debate tournament -- keep only stage 1's independent PLAUSIBLE/NOT PLAUSIBLE filter (see module docstring)",
+        help="Skip the pairwise debate tournament -- keep only the judge's independent PLAUSIBLE/NOT PLAUSIBLE filter (see module docstring)",
     )
     parser.add_argument("--max-per-start-gene", type=int, default=DEFAULT_MAX_PER_START_GENE,
                         help="Trim diversity cap: most kept candidates that may share one start gene (0 = no cap)")
-    parser.add_argument("--stage1-passes", type=int, choices=[1, 2], default=DEFAULT_STAGE1_PASSES,
+    parser.add_argument("--judge-passes", type=int, choices=[1, 2], default=DEFAULT_JUDGE_PASSES,
                         help="2 = also judge candidates in reversed order (measures order bias); 1 = single judgement")
     parser.add_argument("--no-swap-debates", action="store_true",
-                        help="Run each stage-2 debate once instead of in both A/B orders")
-    parser.add_argument("--no-stage1-control", action="store_true",
-                        help="Skip the extra forward-order stage-1 pass that measures sampling noise")
+                        help="Run each debate once instead of in both A/B orders")
+    parser.add_argument("--no-judge-control", action="store_true",
+                        help="Skip the extra forward-order judge pass that measures sampling noise")
     parser.add_argument("--no-judge-evidence", action="store_true",
                         help="Do not show the judge OmniPath edge strength or bridge-gene PubMed titles")
     parser.add_argument(
@@ -1614,7 +1613,7 @@ def _cli():
             "OmniPath dataset scope. Omit for the default core 'omnipath' set. Pass 'extended' "
             f"as shorthand for '{EXTENDED_DATASETS}' (adds pathwayextra + kinaseextra, still-"
             "curated but broader coverage), or a raw comma-separated dataset list. See "
-            "omnipath_client.py's module docstring and claude/agent2_bfs_and_prompt_recalibration.md."
+            "omnipath_client.py's module docstring and the Stage 2 BFS and prompt recalibration note."
         ),
     )
     args = parser.parse_args()
@@ -1627,10 +1626,10 @@ def _cli():
     else:
         parser.error("Pass --pair, or both --disease1 and --disease2.")
 
-    print(f"Running Agent 1 (Discovery) for {disease1} / {disease2}...", flush=True)
-    agent1_result = run_agent1_discovery(disease1, disease2, min_score=args.min_score)
+    print(f"Running Stage 1 (Discovery) for {disease1} / {disease2}...", flush=True)
+    stage1_result = run_stage1_discovery(disease1, disease2, min_score=args.min_score)
 
-    print("Running Agent 2 (Chain Construction)...", flush=True)
+    print("Running Stage 2 (LLM-based Judging)...", flush=True)
     metalinks_client = MetalinksClient() if args.with_metabolites else None
     if args.omnipath_datasets == "extended":
         omnipath_client = OmniPathClient(datasets=EXTENDED_DATASETS)
@@ -1638,29 +1637,29 @@ def _cli():
         omnipath_client = OmniPathClient(datasets=args.omnipath_datasets)
     else:
         omnipath_client = None  # OmniPathClient()'s own default (the core "omnipath" set)
-    agent2_result = run_agent2_chain(
-        agent1_result,
+    stage2_result = run_stage2_judging(
+        stage1_result,
         omnipath_client=omnipath_client,
         metalinks_client=metalinks_client,
         max_hops=args.max_hops,
         enable_debate_tournament=not args.no_debate_tournament,
         max_per_start_gene=args.max_per_start_gene,
-        stage1_passes=args.stage1_passes,
+        judge_passes=args.judge_passes,
         swap_debate_order=not args.no_swap_debates,
-        stage1_control_pass=not args.no_stage1_control,
+        judge_control_pass=not args.no_judge_control,
         judge_evidence=not args.no_judge_evidence,
         pubmed_client=None if args.no_judge_evidence else PubMedClient(),
     )
 
-    if not agent2_result.chains:
-        reason_text = f' LLM\'s stated reason: "{agent2_result.rejection_reason}"' if agent2_result.rejection_reason else " (no reason given)"
+    if not stage2_result.chains:
+        reason_text = f' LLM\'s stated reason: "{stage2_result.rejection_reason}"' if stage2_result.rejection_reason else " (no reason given)"
         print(
-            f"Agent 2 found {agent2_result.candidate_path_count} structural candidate path(s), "
+            f"Stage 2 found {stage2_result.candidate_path_count} structural candidate path(s), "
             f"but the LLM did not judge any of them biologically plausible.{reason_text}",
             flush=True,
         )
 
-    print(json.dumps(agent2_result.to_dict(), indent=2))
+    print(json.dumps(stage2_result.to_dict(), indent=2))
 
 
 if __name__ == "__main__":

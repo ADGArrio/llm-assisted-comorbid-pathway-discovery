@@ -1,18 +1,18 @@
 """
-Agent 3, cross-database gene-disease association check -- GWAS Catalog.
+Stage 3, cross-database gene-disease association check -- GWAS Catalog.
 
 Service: GWAS Catalog REST API v2 (https://www.ebi.ac.uk/gwas/rest/api/v2), one endpoint:
   GET /associations?mapped_gene=<SYMBOL>&efo_trait=<exact EFO trait name>&size=100&page=N
 Data: each association carries p_value, efo_traits [{efo_id, efo_trait}], mapped_genes,
 accession_id (the GCST study accession), pubmed_id and the SNP alleles. This is real, numerical
-GWAS-study evidence rather than another literature-aggregation source -- Agent 1's PubMed
+GWAS-study evidence rather than another literature-aggregation source -- Stage 1's PubMed
 citations already cover literature evidence.
-Used by: PipelineB.agent3_confirmation, to independently confirm a chain's two disease-anchored
+Used by: PipelineB.stage3_confirmation, to independently confirm a chain's two disease-anchored
 endpoint genes against a source Open Targets does not itself aggregate.
 
 MIGRATION, 2026-10-18 (v1 -> v2). The v1 endpoint this module was built on
 (/singleNucleotidePolymorphisms/search/findByGene) now answers HTTP 410 Gone -- EBI retired it. A
-live run of the whole pipeline crashed Agent 3 on its first gene (FGFR4) with exactly that error.
+live run of the whole pipeline crashed Stage 3 on its first gene (FGFR4) with exactly that error.
 It failed LOUDLY (HTTPError), which is the right failure mode: it did not silently report "no
 GWAS evidence". The v2 API is much simpler: one request returns the associations themselves, with
 traits inline, instead of the v1 chain gene -> SNPs -> associations -> efoTraits (up to ~30
@@ -59,7 +59,7 @@ well documented and wasn't implicated by this bug.
 
 BUG FIX #2, 2026-09-14 (same day, next run): the fix above made this
 client's own success its next problem -- following one HTTP request per
-SNP (up to 20 per gene) made a real T2DM->AD run's Agent 3 step hit
+SNP (up to 20 per gene) made a real T2DM->AD run's Stage 3 step hit
 `429 Too Many Requests` from GWAS Catalog and crash the whole pipeline
 (uncaught `requests.HTTPError`, right after the fix above was pushed).
 Three changes address this:
@@ -128,7 +128,7 @@ Two changes:
      of that check (the top-level search, or any per-SNP follow-up) gave
      up after exhausting retries. Callers that care whether a `[]`/
      `confirmed=False` result might actually be "not fully checked" now
-     have a way to tell -- see agent3_confirmation.py's
+     have a way to tell -- see stage3_confirmation.py's
      `EndpointCrossDbCheck.possibly_incomplete` and main.py's readable
      report, which both surface this rather than silently reporting a
      rate-limit artifact as if it were a real negative finding. This
@@ -143,7 +143,7 @@ Two changes:
 (always `False`, since it never makes real requests) purely so code that
 reads it works the same against either client without an `isinstance`
 check or a `getattr` default at every call site outside
-agent3_confirmation.py (which still uses `getattr(..., False)` defensively
+stage3_confirmation.py (which still uses `getattr(..., False)` defensively
 for any third client that doesn't define the attribute at all).
 
 BUG FIX #4, 2026-09-14 (same day, after bug-fix #3's pacing widening):

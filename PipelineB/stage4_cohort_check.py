@@ -1,5 +1,5 @@
 """
-Agent 4 -- MIMIC-IV Cohort Check.
+Stage 4 -- Cohort Check (MIMIC-IV).
 
 Service: none directly -- orchestrates mimic_client.py (local file reads).
 Data: MimicClient.compute_cohort_sets() output (per-disease subject_id
@@ -100,7 +100,7 @@ def _two_by_two_stats(n_total: int, n1: int, n2: int, n_both: int) -> dict:
     return out
 
 
-def run_agent4_mimic(disease1: str, disease2: str, mimic_client: Optional[object] = None) -> MimicCohortResult:
+def run_stage4_cohort_check(disease1: str, disease2: str, mimic_client: Optional[object] = None) -> MimicCohortResult:
     # Input: two disease names, optional client (defaults to real MimicClient(), needs
     # MIMIC_DATA_DIR in .env; pass StubMimicClient in tests). Output: MimicCohortResult.
     prefixes1 = DISEASE_ICD_PREFIXES.get(disease1)
@@ -143,7 +143,7 @@ def run_agent4_mimic(disease1: str, disease2: str, mimic_client: Optional[object
 
 
 def _cli():
-    parser = argparse.ArgumentParser(description="Run Agent 4 (MIMIC-IV Cohort Check) for one disease pair.")
+    parser = argparse.ArgumentParser(description="Run Stage 4 (Cohort Check) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
@@ -157,7 +157,7 @@ def _cli():
     else:
         parser.error("Pass --pair, or both --disease1 and --disease2.")
 
-    result = run_agent4_mimic(disease1, disease2)
+    result = run_stage4_cohort_check(disease1, disease2)
     print(json.dumps(result.to_dict(), indent=2))
 
 

@@ -1,37 +1,37 @@
 """
-Agent 3 -- Independent Confirmation.
+Stage 3 -- Confirmation.
 
 Service: none directly -- orchestrates tissue_client.py (GTEx),
 crossdb_client.py (GWAS Catalog), and pubmed_client.py (PubMed, for the
-new edge-level literature check below), sources Agent 1 never looked at
-during discovery (PubMed aside -- Agent 1 already uses it gene-level;
+new edge-level literature check below), sources Stage 1 never looked at
+during discovery (PubMed aside -- Stage 1 already uses it gene-level;
 see pubmed_client.py's module docstring).
 Data: per chain, runs (1) a tissue-expression check, (2) a cross-database
 gene-disease association check, and (3, new) an edge-level literature
 check on bridge edges; see those modules for each service's own data
-shape. Output is a list of Agent3ConfirmationResult, one per chain.
-Used by: the top-level pipeline, after Agent 2.
+shape. Output is a list of Stage3ConfirmationResult, one per chain.
+Used by: the top-level pipeline, after Stage 2.
 
 Simplified 2026-09-14 to two sources total -- see
-claude/agent3_simplification.md. Dropped the Human Protein Atlas
+the Stage 3 simplification note. Dropped the Human Protein Atlas
 fallback (GTEx alone covers every tissue this project's three diseases
 need) and dropped DisGeNET (GWAS Catalog is real numerical study-level
 evidence -- p-values, study accessions -- while DisGeNET is itself a
-literature-aggregation source, and Agent 1's PubMed citations already
+literature-aggregation source, and Stage 1's PubMed citations already
 cover literature evidence). Both removed clients are still in git
 history if a real run later justifies adding either back.
 
 Which nodes get which check: a chain's first gene (disease1-associated
-per Agent 1) and last gene (disease2-associated) get both tissue and
-cross-db checks. Every gene in between is a BFS bridge Agent 1 never
+per Stage 1) and last gene (disease2-associated) get both tissue and
+cross-db checks. Every gene in between is a BFS bridge Stage 1 never
 claimed was disease-associated, so it only gets tissue-checked, against
-the union of both diseases' relevant tissues. Since Agent 2 can route a
+the union of both diseases' relevant tissues. Since Stage 2 can route a
 chain through a metabolite (metalinks_client.py), a middle hop may be
 metabolite-kind rather than gene-kind -- GTEx/GWAS Catalog are both
 gene-centric with no meaningful check for a metabolite name, so
 metabolite middle hops are excluded from tissue/cross-db checks
 entirely and instead just listed in `chain_metabolites` for visibility.
-Chain endpoints are always genes by construction (see agent2_chain.py's
+Chain endpoints are always genes by construction (see stage2_judging.py's
 module docstring), so endpoint handling is unaffected by this.
 
 Findings are reported per-check, not collapsed into one pass/fail
@@ -64,7 +64,7 @@ EdgeCitation docstring; `EdgeLiteratureCheck.supported` only counts a
 real co-mentioning passage (full text or abstract), never a bare
 title-only match.
 
-Independence of the evidence (revised 2026-10-18). Agent 1 selects each disease's genes by Open Targets' OVERALL
+Independence of the evidence (revised 2026-10-18). Stage 1 selects each disease's genes by Open Targets' OVERALL
 association score, and that score includes a `genetic_association` datatype built partly from GWAS data (checked
 live: 140 of the top 200 T2DM genes and 152 of the top 200 CAD genes have genetic_association >= 0.3). A GWAS
 Catalog hit on a chain ENDPOINT therefore largely repeats the evidence that selected the endpoint, and is reported
@@ -74,7 +74,7 @@ Two additions keep a real, non-circular verification:
      OmniPath search and never ranked by Open Targets, so a GWAS hit on a bridge gene is evidence the selection did
      not use.
   2. A random-gene baseline (`null_baseline`). Tissue-expression and GWAS hit rates are computed for a seeded random
-     sample of genes drawn from the pool of genes the BFS could have used as bridges (Agent 2's
+     sample of genes drawn from the pool of genes the BFS could have used as bridges (Stage 2's
      `bfs_stats["candidate_bridge_genes"]`) and compared with the chains' own bridge genes, so "16/18 expressed" or
      "1 of 3 bridge genes has a GWAS hit" is read against what a comparable random bridge gene would score. The pool
      shares the chains' topology bias (well-connected genes), which a uniformly random gene would not.
@@ -86,8 +86,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from common.config import DISEASE_RELEVANT_TISSUES, DISEASE_PAIRS, get_pair
-from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
-from PipelineB.agent2_chain import Agent2ChainResult, ChainCandidate, run_agent2_chain
+from PipelineB.stage1_discovery import Stage1DiscoveryResult, run_stage1_discovery
+from PipelineB.stage2_judging import Stage2JudgingResult, ChainCandidate, run_stage2_judging
 from PipelineB.crossdb_client import GwasAssociation, GWASCatalogClient
 from PipelineB.metalinks_client import MetalinksClient
 from PipelineB.pubmed_client import EdgeCitation, PubMedClient
@@ -107,7 +107,7 @@ class EndpointCrossDbCheck:
     # distinction was discovered to matter. Always False for StubGWASCatalogClient (see there).
     possibly_incomplete: bool = False
 
-    # False for a chain endpoint: Agent 1 picked it by an Open Targets score that already includes GWAS-derived
+    # False for a chain endpoint: Stage 1 picked it by an Open Targets score that already includes GWAS-derived
     # genetic evidence, so a hit is "consistent with the selection evidence", not independent confirmation.
     # True for a bridge gene (never ranked by Open Targets).
     independent_of_selection: bool = True
@@ -132,7 +132,7 @@ class EdgeLiteratureCheck:
     """One bridge edge's literature-support check -- see module docstring's "Edge-level
     literature validation" note. Only ever built for an edge whose both ends are bridge/middle
     genes; a chain with no such edge (1- or 2-hop chains) simply has an empty
-    `edge_literature_checks` list on its Agent3ConfirmationResult."""
+    `edge_literature_checks` list on its Stage3ConfirmationResult."""
 
     gene_a: str
     gene_b: str
@@ -167,7 +167,7 @@ class EdgeLiteratureCheck:
 
 
 @dataclass
-class Agent3ConfirmationResult:
+class Stage3ConfirmationResult:
     tissue_checks: List[TissueExpressionResult]
     endpoint_checks: List[EndpointCrossDbCheck]  # exactly 2: [disease1-endpoint, disease2-endpoint]
     chain_metabolites: List[str]  # metabolite-kind middle hops in this chain; never tissue/cross-db checked
@@ -201,7 +201,7 @@ def _chain_gene_roles(chain: ChainCandidate) -> Dict[str, List[str]]:
     # Input: a chain. Output: {"disease1_endpoint": gene, "disease2_endpoint": gene,
     # "middle": [gene,...], "middle_metabolites": [name,...]}.
     # Chain endpoints are always gene-kind by construction (BFS starts and stops at genes --
-    # see agent2_chain.py's module docstring); only middle hops can be metabolite-kind, which
+    # see stage2_judging.py's module docstring); only middle hops can be metabolite-kind, which
     # are split out separately since gene-centric checks don't apply to them. A single-edge
     # chain has no middle nodes at all -- its one gene pair are both endpoints.
     edges = chain.edges
@@ -273,8 +273,8 @@ def _confirm_chain(
     gtex_client,
     gwas_client,
     pubmed_client,
-) -> Agent3ConfirmationResult:
-    # Input: one chain + both disease names + clients. Output: its Agent3ConfirmationResult
+) -> Stage3ConfirmationResult:
+    # Input: one chain + both disease names + clients. Output: its Stage3ConfirmationResult
     # (tissue checks for every gene, cross-db checks for the two endpoint genes only, edge
     # literature checks for bridge edges only; metabolite middle hops are skipped for all three
     # and listed in chain_metabolites instead).
@@ -302,7 +302,7 @@ def _confirm_chain(
 
     edge_literature_checks = _edge_literature_checks(chain, roles, pubmed_client)
 
-    return Agent3ConfirmationResult(
+    return Stage3ConfirmationResult(
         tissue_checks=tissue_checks,
         endpoint_checks=endpoint_checks,
         chain_metabolites=roles["middle_metabolites"],
@@ -371,7 +371,7 @@ def compute_null_baseline(
     }
 
 
-def _chain_bridge_summary(results: List[Agent3ConfirmationResult], disease1: str, disease2: str) -> dict:
+def _chain_bridge_summary(results: List[Stage3ConfirmationResult], disease1: str, disease2: str) -> dict:
     # Input: all chains' results. Output: the same rates for the chains' own DISTINCT bridge genes, so they can be read
     # side by side with the baseline (a gene shared by several chains counts once).
     bridge_genes = sorted({c.gene_symbol for r in results for c in r.bridge_gwas_checks})
@@ -403,18 +403,18 @@ def _chain_bridge_summary(results: List[Agent3ConfirmationResult], disease1: str
     }
 
 
-def run_agent3_confirmation(
-    agent1_result: Agent1DiscoveryResult,
-    agent2_result: Agent2ChainResult,
+def run_stage3_confirmation(
+    stage1_result: Stage1DiscoveryResult,
+    stage2_result: Stage2JudgingResult,
     gtex_client: Optional[object] = None,
     gwas_client: Optional[object] = None,
     pubmed_client: Optional[object] = None,
     null_baseline_size: int = DEFAULT_NULL_SIZE,
-) -> List[Agent3ConfirmationResult]:
-    # Input: Agent 1 + Agent 2 results, optional clients (all default to real clients;
+) -> List[Stage3ConfirmationResult]:
+    # Input: Stage 1 + Stage 2 results, optional clients (all default to real clients;
     # pass Stub* clients in tests), and null_baseline_size (random genes for the baseline; 0 = skip it).
-    # Output: one Agent3ConfirmationResult per chain, same order. [] if Agent 2 found no chain.
-    if not agent2_result.chains:
+    # Output: one Stage3ConfirmationResult per chain, same order. [] if Stage 2 found no chain.
+    if not stage2_result.chains:
         return []
 
     gtex_client = gtex_client or GTExClient()
@@ -422,13 +422,13 @@ def run_agent3_confirmation(
     pubmed_client = pubmed_client or PubMedClient()
 
     results = [
-        _confirm_chain(chain, agent1_result.disease1, agent1_result.disease2, gtex_client, gwas_client, pubmed_client)
-        for chain in agent2_result.chains
+        _confirm_chain(chain, stage1_result.disease1, stage1_result.disease2, gtex_client, gwas_client, pubmed_client)
+        for chain in stage2_result.chains
     ]
 
-    pool = (getattr(agent2_result, "bfs_stats", None) or {}).get("candidate_bridge_genes") or []
+    pool = (getattr(stage2_result, "bfs_stats", None) or {}).get("candidate_bridge_genes") or []
     if null_baseline_size and pool:
-        disease1, disease2 = agent1_result.disease1, agent1_result.disease2
+        disease1, disease2 = stage1_result.disease1, stage1_result.disease2
         chain_genes = sorted({t.gene_symbol for r in results for t in r.tissue_checks})
         baseline = compute_null_baseline(pool, chain_genes, disease1, disease2, gtex_client, gwas_client, size=null_baseline_size)
         baseline["chains"] = _chain_bridge_summary(results, disease1, disease2)
@@ -438,20 +438,20 @@ def run_agent3_confirmation(
 
 
 def _cli():
-    parser = argparse.ArgumentParser(description="Run Agents 1-3 for one disease pair.")
+    parser = argparse.ArgumentParser(description="Run Stages 1-3 for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
-    parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Agent 1")
-    parser.add_argument("--max-hops", type=int, default=None, help="Max PPI/metabolite hops, passed to Agent 2 (defaults to agent2_chain's own default)")
+    parser.add_argument("--min-score", type=float, default=0.1, help="Minimum Open Targets association score, passed to Stage 1")
+    parser.add_argument("--max-hops", type=int, default=None, help="Max PPI/metabolite hops, passed to Stage 2 (defaults to stage2_judging's own default)")
     parser.add_argument(
-        "--with-metabolites", action="store_true", help="Opt in to MetalinksDB gene<->metabolite hops in Agent 2 (default: protein-only)"
+        "--with-metabolites", action="store_true", help="Opt in to MetalinksDB gene<->metabolite hops in Stage 2 (default: protein-only)"
     )
     parser.add_argument("--no-metabolites", action="store_true", help="Deprecated no-op: protein-only is now the default")
     parser.add_argument(
         "--no-edge-literature",
         action="store_true",
-        help="Skip Agent 3's edge-level literature check on bridge edges (saves PubMed/PMC queries; see module docstring)",
+        help="Skip Stage 3's edge-level literature check on bridge edges (saves PubMed/PMC queries; see module docstring)",
     )
     parser.add_argument("--null-size", type=int, default=DEFAULT_NULL_SIZE, help="Random genes in the baseline (0 = skip it)")
     args = parser.parse_args()
@@ -464,21 +464,21 @@ def _cli():
     else:
         parser.error("Pass --pair, or both --disease1 and --disease2.")
 
-    print(f"Running Agent 1 (Discovery) for {disease1} / {disease2}...", flush=True)
-    agent1_result = run_agent1_discovery(disease1, disease2, min_score=args.min_score)
+    print(f"Running Stage 1 (Discovery) for {disease1} / {disease2}...", flush=True)
+    stage1_result = run_stage1_discovery(disease1, disease2, min_score=args.min_score)
 
-    print("Running Agent 2 (Chain Construction)...", flush=True)
-    agent2_kwargs = {"max_hops": args.max_hops} if args.max_hops else {}
+    print("Running Stage 2 (LLM-based Judging)...", flush=True)
+    stage2_kwargs = {"max_hops": args.max_hops} if args.max_hops else {}
     metalinks_client = MetalinksClient() if args.with_metabolites else None
-    agent2_result = run_agent2_chain(agent1_result, metalinks_client=metalinks_client, **agent2_kwargs)
+    stage2_result = run_stage2_judging(stage1_result, metalinks_client=metalinks_client, **stage2_kwargs)
 
-    print("Running Agent 3 (Independent Confirmation)...", flush=True)
+    print("Running Stage 3 (Confirmation)...", flush=True)
     if args.no_edge_literature:
         pubmed_client = _NoOpPubMedClient()
     else:
         pubmed_client = PubMedClient()
-    agent3_results = run_agent3_confirmation(
-        agent1_result, agent2_result, pubmed_client=pubmed_client, null_baseline_size=args.null_size
+    stage3_results = run_stage3_confirmation(
+        stage1_result, stage2_result, pubmed_client=pubmed_client, null_baseline_size=args.null_size
     )
 
     print(
@@ -488,7 +488,7 @@ def _cli():
                 "disease2": disease2,
                 "chains": [
                     {**chain.to_dict(), "confirmation": confirmation.to_dict()}
-                    for chain, confirmation in zip(agent2_result.chains, agent3_results)
+                    for chain, confirmation in zip(stage2_result.chains, stage3_results)
                 ],
             },
             indent=2,

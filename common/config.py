@@ -2,7 +2,7 @@
 Disease pairs and reference mappings shared by both pipelines.
 
 Data: hardcoded config, no external service.
-Used by: every agent/pipeline in common/, PipelineA/, PipelineB/.
+Used by: every stage and pipeline in common/, PipelineA/, PipelineB/.
 """
 from dotenv import load_dotenv
 
@@ -30,14 +30,14 @@ def get_pair(pair_id: str) -> dict:
     raise KeyError(f"Unknown disease pair id: {pair_id!r}. Known ids: {[p['id'] for p in DISEASE_PAIRS]}")
 
 
-# Agent 3: disease -> GTEx tissueSiteDetailId list (hand-picked, not exhaustive -- see PipelineB/README.md).
+# Stage 3: disease -> GTEx tissueSiteDetailId list (hand-picked, not exhaustive -- see PipelineB/README.md).
 DISEASE_RELEVANT_TISSUES = {
     "Type 2 Diabetes Mellitus": ["Pancreas", "Liver", "Muscle_Skeletal", "Adipose_Subcutaneous"],
     "Alzheimer's Disease": ["Brain_Cortex", "Brain_Hippocampus"],
     "Coronary Artery Disease": ["Heart_Left_Ventricle", "Artery_Coronary"],
 }
 
-# Agent 4: disease -> ICD code prefixes matched against MIMIC-IV's diagnoses_icd.icd_code, split by
+# Stage 4: disease -> ICD code prefixes matched against MIMIC-IV's diagnoses_icd.icd_code, split by
 # icd_version ("9" / "10") since MIMIC-IV spans the US's October 2015 ICD-9-to-ICD-10 transition and
 # genuinely mixes both coding systems in the same table.
 #
@@ -48,10 +48,10 @@ DISEASE_RELEVANT_TISSUES = {
 #   AD:   ICD-9=1703   ICD-10=1639   overlap=108    UNION=3234   (ICD-10-only missed 1595, 49.3%)
 #   CAD:  ICD-9=24694  ICD-10=27097  overlap=5729   UNION=46062  (ICD-10-only missed 18965, 41.2%)
 # The relative-risk numbers computed from the ICD-10-only cohorts (2.30 for T2DM->AD, 3.447 for
-# T2DM->CAD, see claude/agent4_mimic_real_run.md) were consequently inflated by sampling bias --
+# T2DM->CAD, see the Stage 4 real-run write-up) were consequently inflated by sampling bias --
 # ICD-10-only means counting only a biased, more-recently-admitted subset of patients. Corrected
 # (ICD-9+10 union) relative risks: T2DM->AD ~1.32, T2DM->CAD ~2.05. See
-# claude/agent4_mimic_real_run.md for the full writeup.
+# the Stage 4 real-run write-up for the full writeup.
 #
 # ICD-9 prefixes below were derived from MIMIC-IV's own d_icd_diagnoses.csv.gz lookup table, not
 # guessed from the ICD-10 mapping:

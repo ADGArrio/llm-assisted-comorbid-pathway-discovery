@@ -1,20 +1,20 @@
 """
-Agent 1 -- Discovery.
+Stage 1 -- Discovery.
 
 Service: none directly -- orchestrates OpenTargetsClient and PubMedClient
 via LangGraph. discover_disease1/discover_disease2 (Open Targets lookups)
 fan out from START and run concurrently; cite_genes (PubMed lookups) joins
 after both finish, since it needs their gene lists.
 Data: see opentargets_client.py / pubmed_client.py for each service's
-own data shape. This module's output is Agent1DiscoveryResult: two gene
+own data shape. This module's output is Stage1DiscoveryResult: two gene
 lists (one per disease), a gene->citations dict (every Citation tagged with
 the gene/disease search that found it), and citation_searches (one record per
 PubMed search actually run, including searches that returned nothing).
 A gene ranked in BOTH diseases' top-N is searched once per disease.
-Used by: PipelineB.agent2_chain (candidate gene pools + citations).
+Used by: PipelineB.stage2_judging (candidate gene pools + citations).
 
 Usage:
-    python -m PipelineB.agent1_discovery --pair t2dm_ad
+    python -m PipelineB.stage1_discovery --pair t2dm_ad
 """
 import argparse
 import json
@@ -33,7 +33,7 @@ DEFAULT_MAX_GENES_TO_CITE = 10
 DEFAULT_CITATIONS_PER_GENE = 2
 
 
-class Agent1State(TypedDict, total=False):
+class Stage1State(TypedDict, total=False):
     disease1: str
     disease2: str
     disease1_efo_id: str
@@ -45,7 +45,7 @@ class Agent1State(TypedDict, total=False):
 
 
 @dataclass
-class Agent1DiscoveryResult:
+class Stage1DiscoveryResult:
     disease1: str
     disease2: str
     disease1_efo_id: str
@@ -76,9 +76,9 @@ class Agent1DiscoveryResult:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Agent1DiscoveryResult":
-        # Inverse of to_dict(): rebuild a result from a saved pipeline_b_<pair>.json's "agent1" block, so Agents
-        # 2-4 can be re-run on exactly the genes and citations of an earlier Agent 1 run (added 2026-10-18).
+    def from_dict(cls, d: dict) -> "Stage1DiscoveryResult":
+        # Inverse of to_dict(): rebuild a result from a saved pipeline_b_<pair>.json's "stage1" block, so Stages
+        # 2-4 can be re-run on exactly the genes and citations of an earlier Stage 1 run (added 2026-10-18).
         fields = set(Citation.__dataclass_fields__)
         return cls(
             disease1=d["disease1"],
@@ -102,21 +102,21 @@ def _build_graph(
     citations_per_gene: int,
 ):
     # Input: clients + tuning params. Output: a compiled LangGraph graph (see module docstring for shape).
-    def discover_disease1(state: Agent1State) -> dict:
+    def discover_disease1(state: Stage1State) -> dict:
         efo_id = ot_client.search_disease(state["disease1"]) # returns Experimental Factor Ontology (EFO) ID
         # Open Targets’ search actually returns up to 5 hits, each with an ID, a name, and a relevance score. 
         # The function throws away everything except the first hit’s ID, on the assumption that the top hit is the right disease. 
         # It does not check the name. It raises an error if no disease is found.
         targets = ot_client.get_associated_targets(efo_id, min_score=min_score) # returns list of GeneAssociation objects
         # returns a list of GeneAssociation objects, each containing the gene symbol, Ensembl ID, uniprot ID, and disease association score (range: 0.0 - 1.0, where 1.0 is the highest association).
-        return {"disease1_efo_id": efo_id, "disease1_targets": targets} # Agent2 matches proteins by uniprot id.
+        return {"disease1_efo_id": efo_id, "disease1_targets": targets} # Stage 2 matches proteins by uniprot id.
 
-    def discover_disease2(state: Agent1State) -> dict:
+    def discover_disease2(state: Stage1State) -> dict:
         efo_id = ot_client.search_disease(state["disease2"])
         targets = ot_client.get_associated_targets(efo_id, min_score=min_score)
         return {"disease2_efo_id": efo_id, "disease2_targets": targets}
 
-    def cite_genes(state: Agent1State) -> dict: # Score Used: disease association score
+    def cite_genes(state: Stage1State) -> dict: # Score Used: disease association score
         citations: Dict[str, List[Citation]] = {}
         searches: List[dict] = []
         # Select the top genes based on their disease association score.
@@ -152,7 +152,7 @@ def _build_graph(
                 )
         return {"citations": citations, "citation_searches": searches}
 
-    graph = StateGraph(Agent1State)
+    graph = StateGraph(Stage1State)
     graph.add_node("discover_disease1", discover_disease1)
     graph.add_node("discover_disease2", discover_disease2)
     graph.add_node("cite_genes", cite_genes)
@@ -166,7 +166,7 @@ def _build_graph(
     return graph.compile()
 
 
-def run_agent1_discovery(
+def run_stage1_discovery(
     disease1: str,
     disease2: str,
     ot_client: Optional[object] = None,
@@ -174,16 +174,16 @@ def run_agent1_discovery(
     min_score: float = DEFAULT_MIN_SCORE,
     max_genes_to_cite: int = DEFAULT_MAX_GENES_TO_CITE,
     citations_per_gene: int = DEFAULT_CITATIONS_PER_GENE,
-) -> Agent1DiscoveryResult:
+) -> Stage1DiscoveryResult:
     # Input: two disease names, optional clients (default to real OpenTargetsClient/PubMedClient;
-    # pass Stub* clients in tests), tuning params. Output: Agent1DiscoveryResult.
+    # pass Stub* clients in tests), tuning params. Output: Stage1DiscoveryResult.
     ot_client = ot_client or OpenTargetsClient()
     pubmed_client = pubmed_client or PubMedClient()
 
     compiled = _build_graph(ot_client, pubmed_client, min_score, max_genes_to_cite, citations_per_gene)
     final_state = compiled.invoke({"disease1": disease1, "disease2": disease2})
 
-    return Agent1DiscoveryResult(
+    return Stage1DiscoveryResult(
         disease1=disease1,
         disease2=disease2,
         disease1_efo_id=final_state["disease1_efo_id"],
@@ -211,7 +211,7 @@ def _data_versions(ot_client, pubmed_client) -> dict:
 
 
 def _cli():
-    parser = argparse.ArgumentParser(description="Run Agent 1 (Discovery) for one disease pair.")
+    parser = argparse.ArgumentParser(description="Run Stage 1 (Discovery) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
     parser.add_argument("--disease1", help="Override: disease 1 name")
     parser.add_argument("--disease2", help="Override: disease 2 name")
@@ -226,7 +226,7 @@ def _cli():
     else:
         parser.error("Pass --pair, or both --disease1 and --disease2.")
 
-    result = run_agent1_discovery(disease1, disease2, min_score=args.min_score)
+    result = run_stage1_discovery(disease1, disease2, min_score=args.min_score)
     print(json.dumps(result.to_dict(), indent=2))
 
 

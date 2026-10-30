@@ -1,12 +1,12 @@
 """
-Agent 1, sub-agent 2 -- PubMed E-utilities client.
+Stage 1 -- PubMed E-utilities client.
 
 Service: NCBI E-utilities (https://eutils.ncbi.nlm.nih.gov/entrez/eutils),
 esearch (gene+disease terms -> PMIDs) then esummary (PMIDs -> titles).
 Docs: https://www.ncbi.nlm.nih.gov/books/NBK25500/. No key required;
 set PUBMED_API_KEY/PUBMED_EMAIL in .env to raise the <=3 req/sec limit.
 Data: JSON. esearchresult.idlist -> list of PMIDs; result.<pmid>.title.
-Used by: PipelineB.agent1_discovery, for citation support on genes
+Used by: PipelineB.stage1_discovery, for citation support on genes
 Open Targets already surfaced (not a second discovery source).
 
 Verified live 2026-09-28 against the real E-utilities and BioC-PMC
@@ -21,7 +21,7 @@ feedback -- see claude/committee_feedback_round2_coscientist.md section
 3a): `search_citations` above only ever asked "is this gene associated
 with this disease" (a gene-level check). It never asked "is there
 literature support for this SPECIFIC gene-A-to-gene-B interaction" --
-the question needed to justify one edge in an Agent 2 chain (e.g.
+the question needed to justify one edge in a Stage 2 chain (e.g.
 `PTPN1 --inhibits--> CAPN1`). `search_edge_citations` below is the new,
 edge-level equivalent: it searches PubMed for both gene symbols
 co-occurring in the same paper, same as before, but then goes one step
@@ -52,7 +52,7 @@ was available and searched, no co-mention found" is a much stronger
 negative than "only the abstract was available." Collapsing the two
 would overstate how thoroughly a null result was checked.
 
-Scope decision (confirmed 2026-09-27, see agent3_confirmation.py's
+Scope decision (confirmed 2026-09-27, see stage3_confirmation.py's
 `_edge_literature_checks`): this is only ever called for a chain's
 "bridge edges" -- edges whose both ends are bridge/middle genes, not
 the chain's overall disease-anchored endpoints. The two endpoint genes
@@ -87,7 +87,7 @@ _RATE_LIMIT_INITIAL_BACKOFF_SECONDS = 2.0
 
 def citation_query_term(gene_symbol: str, disease_name: str) -> str:
     # Input: gene symbol + disease name. Output: the exact PubMed query string search_citations
-    # sends for that pair. A module-level function (not buried inside search_citations) so Agent 1
+    # sends for that pair. A module-level function (not buried inside search_citations) so Stage 1
     # can record the same string for a search that returned zero hits, where there is no Citation
     # object to carry it.
     return f"{gene_symbol}[Title/Abstract] AND {disease_name}[Title/Abstract]"
@@ -95,10 +95,10 @@ def citation_query_term(gene_symbol: str, disease_name: str) -> str:
 
 @dataclass
 class Citation:
-    """One PubMed paper found by a gene-level search (Agent 1's `search_citations`).
+    """One PubMed paper found by a gene-level search (Stage 1's `search_citations`).
 
     Provenance fields (added 2026-10-15) record WHICH search produced this citation, so a gene
-    that was searched against both diseases (see agent1_discovery.cite_genes) never has an
+    that was searched against both diseases (see stage1_discovery.cite_genes) never has an
     ambiguous record. Bibliographic fields come from the same esummary response the title was
     already read from -- no extra API call. Every field after `title` is optional so a citation
     built by hand or loaded from an older saved run (pmid + title only) still works."""

@@ -1,7 +1,7 @@
 """
-Agent 4, MIMIC-IV client.
+Stage 4, MIMIC-IV client.
 
-Per project_architecture.md, Agent 4 validates the disease *pair* (do
+Per project_architecture.md, Stage 4 validates the disease *pair* (do
 these two diagnoses actually co-occur more than chance in real patients),
 not any individual chain or gene -- MIMIC-IV's diagnosis codes can't
 confirm a specific protein-protein edge. Only two tables are needed:
@@ -22,7 +22,7 @@ download: the full PhysioNet zip includes many modules (ICU chartevents,
 labs, notes, waveform data, ...) this project doesn't touch, and a full
 recursive `wget` mirror is known to be extremely slow for reasons
 unrelated to bandwidth -- see the module docstring reasoning in
-agent4_mimic.py for the practical download recommendation. This client
+stage4_cohort_check.py for the practical download recommendation. This client
 never asks for anything beyond the `hosp/` module's two diagnosis tables.
 
 Reads `diagnoses_icd.csv.gz` in chunks (500k rows at a time) rather than
@@ -36,7 +36,7 @@ earlier version of `compute_cohort_sets` only ever matched icd_version
 == "10", which silently dropped every ICD-9-coded patient -- confirmed
 against the real MIMIC-IV data as a ~40-49% undercount per disease (see
 common/config.py's DISEASE_ICD_PREFIXES comment and
-claude/agent4_mimic_real_run.md). `compute_cohort_sets` now takes a
+the Stage 4 real-run write-up). `compute_cohort_sets` now takes a
 version-aware prefix mapping (`{"9": [...], "10": [...]}` per disease)
 and matches each version's rows against only that version's prefixes.
 """

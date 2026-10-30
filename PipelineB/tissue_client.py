@@ -1,18 +1,18 @@
 """
-Agent 3, tissue-expression check -- GTEx.
+Stage 3, tissue-expression check -- GTEx.
 
 Service: GTEx Portal API v2 (https://gtexportal.org/api/v2/expression/medianGeneExpression),
 no key needed.
 Data: GTEx response is {"data": [...]}, each record's median value tried
 under a few plausible field names (median/value/data) since the exact
 schema wasn't confirmed live from this sandbox.
-Used by: PipelineB.agent3_confirmation, checking whether a chain's genes
+Used by: PipelineB.stage3_confirmation, checking whether a chain's genes
 are expressed in tissues relevant to the disease they sit near
-(common/config.py's DISEASE_RELEVANT_TISSUES) -- evidence Agent 1 never
+(common/config.py's DISEASE_RELEVANT_TISSUES) -- evidence Stage 1 never
 looked at.
 
 Simplified 2026-09-14 to GTEx only -- the Human Protein Atlas fallback
-was dropped (see claude/agent3_simplification.md): GTEx alone already
+was dropped (see the Stage 3 simplification note): GTEx alone already
 covers every tissue this project's three diseases need
 (DISEASE_RELEVANT_TISSUES in common/config.py). The removed HPAClient/
 StubHPAClient code is still in git history if a real run later shows a
@@ -83,10 +83,10 @@ below specifically so that response body is captured automatically the
 next time this fails, instead of needing a separate diagnostic run. Both
 callers also now catch that error and degrade to "no data this run"
 (printing the full message, body included) rather than letting it
-propagate -- consistent with agent3_confirmation.py's existing
-philosophy that Agent 3 findings are reported per-check, never a hard
+propagate -- consistent with stage3_confirmation.py's existing
+philosophy that Stage 3 findings are reported per-check, never a hard
 pipeline failure; a broken request for one gene's tissue check
-shouldn't take down Agents 1/2/4's results along with it.
+shouldn't take down Stages 1/2/4's results along with it.
 
 RATE-LIMIT HARDENING, 2026-09-14 (same day): the equivalent fix in this
 module's sibling, crossdb_client.py (GWAS Catalog), made that client's
@@ -248,7 +248,7 @@ class GTExClient:
         self.genome_build = genome_build or os.environ.get("GTEX_GENOME_BUILD", GTEX_DEFAULT_GENOME_BUILD)
         self.timeout = timeout
         # gene symbol -> resolved gencodeId (or None if unresolvable), cached per client instance
-        # since the same gene is looked up once per relevant tissue (see agent3_confirmation.py).
+        # since the same gene is looked up once per relevant tissue (see stage3_confirmation.py).
         self._gencode_id_cache: Dict[str, Optional[str]] = {}
 
     def _get(self, url: str, params: dict):
@@ -302,8 +302,8 @@ class GTExClient:
             _raise_for_status_with_body(resp)
         except requests.HTTPError as e:
             # Never let a broken request (wrong param name, a real GTEx-side error, etc.) crash
-            # the whole pipeline over one gene's tissue check -- see agent3_confirmation.py's
-            # module docstring: Agent 3 findings are reported per-check, never a hard failure.
+            # the whole pipeline over one gene's tissue check -- see stage3_confirmation.py's
+            # module docstring: Stage 3 findings are reported per-check, never a hard failure.
             # The full error (now including the response body, see _raise_for_status_with_body)
             # is printed so this is diagnosable from a normal run's console output alone.
             print(f"GTEx: request failed resolving {gene_symbol!r} -- treating as unresolved this run. {e}", flush=True)

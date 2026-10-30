@@ -1,6 +1,6 @@
 import pytest
 
-from PipelineB.agent4_mimic import run_agent4_mimic
+from PipelineB.stage4_cohort_check import run_stage4_cohort_check
 from PipelineB.mimic_client import StubMimicClient
 
 DISEASE1 = "Type 2 Diabetes Mellitus"
@@ -17,7 +17,7 @@ def test_relative_risk_computed_correctly_from_stub_cohort_sets():
     disease2_ids = {str(i) for i in range(30, 50)}  # overlaps disease1_ids in [30,40) -> 10 shared
     stub = StubMimicClient({"__all__": all_ids, DISEASE1: disease1_ids, DISEASE2: disease2_ids})
 
-    result = run_agent4_mimic(DISEASE1, DISEASE2, mimic_client=stub)
+    result = run_stage4_cohort_check(DISEASE1, DISEASE2, mimic_client=stub)
 
     assert result.n_total_patients == 100
     assert result.n_disease1_patients == 40
@@ -33,7 +33,7 @@ def test_zero_disease2_base_rate_returns_none_relative_risk_not_a_crash():
     all_ids = {"1", "2", "3"}
     stub = StubMimicClient({"__all__": all_ids, DISEASE1: {"1"}, DISEASE2: set()})
 
-    result = run_agent4_mimic(DISEASE1, DISEASE2, mimic_client=stub)
+    result = run_stage4_cohort_check(DISEASE1, DISEASE2, mimic_client=stub)
 
     assert result.disease2_base_rate == 0.0
     assert result.relative_risk is None
@@ -45,20 +45,20 @@ def test_zero_disease2_base_rate_returns_none_relative_risk_not_a_crash():
 def test_missing_icd_mapping_raises_value_error():
     stub = StubMimicClient({"__all__": set()})
     with pytest.raises(ValueError, match="No ICD prefix mapping"):
-        run_agent4_mimic("Some Unmapped Disease", DISEASE2, mimic_client=stub)
+        run_stage4_cohort_check("Some Unmapped Disease", DISEASE2, mimic_client=stub)
 
 
 def test_to_dict_is_json_serializable():
     import json
 
     stub = StubMimicClient({"__all__": {"1"}, DISEASE1: {"1"}, DISEASE2: {"1"}})
-    result = run_agent4_mimic(DISEASE1, DISEASE2, mimic_client=stub)
+    result = run_stage4_cohort_check(DISEASE1, DISEASE2, mimic_client=stub)
     json.dumps(result.to_dict())
 
 
 def test_real_mimic_counts_reproduce_the_hand_computed_statistics():
     # Counts from the 2026-10-18 real run (T2DM -> AD); values cross-checked against scipy's chi2_contingency.
-    from PipelineB.agent4_mimic import _two_by_two_stats
+    from PipelineB.stage4_cohort_check import _two_by_two_stats
 
     s = _two_by_two_stats(n_total=223291, n1=44005, n2=3234, n_both=841)
     assert s["relative_risk"] == pytest.approx(1.4317, abs=1e-3)
@@ -73,7 +73,7 @@ def test_real_mimic_counts_reproduce_the_hand_computed_statistics():
 
 
 def test_null_association_gives_rr_one_and_p_one():
-    from PipelineB.agent4_mimic import _two_by_two_stats
+    from PipelineB.stage4_cohort_check import _two_by_two_stats
 
     s = _two_by_two_stats(n_total=100, n1=50, n2=20, n_both=10)  # 20% in both groups
     assert s["relative_risk"] == pytest.approx(1.0)
@@ -82,7 +82,7 @@ def test_null_association_gives_rr_one_and_p_one():
 
 
 def test_inconsistent_counts_yield_no_statistics():
-    from PipelineB.agent4_mimic import _two_by_two_stats
+    from PipelineB.stage4_cohort_check import _two_by_two_stats
 
     s = _two_by_two_stats(n_total=10, n1=8, n2=8, n_both=1)  # 'neither' cell would be negative
     assert all(v is None for v in s.values())

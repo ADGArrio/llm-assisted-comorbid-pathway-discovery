@@ -1,10 +1,10 @@
 """
 Why max_hops = 5?  Measures what each extra hop buys and costs, against a degree-matched random baseline.
 (Added 2026-10-15.  The previous justification -- "5 sits inside the 4-6 hop small-world diameter" in
-claude/agent2_bfs_and_prompt_recalibration.md -- was an argument, not a measurement.)
+the Stage 2 BFS and prompt recalibration note -- was an argument, not a measurement.)
 
-It runs Agent 2's OWN breadth-first search (`PipelineB.agent2_chain._bfs_shortest_paths`, no LLM) on the
-saved Agent 1 gene lists, to depth `--max-depth` (default 10), over a local copy of the OmniPath network
+It runs Stage 2's OWN breadth-first search (`PipelineB.stage2_judging._bfs_shortest_paths`, no LLM) on the
+saved Stage 1 gene lists, to depth `--max-depth` (default 10), over a local copy of the OmniPath network
 (one download, ~13 s) so the search -- and a random baseline -- can be repeated quickly and identically.
 Because the search is layered, "max_hops = h" is exactly "the paths found at depth <= h".
 
@@ -25,7 +25,7 @@ Writes outputs/max_hops_analysis/<pair>.json, outputs/max_hops_analysis/summary.
 docs/figures/fig_maxhops_*.png (copied to ../Thesis/figures/).
 
 Scope notes: protein-only (no MetalinksDB metabolites) and the core OmniPath dataset, as the table in
-claude/codebase_walkthrough_agent2.md; today's OmniPath release (recorded in the output).
+the Stage 2 code walkthrough; today's OmniPath release (recorded in the output).
 """
 import argparse
 import bisect
@@ -43,12 +43,12 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MAX_DEPTH = 10
 DEFAULT_REPLICATES = 100
 DEFAULT_PAIRS = ["t2dm_ad", "t2dm_cad"]
-FRONTIER_CAP = 3000  # mirrors PipelineB.agent2_chain._MAX_FRONTIER_SIZE (re-read at run time, see run_pair)
+FRONTIER_CAP = 3000  # mirrors PipelineB.stage2_judging._MAX_FRONTIER_SIZE (re-read at run time, see run_pair)
 
 
 class InMemoryOmniPath:
     """Serves get_outgoing_interactions from a list already in memory -- same interface as OmniPathClient,
-    so Agent 2's real BFS can run on it unchanged, thousands of times, without HTTP."""
+    so Stage 2's real BFS can run on it unchanged, thousands of times, without HTTP."""
 
     def __init__(self, interactions, datasets="omnipath"):
         self.datasets = datasets
@@ -74,8 +74,8 @@ def load_full_network(datasets: str = "omnipath"):
 
 
 def run_bfs(client, start_genes: Sequence[str], goal_genes: set, max_depth: int):
-    # Agent 2's real search, trim disabled, returning (paths, stats).
-    from PipelineB import agent2_chain as a2
+    # Stage 2's real search, trim disabled, returning (paths, stats).
+    from PipelineB import stage2_judging as a2
 
     stats: dict = {}
     paths = a2._bfs_shortest_paths(client, None, list(start_genes), set(goal_genes), max_depth, 10 ** 9, stats=stats)
@@ -88,7 +88,7 @@ def _has_unknown(path) -> bool:
 
 def per_depth_table(paths, stats: dict, max_depth: int, max_paths: int = 10) -> dict:
     # Input: all BFS paths (untrimmed), the BFS stats, depth. Output: lists indexed by hop count 1..max_depth.
-    from PipelineB import agent2_chain as a2
+    from PipelineB import stage2_judging as a2
 
     by_len = defaultdict(list)
     for p in paths:
@@ -100,7 +100,7 @@ def per_depth_table(paths, stats: dict, max_depth: int, max_paths: int = 10) -> 
         new = by_len.get(h, [])
         cumulative += len(new)
         signed = sum(1 for p in new if not _has_unknown(p))
-        # What the pipeline would hand to the LLM if max_hops were h: the shipped trim rule (Agent 2's own
+        # What the pipeline would hand to the LLM if max_hops were h: the shipped trim rule (Stage 2's own
         # _trim_candidates: longest first, fully-signed first among equal lengths, at most DEFAULT_MAX_PER_START_GENE
         # per start gene) applied to the paths of length <= h. `legacy` = the pre-2026-10-18 rule (longest first only),
         # kept for comparison of how many distinct start genes survive.
@@ -193,9 +193,9 @@ def empirical_p(observed: int, null_values: Sequence[int]) -> float:
 
 
 def run_pair(pair_id: str, interactions, replicates: int, max_depth: int, seed: int = 0) -> dict:
-    from PipelineB import agent2_chain as a2
+    from PipelineB import stage2_judging as a2
 
-    saved = json.load(open(os.path.join(HERE, "outputs", f"pipeline_b_{pair_id}.json")))["agent1"]
+    saved = json.load(open(os.path.join(HERE, "outputs", f"pipeline_b_{pair_id}.json")))["stage1"]
     starts = [t["gene_symbol"] for t in sorted(saved["disease1_targets"], key=lambda t: -t["disease_assoc_score"])]
     goals = {t["gene_symbol"] for t in saved["disease2_targets"]}
     client = InMemoryOmniPath(interactions)

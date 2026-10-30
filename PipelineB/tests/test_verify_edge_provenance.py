@@ -46,9 +46,9 @@ def test_genes_named_in_shown_citation_titles_are_not_counted_as_outside_knowled
 
 def _saved(rationale, debate_rationale=None, edges=None):
     edges = edges or [_edge("INSR", "PTPN1"), _edge("PTPN1", "CAPN1", "inhibits")]
-    agent2 = {"chains": [{"edges": edges, "rationale": rationale}, {"edges": [_edge("INSR", "APP")], "rationale": None}],
+    stage2 = {"chains": [{"edges": edges, "rationale": rationale}, {"edges": [_edge("INSR", "APP")], "rationale": None}],
               "debate_log": [{"winner_index": 0, "loser_index": 1, "rationale": debate_rationale}] if debate_rationale else []}
-    return {"citations": {}}, agent2
+    return {"citations": {}}, stage2
 
 
 def test_audit_result_summary_all_grounded():

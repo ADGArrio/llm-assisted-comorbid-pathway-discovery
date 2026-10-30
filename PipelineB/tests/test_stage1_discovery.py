@@ -1,4 +1,4 @@
-from PipelineB.agent1_discovery import Agent1DiscoveryResult, run_agent1_discovery
+from PipelineB.stage1_discovery import Stage1DiscoveryResult, run_stage1_discovery
 from PipelineB.opentargets_client import GeneAssociation, StubOpenTargetsClient
 from PipelineB.pubmed_client import Citation, StubPubMedClient
 
@@ -34,17 +34,17 @@ def _build_stub_clients():
     return ot_client, pubmed_client
 
 
-def test_run_agent1_discovery_end_to_end_with_stubs():
+def test_run_stage1_discovery_end_to_end_with_stubs():
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     assert result.disease1_efo_id == "EFO_T2DM"
     assert result.disease2_efo_id == "EFO_AD"
 
 
-def test_run_agent1_discovery_filters_low_score_targets():
+def test_run_stage1_discovery_filters_low_score_targets():
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     d1_symbols = [t.gene_symbol for t in result.disease1_targets]
     d2_symbols = [t.gene_symbol for t in result.disease2_targets]
@@ -54,17 +54,17 @@ def test_run_agent1_discovery_filters_low_score_targets():
     assert "APP" in d2_symbols
 
 
-def test_run_agent1_discovery_cites_genes_from_both_diseases():
+def test_run_stage1_discovery_cites_genes_from_both_diseases():
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     assert result.citations["TCF7L2"][0].pmid == "111"
     assert result.citations["APP"][0].pmid == "333"
 
 
-def test_run_agent1_discovery_searches_shared_gene_against_both_diseases():
+def test_run_stage1_discovery_searches_shared_gene_against_both_diseases():
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     # INSR is in BOTH diseases' top-N, so (changed 2026-10-15; it used to be skipped on the
     # disease-2 side) it is searched once against each disease.
@@ -81,16 +81,16 @@ def test_run_agent1_discovery_searches_shared_gene_against_both_diseases():
     assert d2_searched == ["APP", "INSR"]
 
 
-def test_run_agent1_discovery_to_dict_is_json_serializable():
+def test_run_stage1_discovery_to_dict_is_json_serializable():
     import json
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
     json.dumps(result.to_dict())
 
 
-def test_run_agent1_discovery_tags_every_citation_with_its_search():
+def test_run_stage1_discovery_tags_every_citation_with_its_search():
     ot_client, pubmed_client = _build_stub_clients()
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     for gene, cites in result.citations.items():
         for c in cites:
@@ -104,7 +104,7 @@ def test_run_agent1_discovery_tags_every_citation_with_its_search():
     assert result.citations["APP"][0].disease_name == DISEASE2
 
 
-def test_run_agent1_discovery_records_every_search_including_zero_hit_ones():
+def test_run_stage1_discovery_records_every_search_including_zero_hit_ones():
     # A gene with no PubMed hits leaves no Citation behind, so without citation_searches there
     # would be no record that it was searched at all.
     targets_d1 = [
@@ -119,7 +119,7 @@ def test_run_agent1_discovery_records_every_search_including_zero_hit_ones():
     pubmed_client = StubPubMedClient(
         citations_by_gene={"TCF7L2": [Citation("111", "t")], "INSR": [Citation("222", "i")], "APP": [Citation("333", "a")]}
     )
-    result = run_agent1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
+    result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
     d1 = [s for s in result.citation_searches if s["disease_name"] == DISEASE1]
     assert [s["gene_symbol"] for s in d1] == ["TCF7L2", "INSR", "NOHITS"]  # in score order
@@ -136,9 +136,9 @@ def test_run_agent1_discovery_records_every_search_including_zero_hit_ones():
     assert len(result.citation_searches) == 5
 
 
-def test_agent1_result_without_citation_searches_still_works():
+def test_stage1_result_without_citation_searches_still_works():
     # Results built by hand, or loaded from a run saved before citation_searches existed, omit it.
-    result = Agent1DiscoveryResult(
+    result = Stage1DiscoveryResult(
         disease1=DISEASE1, disease2=DISEASE2, disease1_efo_id="EFO_T2DM", disease2_efo_id="EFO_AD",
         disease1_targets=[], disease2_targets=[], citations={"A": [Citation("1", "old-style, no provenance")]},
     )
@@ -149,7 +149,7 @@ def test_agent1_result_without_citation_searches_still_works():
 
 
 def test_result_records_data_versions_and_never_fails_on_a_version_lookup_error():
-    from PipelineB.agent1_discovery import _data_versions
+    from PipelineB.stage1_discovery import _data_versions
 
     class _Good:
         def get_data_version(self):
@@ -170,16 +170,16 @@ def test_result_records_data_versions_and_never_fails_on_a_version_lookup_error(
     assert "open_targets" not in _data_versions(object(), object())
 
 
-def test_agent1_result_round_trips_through_to_dict_and_from_dict():
-    # added 2026-10-18 so Agents 2-4 can be re-run on a saved Agent 1 output (scripts/run_all --reuse-saved-agent1)
-    from PipelineB.agent1_discovery import Agent1DiscoveryResult
+def test_stage1_result_round_trips_through_to_dict_and_from_dict():
+    # added 2026-10-18 so Stages 2-4 can be re-run on a saved Stage 1 output (scripts/run_all --reuse-saved-stage1)
+    from PipelineB.stage1_discovery import Stage1DiscoveryResult
     from PipelineB.opentargets_client import GeneAssociation
     from PipelineB.pubmed_client import Citation
-    original = Agent1DiscoveryResult(
+    original = Stage1DiscoveryResult(
         disease1="D1", disease2="D2", disease1_efo_id="EFO_1", disease2_efo_id="EFO_2",
         disease1_targets=[GeneAssociation("INSR", "ENSG1", "P06213", 0.8)],
         disease2_targets=[GeneAssociation("APP", "ENSG2", None, 0.9)],
         citations={"INSR": [Citation(pmid="1", title="t", gene_symbol="INSR", disease_name="D1", search_rank=1)]},
         citation_searches=[{"gene_symbol": "INSR"}], data_versions={"open_targets": "26.09"},
     )
-    assert Agent1DiscoveryResult.from_dict(original.to_dict()).to_dict() == original.to_dict()
+    assert Stage1DiscoveryResult.from_dict(original.to_dict()).to_dict() == original.to_dict()

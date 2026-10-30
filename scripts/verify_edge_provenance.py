@@ -1,5 +1,5 @@
 """
-Edge-provenance audit for Agent 2 -- evidence for the claim "the LLM only ranks chains the code
+Edge-provenance audit for Stage 2 -- evidence for the claim "the LLM only ranks chains the code
 already found; it cannot add an edge."  (Added 2026-10-15.)
 
 What can and cannot be shown
@@ -7,10 +7,10 @@ What can and cannot be shown
     database (OmniPath, or MetalinksDB for metabolite hops) with the same source, target and
     direction label. The LLM's only outputs are a candidate NUMBER, a PLAUSIBLE/NOT verdict, a
     winner A/B and free text; chains are rebuilt from the code-found path, never from model text.
-    agent2_chain.py also enforces this at run time (EdgeProvenanceError).
+    stage2_judging.py also enforces this at run time (EdgeProvenanceError).
   * NOT shown, and not claimable: that the model reasons only from the supplied edges. It is asked
     for a biological-plausibility judgement, which necessarily draws on what it learned in training
-    (claude/agent2_findings_maxhops10_run.md records a case: "NR1H2 (also known as RXR)").
+    (the Stage 2 max_hops=10 findings note records a case: "NR1H2 (also known as RXR)").
   * MEASURED instead: how often the model's free-text rationales name a gene that is NOT in the
     chain and NOT in the citation titles it was shown -- a lower bound on "going beyond the data"
     (aliases such as "AKT" or "PI3K" are not counted; only exact gene symbols OmniPath knows).
@@ -65,7 +65,7 @@ def chain_genes(chain: dict) -> Set[str]:
 
 
 def genes_in_cited_titles(chain_gene_set: Iterable[str], citations: Dict[str, List[dict]], universe: Set[str]) -> Set[str]:
-    # Genes named in the titles of the citations Agent 2 put into the prompt for this chain (it shows up
+    # Genes named in the titles of the citations Stage 2 put into the prompt for this chain (it shows up
     # to 2 titles per path gene), so a rationale mentioning them is not "outside knowledge".
     shown: Set[str] = set()
     for gene in chain_genes_sorted(chain_gene_set):
@@ -83,14 +83,14 @@ def audit_rationale(text: Optional[str], allowed: Set[str], universe: Set[str]) 
     return {"genes_mentioned": sorted(mentioned), "off_path_genes": sorted(mentioned - allowed)}
 
 
-def audit_result(agent1: dict, agent2: dict, live_index: Dict[Tuple[str, str], str], universe: Set[str]) -> dict:
-    # Input: the saved agent1/agent2 dicts, the live edge index, the gene-symbol universe.
+def audit_result(stage1: dict, stage2: dict, live_index: Dict[Tuple[str, str], str], universe: Set[str]) -> dict:
+    # Input: the saved stage1/stage2 dicts, the live edge index, the gene-symbol universe.
     # Output: per-edge checks, per-rationale gene-mention audit, and a summary.
-    citations = agent1.get("citations", {})
+    citations = stage1.get("citations", {})
     chains_out = []
     n_edges = n_exact = n_mismatch = n_missing = n_metabolite_unchecked = 0
     n_rationales = n_with_off_path = 0
-    for ci, chain in enumerate(agent2.get("chains", [])):
+    for ci, chain in enumerate(stage2.get("chains", [])):
         checks = []
         for e in chain["edges"]:
             if e.get("source_kind", "gene") != "gene" or e.get("target_kind", "gene") != "gene":
@@ -111,8 +111,8 @@ def audit_result(agent1: dict, agent2: dict, live_index: Dict[Tuple[str, str], s
         chains_out.append({"chain_index": ci, "path": " -> ".join([chain["edges"][0]["source_gene"]] + [e["target_gene"] for e in chain["edges"]]),
                            "edge_checks": checks, "rationale_audit": rationale})
     debate_out = []
-    for d in agent2.get("debate_log", []):
-        winner, loser = agent2["chains"][d["winner_index"]], agent2["chains"][d["loser_index"]]
+    for d in stage2.get("debate_log", []):
+        winner, loser = stage2["chains"][d["winner_index"]], stage2["chains"][d["loser_index"]]
         allowed = chain_genes(winner) | chain_genes(loser)
         for chain in (winner, loser):
             allowed |= genes_in_cited_titles(chain_genes(chain), citations, universe)
@@ -132,17 +132,17 @@ def audit_result(agent1: dict, agent2: dict, live_index: Dict[Tuple[str, str], s
     }
 
 
-def build_live_index_and_universe(agent1: dict, agent2: dict, datasets: str) -> Tuple[Dict[Tuple[str, str], str], Set[str]]:
-    # Input: saved agent1/agent2 and the OmniPath dataset choice. Output: ({(source, target): type} for the
-    # chain edges' source genes, set of every gene symbol the BFS from Agent 1's lists touches). The universe is
-    # built by re-running Agent 2's own BFS (no LLM) so it is exactly the graph the pipeline searched.
-    from PipelineB import agent2_chain as a2
+def build_live_index_and_universe(stage1: dict, stage2: dict, datasets: str) -> Tuple[Dict[Tuple[str, str], str], Set[str]]:
+    # Input: saved stage1/stage2 and the OmniPath dataset choice. Output: ({(source, target): type} for the
+    # chain edges' source genes, set of every gene symbol the BFS from Stage 1's lists touches). The universe is
+    # built by re-running Stage 2's own BFS (no LLM) so it is exactly the graph the pipeline searched.
+    from PipelineB import stage2_judging as a2
     from PipelineB.omnipath_client import EXTENDED_DATASETS, OmniPathClient
 
     client = OmniPathClient(datasets=EXTENDED_DATASETS if datasets == "extended" else "omnipath")
     universe: Set[str] = set()
     index: Dict[Tuple[str, str], str] = {}
-    chain_sources = {e["source_gene"] for c in agent2.get("chains", []) for e in c["edges"] if e.get("source_kind", "gene") == "gene"}
+    chain_sources = {e["source_gene"] for c in stage2.get("chains", []) for e in c["edges"] if e.get("source_kind", "gene") == "gene"}
 
     class Spy(OmniPathClient):
         def get_outgoing_interactions(self, genes):
@@ -153,8 +153,8 @@ def build_live_index_and_universe(agent1: dict, agent2: dict, datasets: str) -> 
             return out
 
     spy = Spy(datasets=client.datasets)
-    d1 = [t["gene_symbol"] for t in agent1["disease1_targets"]]
-    d2 = {t["gene_symbol"] for t in agent1["disease2_targets"]}
+    d1 = [t["gene_symbol"] for t in stage1["disease1_targets"]]
+    d2 = {t["gene_symbol"] for t in stage1["disease2_targets"]}
     universe |= set(d1) | d2
     a2._bfs_shortest_paths(spy, None, d1, d2, max_hops=a2.DEFAULT_MAX_HOPS, max_paths=10 ** 6)
     for i in client.get_outgoing_interactions(sorted(chain_sources)):
@@ -173,8 +173,8 @@ def main():
     path = args.result or os.path.join("outputs", f"pipeline_b_{args.pair}.json")
     with open(path) as f:
         saved = json.load(f)
-    index, universe = build_live_index_and_universe(saved["agent1"], saved["agent2"], args.omnipath_datasets)
-    audit = audit_result(saved["agent1"], saved["agent2"], index, universe)
+    index, universe = build_live_index_and_universe(saved["stage1"], saved["stage2"], args.omnipath_datasets)
+    audit = audit_result(saved["stage1"], saved["stage2"], index, universe)
     audit["source"], audit["omnipath_datasets"] = path, args.omnipath_datasets
     os.makedirs(args.out_dir, exist_ok=True)
     out = os.path.join(args.out_dir, f"{args.pair}.json")

@@ -1,10 +1,10 @@
 """
-Agent 1, sub-agent 1 -- Open Targets Platform client.
+Stage 1 -- Open Targets Platform client.
 
 Service: Open Targets GraphQL API v4 (https://api.platform.opentargets.org/api/v4/graphql), no key needed.
 Data: GraphQL JSON. search{} resolves a disease name to an EFO/MONDO id; disease(efoId){associatedTargets}
   returns gene rows (approvedSymbol, Ensembl id, UniProt ids, association score).
-Used by: PipelineB.agent1_discovery (disease -> candidate gene lists).
+Used by: PipelineB.stage1_discovery (disease -> candidate gene lists).
 
 """
 import os
@@ -104,7 +104,7 @@ class OpenTargetsClient:
 
     def get_data_version(self) -> dict:
         # Output: {"api_version": "26.9.0", "data_version": "26.09"} -- which Open Targets release answered. The
-        # scores Agent 1 returns change between releases, so a saved run is only reproducible with this recorded
+        # scores Stage 1 returns change between releases, so a saved run is only reproducible with this recorded
         # (added 2026-10-18; verified live: data release 26.09).
         meta = self._post(_META_QUERY, {})["meta"]
         api = meta["apiVersion"]

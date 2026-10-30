@@ -182,7 +182,7 @@ def run_for_pair(pair_id: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"{path} not found -- run Pipeline B for {pair_id} first.")
     data = json.loads(path.read_text())
-    chains = data["agent2"]["chains"]
+    chains = data["stage2"]["chains"]
     gold_cfg = GOLD_SETS[pair_id]
     d1_label, d1_gold = gold_cfg["disease1"]
 

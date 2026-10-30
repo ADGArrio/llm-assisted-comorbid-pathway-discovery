@@ -111,7 +111,7 @@ def test_parse_response_handles_empty_text():
 
 
 def test_get_outgoing_interactions_batches_large_gene_lists(monkeypatch):
-    """Regression test, added 2026-09-14 alongside raising agent2_chain.py's
+    """Regression test, added 2026-09-14 alongside raising stage2_judging.py's
     _MAX_FRONTIER_SIZE from 300 to 3000: a single request with thousands of
     comma-joined gene symbols risks a URL-length failure. get_outgoing_interactions
     must split a large gene list into multiple _QUERY_BATCH_SIZE-sized requests

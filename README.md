@@ -1,115 +1,68 @@
-# LLM-Assisted Comorbid Mechanistic Pathway Discovery
+# A Multi-Stage, LLM-Assisted Pipeline for Mechanistic Deduction of Disease Comorbidity
 
-MS thesis project (Arrio Gonsalves, CMU, advisor Dr. Min Xu). Compares two
-approaches to deducing the mechanistic pathway connecting a pair of
-comorbid diseases -- Type 2 Diabetes Mellitus paired with Alzheimer's
-Disease, and with Coronary Artery Disease:
+MS thesis code (Arrio Gonsalves, Carnegie Mellon University, advisor Dr. Min Xu). The study asks one question: when a
+language model proposes a mechanism linking two comorbid diseases, can the proposal be checked against real data? It
+compares two approaches on Type 2 diabetes paired with Alzheimer's disease, and with coronary artery disease:
 
-- **Pipeline A** -- an orphaned/ungrounded LLM baseline: one prompt, the
-  model's own parametric knowledge only, no retrieval.
-- **Pipeline B** -- a grounded, four-agent pipeline that builds its answer
-  from real biomedical data sources and independently checks it before
-  reporting it.
+- **Pipeline A** -- the ungrounded control. One language-model call with only the two disease names, no retrieval. It
+  returns free text.
+- **Pipeline B** -- the grounded system. Four sequential stages. Three of them are ordinary code that calls public
+  databases; one (Stage 2) calls a language model to judge candidate chains. Every link in a reported chain is a database
+  record, and the chain is checked against evidence the earlier stages did not use.
 
-Both pipelines run standalone or side by side via `main.py`. Scoring one
-against the other (the planned **BioPathBench** benchmark) is deferred for
-now -- see `claude/metrics_purge.md` -- so this repo currently just runs
-both pipelines cleanly and saves their raw output. Full architecture spec
-lives in the project's `claude/project_architecture.md` doc.
+Only Stage 2 uses a language model, and it is used for two jobs: a *judge* that endorses or rejects each candidate
+chain, and a *debate* that compares endorsed chains two at a time. Stages 1, 3 and 4 are fixed code with no model.
 
 ## Layout
 
 ```
-Code/
-  common/       -- shared by both pipelines: disease-pair config, LLM client
-  PipelineA/    -- Orphaned LLM baseline
-  PipelineB/    -- Grounded multi-agent pipeline (Agents 1-4)
-  docs/figures/ -- diagrams
-  main.py       -- run both pipelines cell-by-cell in VS Code's Interactive Window
-  requirements.txt
-  pytest.ini
+common/       shared by both pipelines: disease-pair config, LLM client, report formatting
+PipelineA/    the ungrounded baseline
+PipelineB/    the four-stage grounded pipeline, its data clients and tests
+scripts/      analyses behind the thesis (run_all, hop sweep, evidence floor, model comparison, audits)
+docs/figures/ figures used in the thesis and the architecture diagram
+main.py       run both pipelines cell by cell in VS Code's Interactive Window
 ```
 
-## What's here
+## Pipeline B stages
 
-**Pipeline A** (`PipelineA/pipeline_a.py`) -- a single LLM call asked to
-narrate a mechanistic chain between two diseases from its own knowledge,
-returning the raw narrative text.
-
-**Pipeline B** (`PipelineB/`) -- four agents, each independent enough to
-run and test on its own:
-
-- **Agent 1, Discovery** (`agent1_discovery.py`) -- Open Targets resolves
-  each disease to its gene associations; PubMed supplies citation support
-  for the genes found. Orchestrated with LangGraph (`discover_disease1`/
-  `discover_disease2` run concurrently, `cite_genes` joins after both).
-- **Agent 2, Chain Construction** (`agent2_chain.py`) -- BFS over live
-  OmniPath protein-protein interactions and MetalinksDB gene<->metabolite
-  interactions, finding every shortest real path from a disease1-associated
-  node to a disease2-associated gene (metabolites can be intermediate hops;
-  chain endpoints are always genes). When multiple equally-short candidates
-  exist, an LLM judges which are biologically plausible using real
-  citations as evidence -- it never invents an edge itself.
-- **Agent 3, Independent Confirmation** (`agent3_confirmation.py`) --
-  checks each chain against evidence Agents 1-2 never used: tissue
-  expression (GTEx) and cross-database gene-disease association (GWAS
-  Catalog -- real numerical study-level evidence, kept over DisGeNET
-  since Agent 1's PubMed citations already cover literature evidence).
-  Reports each check individually rather than collapsing to one verdict.
-- **Agent 4, MIMIC-IV Cohort Check** (`agent4_mimic.py`) -- queries local
-  MIMIC-IV diagnosis data for the real-world co-occurrence rate of the two
-  diagnoses, as descriptive (not causal) supporting evidence for the
-  comorbidity itself.
-
-**`main.py`** -- runs both pipelines as `# %%` cells in VS Code's Python
-Interactive Window: Pipeline A, each Pipeline B agent individually, all of
-Pipeline B combined, and a side-by-side view of both pipelines' output.
-Every run is saved as JSON under `outputs/`.
-
-See `docs/figures/pipeline_b_diagram.png` for the Pipeline B architecture
-diagram (inputs, the four-agent flow, and outputs).
+| Stage | Module | Uses a language model? | What it does |
+|---|---|---|---|
+| 1. Discovery | `stage1_discovery.py` | no | Open Targets gives the top 200 genes for each disease; PubMed gives titles of up to 2 papers for the top 10 genes. The two gene lookups run in parallel in a LangGraph graph. |
+| 2. LLM-based Judging | `stage2_judging.py` | **yes** | A breadth-first search over OmniPath protein interactions finds directed paths (up to 5 hops) from a disease-1 gene to a disease-2 gene. The paths are trimmed to 10; the language model judge endorses or rejects each, and a pairwise debate with Elo scoring ranks the endorsed ones. The model never creates an edge; it only chooses among edges the search found. |
+| 3. Confirmation | `stage3_confirmation.py` | no | Checks each chain against evidence the earlier stages did not use: GTEx tissue expression, GWAS Catalog gene-disease links, PMC full-text co-mention for bridge edges, a seeded random-gene baseline, and an evidence floor that can leave a pair with no recommended chain. |
+| 4. Cohort Check | `stage4_cohort_check.py` | no | Computes the real-world co-occurrence of the two diseases in local MIMIC-IV data (a crude, unadjusted relative risk). |
 
 ## Setup
 
 ```
 cd Code
-python3 -m venv "MS Thesis"
-source "MS Thesis/bin/activate"   # Windows: "MS Thesis\Scripts\activate"
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then edit for your LLM endpoint, MIMIC_DATA_DIR, etc.
+cp .env.example .env     # edit for your LLM endpoint and MIMIC_DATA_DIR
 ```
 
-Re-run `source "MS Thesis/bin/activate"` at the start of every new
-terminal session before running anything below -- the env folder is
-gitignored, so it stays local to your machine and isn't part of the repo.
-
-Pipeline A and Agent 2 need a running LLM: defaults to a local Ollama
-server (`ollama serve`) with a model matching `LLM_MODEL` in `.env`, or
-point `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` at any OpenAI-compatible
-hosted endpoint instead.
+Pipeline A and Stage 2 need a language model. The default is a local Ollama server (`ollama serve`) with the model named
+by `LLM_MODEL` in `.env` (the thesis uses `gemma4:12b`). Any OpenAI-compatible endpoint also works through
+`LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`. Stage 4 needs credentialed MIMIC-IV files; set `MIMIC_DATA_DIR` to the
+folder that contains `hosp/`.
 
 ## Run
 
-The easiest way to run and compare both pipelines is `main.py` in VS
-Code's Python Interactive Window -- open the file and run each `# %%`
-cell in order (Shift+Enter). It saves every result to `outputs/` and ends
-with a side-by-side view of Pipeline A's and Pipeline B's output.
-
-Each piece is also runnable standalone from the command line:
-
 ```
-python -m PipelineA.pipeline_a --pair t2dm_ad
-python -m PipelineB.agent1_discovery --pair t2dm_ad
-python -m PipelineB.agent2_chain --pair t2dm_ad
-python -m PipelineB.agent3_confirmation --pair t2dm_ad
-python -m PipelineB.agent4_mimic --pair t2dm_ad
+python -m scripts.run_all                      # both disease pairs, everything, saved under outputs/
+python -m scripts.run_all --pairs t2dm_ad      # one pair
+python -m scripts.run_all --skip-stage4        # no MIMIC-IV on this machine
+python -m PipelineA.pipeline_a --pair t2dm_ad  # each piece also runs on its own
+python -m PipelineB.stage1_discovery --pair t2dm_ad
+python -m PipelineB.stage2_judging --pair t2dm_ad
+python -m PipelineB.stage3_confirmation --pair t2dm_ad
+python -m PipelineB.stage4_cohort_check --pair t2dm_ad
 ```
 
-`--pair` accepts `t2dm_ad` or `t2dm_cad` (see `common/config.py`);
-`--disease1`/`--disease2` overrides work too. Agent 2/3 need real network
-access to OmniPath/GTEx/GWAS Catalog/etc.; Agent 4 needs `MIMIC_DATA_DIR`
-pointing at local MIMIC-IV files instead. See `PipelineB/README.md` for
-per-agent details and real-run findings.
+`--pair` accepts `t2dm_ad` or `t2dm_cad` (see `common/config.py`); `--disease1` and `--disease2` override it. Stages 1 to 3
+need network access to Open Targets, PubMed, OmniPath, GTEx and GWAS Catalog. Saved results go to `outputs/`, which is not
+tracked by git.
 
 ## Test
 
@@ -117,7 +70,4 @@ per-agent details and real-run findings.
 pytest -v
 ```
 
-Everything runs offline against stub clients (`StubLLMClient`,
-`StubOpenTargetsClient`, `StubOmniPathClient`, `StubMetalinksClient`,
-`StubGTExClient`, `StubGWASCatalogClient`, `StubMimicClient`) -- no model
-or network needed.
+The tests run offline against stub clients, so they need neither a model nor a network.

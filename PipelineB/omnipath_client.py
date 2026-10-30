@@ -1,5 +1,5 @@
 """
-Agent 2 -- OmniPath client.
+Stage 2 -- OmniPath client.
 
 Service: OmniPath REST web service (https://omnipathdb.org/interactions),
 no key needed. Docs: pypath.omnipathdb.org/webservice.html.
@@ -14,7 +14,7 @@ Direction rule (changed 2026-10-18): one flag -> that direction; neither ->
 "unknown"; BOTH (a tie, 1.6% of core edges) -> OmniPath's consensus columns
 if exactly one is set, else "unknown". It used to be "activates", which was
 wrong for 647 of the 1,418 core-network ties. See _interaction_type.
-Used by: PipelineB.agent2_chain's BFS, to fetch each layer's outgoing
+Used by: PipelineB.stage2_judging's BFS, to fetch each layer's outgoing
 directed interactions FROM a set of source genes to wherever they
 actually point -- including genes outside that set, so real intermediate
 bridge proteins can be discovered (not restricted back to a fixed list).
@@ -32,10 +32,10 @@ OmniPath's own curated catalog do we query," not "how strict is the
 evidence for one edge." Widening this changes what counts as a "real,
 grounded" edge for the whole Pipeline B comparison, which is a
 methods-relevant choice, not a pure bug fix -- see
-claude/agent2_bfs_and_prompt_recalibration.md for the decision to expose
-this as an explicit, comparable option (`run_agent2(...,
+the Stage 2 BFS and prompt recalibration note for the decision to expose
+this as an explicit, comparable option (`run_stage2(...,
 omnipath_datasets="extended")` in main.py, or `--omnipath-datasets` on
-this module's sibling CLI in agent2_chain.py) rather than silently
+this module's sibling CLI in stage2_judging.py) rather than silently
 changing the default.
 
 Complex nodes are kept, tried-and-reverted 2026-09-14: OmniPath
@@ -51,7 +51,7 @@ on a real single gene again -- real, literature-accurate systems biology
 does inhibit HMGCR), but a pseudo "gene" like that has real downsides
 for this pipeline specifically: it can never carry an Open Targets
 disease-association score, so it can never be a `goal_genes` endpoint;
-Agent 3's confirmation step (GTEx, GWAS Catalog) operates on single
+Stage 3's confirmation step (GTEx, GWAS Catalog) operates on single
 genes, so a complex hop can't be independently confirmed; and it renders
 as a long, confusing underscore-joined string in the readable pathway
 output. A filter dropping any interaction touching a COMPLEX was tried
@@ -118,7 +118,7 @@ def _interaction_type(
     # BOTH set (resources disagree; 1,418 of the 86,189 directed core edges, 1.6%): resolved by OmniPath's
     # consensus columns when exactly one of them is set, otherwise "unknown". Until 2026-10-18 every tie was
     # labelled "activates", which was wrong for 647 of the 1,418 (OmniPath's consensus says inhibition) and
-    # unsupported for the 215 whose consensus is neither/both -- see claude/agent2_hardening_provenance_maxhops.md.
+    # unsupported for the 215 whose consensus is neither/both -- see the Stage 2 hardening note.
     stim, inhib = _truthy(is_stimulation), _truthy(is_inhibition)
     if stim and not inhib:
         return "activates"
@@ -159,7 +159,7 @@ class OmniPathClient:
         # any of those genes, to whatever they point at in OmniPath (may be outside source_genes).
         #
         # Batched in groups of _QUERY_BATCH_SIZE, added 2026-09-14 alongside raising
-        # agent2_chain.py's _MAX_FRONTIER_SIZE: a single GET with thousands of comma-joined gene
+        # stage2_judging.py's _MAX_FRONTIER_SIZE: a single GET with thousands of comma-joined gene
         # symbols in one query string risks hitting a URL-length limit (many servers/proxies cap
         # around 2-8k characters) or a slow/failed request, untested from this network-blocked
         # sandbox. Splitting into several smaller, known-safe-sized requests avoids that risk

@@ -94,7 +94,7 @@ for i, model in enumerate(MODEL_ORDER):
 ax.set_xticks(list(x))
 ax.set_xticklabels(pair_names)
 ax.set_ylabel("Candidates endorsed (of 10)")
-ax.set_title("A. Stage-1 endorsement rate by model")
+ax.set_title("A. Judge endorsement rate by model")
 ax.set_ylim(0, 6)
 ax.spines[["top", "right"]].set_visible(False)
 ax.grid(axis="y")
@@ -108,7 +108,7 @@ elo_labels = []
 for p in pair_names:
     for model in MODEL_ORDER:
         d = load(per_model_files[(p, model)])
-        chains = d.get("agent2_chains") or []
+        chains = d.get("stage2_chains") or []
         if not chains:
             continue
         top = max(chains, key=lambda c: c.get("elo_rating") or 0)
@@ -146,8 +146,8 @@ cad = load(f"outputs/pipeline_b_t2dm_cad{RUN_SUFFIX}.json")
 
 rows = []
 for label_prefix, data in [("T2DM→AD", ad), ("T2DM→CAD", cad)]:
-    for i, chain in enumerate(data["agent2"]["chains"]):
-        a3 = data["agent3"][i]
+    for i, chain in enumerate(data["stage2"]["chains"]):
+        a3 = data["stage3"][i]
         expressed = a3["tissue_expressed_count"]
         total = a3["tissue_checked_count"]
         rows.append((f"{label_prefix}\nP{i+1}", expressed, total, gene_chain_str(chain)))
@@ -175,10 +175,10 @@ print("wrote fig_gtex_coverage.png")
 # =====================================================================
 # Figure 3: MIMIC-IV cohort rate vs. general-population base rate
 # =====================================================================
-ad4 = ad["agent4"]
-cad4 = cad["agent4"]
+ad4 = ad["stage4"]
+cad4 = cad["stage4"]
 groups = ["T2DM → AD", "T2DM → CAD"]
-from PipelineB.agent4_mimic import _two_by_two_stats  # recompute from counts so old saved results work too
+from PipelineB.stage4_cohort_check import _two_by_two_stats  # recompute from counts so old saved results work too
 
 
 def _unexposed_rate(a4):

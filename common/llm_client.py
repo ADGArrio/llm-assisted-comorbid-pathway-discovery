@@ -5,7 +5,7 @@ Service: any OpenAI-compatible /v1/chat/completions endpoint -- local
 Ollama by default (LLM_BASE_URL=http://localhost:11434, no key needed),
 or any hosted model via .env (LLM_BASE_URL/LLM_MODEL/LLM_API_KEY).
 Data: request/response are the standard OpenAI chat-completions JSON shape.
-Used by: PipelineA.pipeline_a (narrative generation) and PipelineB.agent2_chain (chain selection).
+Used by: PipelineA.pipeline_a (narrative generation) and PipelineB.stage2_judging (chain selection).
 
 KNOWN ISSUE (gemma4 via Ollama): a "thinking" model can put its reasoning
 in a separate `reasoning` field and leave `content` empty. We send
@@ -58,7 +58,7 @@ class LLMClient:
             print(
                 f"WARNING: LLM reply was cut off (finish_reason=length) after {len(message.get('content') or '')} characters "
                 f"for a {len(prompt)}-character prompt -- the model's context window is probably too small; see "
-                f"claude/agent4_stats_fix_and_stage1_retry.md.",
+                f"the Stage 4 statistics fix and judge retry note.",
                 flush=True,
             )
         content = (message.get("content") or "").strip()
@@ -84,9 +84,9 @@ class LLMClient:
 class StubLLMClient:
     """Fixed or queued responses, no network call. For tests.
 
-    Added `responses` 2026-09-27, alongside Agent 2's pairwise debate tournament (see
-    agent2_chain.py's module docstring): a test that exercises more than one LLM call per run
-    (the stage-1 independent filter, then one or more stage-2 debates) needs a different response
+    Added `responses` 2026-09-27, alongside Stage 2's pairwise debate tournament (see
+    stage2_judging.py's module docstring): a test that exercises more than one LLM call per run
+    (the independent judge filter, then one or more debates) needs a different response
     for each call, which a single `fixed_response` can't provide. `responses` is consumed in
     order, one per `generate()` call; `fixed_response` (unchanged) still works exactly as before
     for every existing single/repeated-response test."""

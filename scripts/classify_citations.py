@@ -1,14 +1,14 @@
 """
 Citation evidence classifier -- answers "does this paper actually show a mechanism, or does it only
-mention the gene and the disease?" for the papers Agent 1 attaches to its top genes.
+mention the gene and the disease?" for the papers Stage 1 attaches to its top genes.
 (Prototype added 2026-10-15; standalone, nothing in the pipeline imports it.)
 
-Why this exists: Agent 1's PubMed search (PipelineB/pubmed_client.py's `search_citations`) is a
+Why this exists: Stage 1's PubMed search (PipelineB/pubmed_client.py's `search_citations`) is a
 keyword match -- `GENE[Title/Abstract] AND Disease[Title/Abstract]`. A hit only means both strings
 appear in the title or abstract, not that the paper shows the gene doing anything in the disease.
 This script reads each retrieved paper's abstract with the LLM and assigns one evidence label.
 
-Data: Agent 1's saved citations (outputs/pipeline_b_<pair>.json, old or new format), abstracts from
+Data: Stage 1's saved citations (outputs/pipeline_b_<pair>.json, old or new format), abstracts from
 PubMed efetch (PubMedClient.fetch_abstracts), and the LLM from common/llm_client.py.
 Used by: nothing yet -- run by hand (see main()) and read alongside claude/codebase_walkthrough.md.
 
@@ -229,7 +229,7 @@ def load_citation_records(result: dict, top_n: int = 10) -> List[dict]:
     # Old-format ones (saved before 2026-10-15) only have pmid/title, so the disease is inferred
     # from which disease's top-N target list the gene is in; a gene in both is marked
     # "ambiguous (shared gene, old format)" rather than guessed.
-    a1 = result["agent1"]
+    a1 = result["stage1"]
     top = {}
     for key, name_key in (("disease1_targets", "disease1"), ("disease2_targets", "disease2")):
         ranked = sorted(a1.get(key, []), key=lambda t: t["disease_assoc_score"], reverse=True)[:top_n]
@@ -254,7 +254,7 @@ def load_citation_records(result: dict, top_n: int = 10) -> List[dict]:
 
 
 def supports_pair(r: dict, require_gene_focus: bool = False) -> bool:
-    # Does this paper count as literature for the (gene, disease) pair Agent 1 searched?
+    # Does this paper count as literature for the (gene, disease) pair Stage 1 searched?
     # Rule: the paper is about the disease (disease_is_focus) and the gene is more than a passing
     # mention (label is not incidental_mention / no_abstract / parse_failed). A review counts
     # (it is literature about the pair) but is not primary evidence. With require_gene_focus the
@@ -278,7 +278,7 @@ def summarize(classified: List[dict]) -> dict:
     # Input: classified records. Output: label counts overall and per disease, how many need review,
     # and the pair-level numbers that matter (see supports_pair): papers where the gene/disease is the
     # focus, papers supporting the pair, and -- per disease -- how many of the searched GENES have at
-    # least one supporting paper (the gene-level question, which is what Agent 1's "evidence" claims).
+    # least one supporting paper (the gene-level question, which is what Stage 1's "evidence" claims).
     overall = Counter(r["evidence_type"] for r in classified)
     by_disease: Dict[str, Counter] = {}
     genes_by_disease: Dict[str, Dict[str, List[dict]]] = {}

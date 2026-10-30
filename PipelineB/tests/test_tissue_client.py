@@ -104,7 +104,7 @@ def test_gtex_client_resolves_gene_symbol_to_gencode_id_before_querying_expressi
 
 
 def test_gtex_client_caches_gencode_id_resolution_across_tissues(monkeypatch):
-    """The same gene is looked up once per relevant tissue (agent3_confirmation.py) -- resolving
+    """The same gene is looked up once per relevant tissue (stage3_confirmation.py) -- resolving
     its gencodeId should only cost one /reference/gene request, not one per tissue."""
     resolve_calls = []
 

@@ -154,7 +154,7 @@ def test_classify_uses_temperature_zero():
 def _saved(citations, d1_genes=("INSR", "TCF7L2"), d2_genes=("APP", "APOE")):
     def targets(genes):
         return [{"gene_symbol": g, "disease_assoc_score": 0.9 - i * 0.1} for i, g in enumerate(genes)]
-    return {"agent1": {"disease1": "Type 2 Diabetes Mellitus", "disease2": "Alzheimer's Disease",
+    return {"stage1": {"disease1": "Type 2 Diabetes Mellitus", "disease2": "Alzheimer's Disease",
                        "disease1_targets": targets(d1_genes), "disease2_targets": targets(d2_genes),
                        "citations": citations}}
 

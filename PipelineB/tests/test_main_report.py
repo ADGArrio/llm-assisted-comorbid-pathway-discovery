@@ -13,9 +13,9 @@ def _chain(**extra):
 
 
 def test_evidence_line_states_database_facts_and_flags_off_path_genes():
-    line = _format_chain_evidence(_chain(evidence=EVIDENCE, stage1_votes=2, rationale_off_path_genes=["INSR"]))
+    line = _format_chain_evidence(_chain(evidence=EVIDENCE, judge_votes=2, rationale_off_path_genes=["INSR"]))
     assert "direction curated for 2 of 3 edge(s)" in line
-    assert "weakest edge curation effort 2" in line and "endorsed in 2 stage-1 pass(es)" in line
+    assert "weakest edge curation effort 2" in line and "endorsed in 2 judge pass(es)" in line
     assert "INSR" in line
 
 

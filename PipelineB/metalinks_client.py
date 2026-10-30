@@ -1,5 +1,5 @@
 """
-Agent 2 -- MetalinksDB client (gene<->metabolite edges).
+Stage 2 -- MetalinksDB client (gene<->metabolite edges).
 
 Service: MetalinksDB, accessed via the liana-py package (`pip install
 liana`), which downloads a local SQLite snapshot on first use -- not a
@@ -13,7 +13,7 @@ the gene/receptor) or "pd" (production-degradation: the gene/enzyme acts
 ON the metabolite). `mor` (mode of regulation) is 1/-1/0, mapped here to
 activates/inhibits/unknown ("lr" rows) or produces/degrades/unknown
 ("pd" rows).
-Used by: PipelineB.agent2_chain's BFS, as a second edge source alongside
+Used by: PipelineB.stage2_judging's BFS, as a second edge source alongside
 OmniPath so metabolites (glucose, cholesterol, fatty acids, ...) can be
 genuine intermediate hops in a chain: GeneA --produces--> Metabolite
 --activates--> GeneB.
