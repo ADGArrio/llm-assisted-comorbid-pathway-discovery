@@ -254,7 +254,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
         return next(r for r in results[p]["rows"] if r["hops"] == h)
 
     # ---- Figure 1: yield and signal
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.9))
+    fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
         ax.bar([h + (k - 1) * width for h in hops], [row(p, h)["new_paths"] for h in hops], width=width, color=colors[p], label=labels[p])
@@ -282,7 +282,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     save(fig, "fig_maxhops_yield.png", out_dirs)
 
     # ---- Figure 2: quality and cost
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.9))
+    fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
         vals = [row(p, h)["fraction_fully_signed"] for h in hops]
@@ -310,7 +310,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     save(fig, "fig_maxhops_quality_cost.png", out_dirs)
 
     # ---- Figure 3: what the 10 candidates handed to the LLM look like, by hop budget
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.9))
+    fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
         ax.bar([h + (k - 0.5) * width * 1.4 for h in hops], [row(p, h)["kept_mean_hops"] or 0 for h in hops], width=width * 1.4, color=colors[p], label=labels[p])
