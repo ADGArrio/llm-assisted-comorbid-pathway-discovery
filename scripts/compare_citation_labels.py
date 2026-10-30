@@ -2,10 +2,9 @@
 
 Usage: python scripts/compare_citation_labels.py MODEL_JSON LABELS_TSV [--out report.json]
 
-LABELS_TSV columns: pair, idx (1-based position in the classifier's `papers` list), label,
-gene_focus, disease_focus, conf. Computes exact agreement and Cohen's kappa on the evidence label,
-agreement on the two focus flags, and agreement on the two derived rules used in the thesis
-(supports_pair with gene focus; is_gene_focused_mechanism). Lists every disagreement.
+LABELS_TSV columns: pair, idx (1-based position in the classifier's `papers` list), label, gene_focus, disease_focus, conf. Computes
+exact agreement and Cohen's kappa on the evidence label, agreement on the two focus flags, and agreement on the two derived rules used
+in the thesis (supports_pair with gene focus; is_gene_focused_mechanism). Lists every disagreement.
 """
 import argparse, json, sys
 from collections import Counter
@@ -15,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from classify_citations import supports_pair, is_gene_focused_mechanism  # noqa: E402
 
 
+# Input: two equal-length label lists (model, hand). Output: Cohen's kappa.
 def kappa(a, b):
     n = len(a)
     po = sum(x == y for x, y in zip(a, b)) / n
@@ -23,12 +23,15 @@ def kappa(a, b):
     return (po - pe) / (1 - pe) if pe < 1 else 1.0
 
 
+# Input: path to the labels TSV. Output: {idx: {evidence_type, gene_is_focus, disease_is_focus, conf}}.
 def load_labels(path):
     rows = [l.split("\t") for l in Path(path).read_text().splitlines()[1:] if l.strip()]
     return {int(r[1]): dict(evidence_type=r[2], gene_is_focus=r[3] == "1",
                             disease_is_focus=r[4] == "1", conf=r[5]) for r in rows}
 
 
+# Input: the classifier output JSON path and the labels TSV path. Output: a report dict with agreement, kappa and every
+# disagreement.
 def compare(model_json, labels_tsv):
     papers = json.loads(Path(model_json).read_text())["papers"]
     mine = load_labels(labels_tsv)

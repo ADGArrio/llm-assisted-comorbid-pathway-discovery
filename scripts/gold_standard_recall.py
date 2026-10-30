@@ -1,64 +1,20 @@
-"""
-Gold-standard structural coverage metric -- "metric 8" from claude/possible_metrics.md, built
-2026-10-11 per the user's own request to compare the pipeline's actual output against a real,
-external, curated gold standard, as a percentage ("a recall number... compare the actual
-biomedical output vs our current outputs as a %"). Direct re-derivation of BioMaze/BIOME-Bench's
-own Structured-KG-Coverage formula (see possible_metrics.md's "Simplified benchmark design"):
-    coverage = |predicted gene subset (intersect) gold gene set| / |gold gene set|
-applied here per endorsed chain, per disease pair, against real KEGG pathway/disease gene sets --
-not invented, not sampled from training knowledge at request time. Every gene symbol below was
-pulled live from the KEGG REST API (https://rest.kegg.jp) on 2026-10-11 and is reproduced exactly
-as KEGG returned it, with the specific pathway/disease ID cited next to each constant.
+"""Gold-standard structural coverage: compares each endorsed chain's genes with real KEGG gene sets, per disease pair.
 
-WHY THIS IS A PROXY, STATED PLAINLY (see possible_metrics.md, "Gold-standard structural recall"):
-these are per-disease pathway/disease gene sets, not a gold standard for the specific T2DM-to-X
-BRIDGE mechanism. A chain gene appearing in GOLD_T2DM means "this gene is independently known to
-matter for Type 2 Diabetes," not "this specific edge in this specific chain is an established
-comorbidity mechanism." GOLD_CAD_BRIDGE (the AGE-RAGE pathway, KEGG hsa04933) is the one gold set
-here that IS specifically about a diabetes to vascular-disease bridge, so it's the closest thing
-to a real bridge-mechanism gold standard this script has -- flagged as such in the output.
+coverage = |chain genes intersect gold set| / |gold set|, and chain_precision = |chain genes intersect gold set| / |chain genes|. These are
+proxies: the gold sets are per-disease pathway or disease gene sets, not a gold standard for the specific T2DM-to-X bridge mechanism, so
+chain_precision (the share of a chain's own genes independently known to matter for the disease) is the main figure for a short chain.
+GOLD_CAD_BRIDGE (the AGE-RAGE pathway) is the one set that is itself a diabetes-to-vascular-disease bridge.
 
-WHY TWO DIRECTIONS, NOT JUST "RECALL": a single endorsed chain has 3-5 genes; every gold set below
-has 6-190+ genes. |chain (intersect) gold| / |gold| (recall-against-the-full-pathway) is
-necessarily small for any single chain by construction -- that's expected, not a failure, and is
-reported for comparability with BioMaze's own formula. |chain (intersect) gold| / |chain| (what
-fraction of THIS chain's own genes are independently, externally known disease-relevant genes) is
-the more interpretable number for a single short chain, and is this script's primary reported
-figure. Both are computed and saved; see possible_metrics.md for the full discussion.
-
-Gold sets and their real KEGG sources (fetched 2026-10-11):
-
-  GOLD_T2DM        -- KEGG PATHWAY hsa04930 "Type II diabetes mellitus", full GENE section (46
-                       genes after deduplicating one PIK3R3 readthrough entry). Used unmodified.
-  GOLD_AD          -- KEGG PATHWAY hsa05010 "Alzheimer disease", CURATED SUBSET of the GENE
-                       section (40 of ~400+ genes). The full pathway reference is dominated by
-                       generic oxidative-phosphorylation complex subunits (NDUF*/SDH*/UQCR*/COX*/
-                       ATP5* families) and proteasome subunits (PSMA/B/C/D families) that are
-                       generic cellular-machinery genes shared across nearly every KEGG
-                       neurodegeneration pathway, not AD-specific -- including them would make
-                       "coverage" trivially easy to claim for any gene in any pathway. This script
-                       keeps only the named, AD-mechanism-specific modules KEGG's own diagram
-                       groups separately: familial AD/amyloid processing, synaptic calcium
-                       signaling, ER stress/UPR, apoptosis, tau/kinases, and amyloid clearance.
-                       This is a real curation decision, stated here rather than hidden.
-  GOLD_CAD_BRIDGE  -- KEGG PATHWAY hsa04933 "AGE-RAGE signaling pathway in diabetic complications",
-                       full GENE section (101 genes, nothing omitted). The single most directly
-                       relevant gold set in this script -- it IS a diabetes-to-vascular-disease
-                       bridge pathway, not just a CAD pathway in isolation.
-  GOLD_CAD_ATHERO  -- KEGG PATHWAY hsa05417 "Lipid and atherosclerosis", full GENE section (large;
-                       nothing omitted). Broader general atherosclerosis/innate-immunity pathway.
-  GOLD_CAD_STRICT  -- KEGG DISEASE H01742 "Coronary artery disease", direct GENE field (6 genes:
-                       MEF2A, LRP6, CX3CR1, KALRN, MMP3, CD36). Tiny but the highest-specificity
-                       set here -- these are genes KEGG's own disease curation directly links to
-                       CAD subtypes, not pathway-diagram membership.
+Gold sets, fetched from the KEGG REST API on 2026-10-11: GOLD_T2DM (hsa04930, full gene section); GOLD_AD (hsa05010, a curated 40-gene
+subset of AD-specific modules, leaving out generic oxidative-phosphorylation and proteasome subunits); GOLD_CAD_BRIDGE (hsa04933, full);
+GOLD_CAD_ATHERO (hsa05417, full); GOLD_CAD_STRICT (disease H01742, six genes linked directly to CAD).
 
 Usage:
     python3 -m scripts.gold_standard_recall --pair t2dm_cad
     python3 -m scripts.gold_standard_recall --pair t2dm_ad
     python3 -m scripts.gold_standard_recall            # default: both pairs
 
-Output: outputs/gold_standard_recall/{pair_id}.json (per-chain, per-gold-set detail + summary)
-plus a printed summary table. No network calls -- the gold sets are static, fetched once above.
+Output: outputs/gold_standard_recall/{pair_id}.json (per-chain, per-gold-set detail and summary) plus a printed table. No network calls.
 """
 import argparse
 import json
@@ -69,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 RESULT_DIR = OUTPUTS_DIR / "gold_standard_recall"
 
-# --- KEGG hsa04930 "Type II diabetes mellitus", full GENE section, fetched 2026-10-11 ---
+# KEGG hsa04930 "Type II diabetes mellitus", full gene section.
 GOLD_T2DM: Set[str] = {
     "SOCS4", "MTOR", "GCK", "HK1", "HK2", "HK3", "IKBKB", "INS", "INSR", "PDX1", "IRS1",
     "KCNJ11", "MAFA", "PIK3CA", "PIK3CB", "PIK3CD", "PIK3R1", "PIK3R2", "PKLR", "PKM",
@@ -78,7 +34,7 @@ GOLD_T2DM: Set[str] = {
     "HKDC1", "IRS4", "PIK3R3", "SOCS1", "IRS2", "SOCS2", "CACNA1G", "SOCS3", "ADIPOQ",
 }
 
-# --- KEGG hsa05010 "Alzheimer disease", curated subset (see module docstring), fetched 2026-10-11 ---
+# KEGG hsa05010 "Alzheimer disease", curated subset of AD-specific modules.
 GOLD_AD: Set[str] = {
     "APP", "PSEN1", "PSEN2", "APOE", "BACE1", "BACE2",
     "GRIN1", "GRIN2A", "GRIN2B", "GRM5", "CACNA1C", "CALM1", "CALM2", "CALM3",
@@ -89,8 +45,7 @@ GOLD_AD: Set[str] = {
     "AGER", "LRP1", "IDE", "MME", "ADAM10",
 }
 
-# --- KEGG hsa04933 "AGE-RAGE signaling pathway in diabetic complications", full GENE section,
-#     fetched 2026-10-11 (101 entries; nothing omitted) ---
+# KEGG hsa04933 "AGE-RAGE signaling pathway in diabetic complications", full gene section (101 entries).
 GOLD_CAD_BRIDGE: Set[str] = {
     "AGER", "CYBB", "NOX1", "NOX4",
     "PRKCA", "PRKCB", "PRKCD", "PRKCE", "PRKCZ",
@@ -110,8 +65,7 @@ GOLD_CAD_BRIDGE: Set[str] = {
     "CDK4", "CDKN1B", "CCND1", "BAX", "BCL2", "CASP3",
 }
 
-# --- KEGG hsa05417 "Lipid and atherosclerosis", full GENE section, fetched 2026-10-11
-#     (~190 entries after dedup; nothing omitted) ---
+# KEGG hsa05417 "Lipid and atherosclerosis", full gene section.
 GOLD_CAD_ATHERO: Set[str] = {
     "OLR1", "LDLR", "VLDLR", "APOA1", "APOA4", "APOB", "ABCA1", "ABCG1", "CD36", "AGER",
     "CYBA", "CYBB", "NCF1", "NCF2", "NCF4", "NOX1", "SOD2", "NOS3", "NFE2L2",
@@ -145,7 +99,7 @@ GOLD_CAD_ATHERO: Set[str] = {
     "MIB1", "MIB2",
 }
 
-# --- KEGG DISEASE H01742 "Coronary artery disease", direct GENE field, fetched 2026-10-11 ---
+# KEGG DISEASE H01742 "Coronary artery disease", direct gene field.
 GOLD_CAD_STRICT: Set[str] = {"MEF2A", "LRP6", "CX3CR1", "KALRN", "MMP3", "CD36"}
 
 GOLD_SETS = {
@@ -161,11 +115,14 @@ GOLD_SETS = {
 }
 
 
+# Input: a chain dict. Output: its genes in order.
 def gene_list_for_chain(chain: dict) -> List[str]:
     edges = chain["edges"]
     return [edges[0]["source_gene"]] + [e["target_gene"] for e in edges]
 
 
+# Input: a chain's genes and a gold gene set. Output: the matched genes, chain_precision, gold_coverage and the gold set
+# size.
 def score_against_gold(chain_genes: List[str], gold: Set[str]) -> dict:
     chain_set = set(chain_genes)
     matched = sorted(chain_set & gold)
@@ -177,6 +134,8 @@ def score_against_gold(chain_genes: List[str], gold: Set[str]) -> dict:
     }
 
 
+# Input: pair id. Output: per-chain scores against each gold set for that pair, with a summary of mean chain_precision
+# per gold set.
 def run_for_pair(pair_id: str) -> dict:
     path = OUTPUTS_DIR / f"pipeline_b_{pair_id}.json"
     if not path.exists():
@@ -213,6 +172,7 @@ def run_for_pair(pair_id: str) -> dict:
     return {"pair_id": pair_id, "chains": chain_results, "summary": summary}
 
 
+# Command-line entry point: score one pair or both and save the results.
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pair", choices=["t2dm_ad", "t2dm_cad", "both"], default="both")

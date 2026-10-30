@@ -1,83 +1,11 @@
-"""
-Stage 3 -- Confirmation.
-
-Service: none directly -- orchestrates tissue_client.py (GTEx),
-crossdb_client.py (GWAS Catalog), and pubmed_client.py (PubMed, for the
-new edge-level literature check below), sources Stage 1 never looked at
-during discovery (PubMed aside -- Stage 1 already uses it gene-level;
-see pubmed_client.py's module docstring).
-Data: per chain, runs (1) a tissue-expression check, (2) a cross-database
-gene-disease association check, and (3, new) an edge-level literature
-check on bridge edges; see those modules for each service's own data
-shape. Output is a list of Stage3ConfirmationResult, one per chain.
-Used by: the top-level pipeline, after Stage 2.
-
-Simplified 2026-09-14 to two sources total -- see
-the Stage 3 simplification note. Dropped the Human Protein Atlas
-fallback (GTEx alone covers every tissue this project's three diseases
-need) and dropped DisGeNET (GWAS Catalog is real numerical study-level
-evidence -- p-values, study accessions -- while DisGeNET is itself a
-literature-aggregation source, and Stage 1's PubMed citations already
-cover literature evidence). Both removed clients are still in git
-history if a real run later justifies adding either back.
-
-Which nodes get which check: a chain's first gene (disease1-associated
-per Stage 1) and last gene (disease2-associated) get both tissue and
-cross-db checks. Every gene in between is a BFS bridge Stage 1 never
-claimed was disease-associated, so it only gets tissue-checked, against
-the union of both diseases' relevant tissues. Since Stage 2 can route a
-chain through a metabolite (metalinks_client.py), a middle hop may be
-metabolite-kind rather than gene-kind -- GTEx/GWAS Catalog are both
-gene-centric with no meaningful check for a metabolite name, so
-metabolite middle hops are excluded from tissue/cross-db checks
-entirely and instead just listed in `chain_metabolites` for visibility.
-Chain endpoints are always genes by construction (see stage2_judging.py's
-module docstring), so endpoint handling is unaffected by this.
-
-Findings are reported per-check, not collapsed into one pass/fail
-verdict -- no GWAS Catalog hit is real negative evidence, not proof a
-chain is wrong (a gene can matter mechanistically without registering
-in a genetics-only database).
-
-Edge-level literature validation (added 2026-09-27, per committee
-feedback -- see claude/committee_feedback_round2_coscientist.md section
-3a): the checks above validate individual GENES (is this gene expressed
-where it needs to be, is this gene independently disease-associated).
-None of them validate a specific claimed EDGE -- e.g. whether there is
-any real literature support for "PTPN1 inhibits CAPN1" specifically, as
-opposed to each gene separately being a reasonable biological player.
-`_edge_literature_checks` below adds exactly that, scoped deliberately
-to "bridge edges" only -- an edge whose BOTH ends are bridge/middle
-genes (`roles["middle"]`), not the chain's overall disease-anchored
-endpoints. This scoping was an explicit user decision (2026-09-27): a
-chain's two endpoint genes already have independent GWAS Catalog
-evidence, so bridge-to-bridge interactions are the part of a chain with
-the thinnest independent support today, and that's where a literature
-check adds the most value per PubMed/PMC query spent. A real, stated
-consequence: a 1-hop chain (a single edge, both ends are endpoints) or
-a 2-hop chain (one bridge gene, but every edge still touches an
-endpoint) has NO edge with both ends being bridge genes, so it gets
-zero literature checks -- an expected scoping outcome, not a bug, same
-spirit as this module's other documented scoping choices above. A
-citation existing is not automatically support -- see pubmed_client.py's
-EdgeCitation docstring; `EdgeLiteratureCheck.supported` only counts a
-real co-mentioning passage (full text or abstract), never a bare
-title-only match.
-
-Independence of the evidence (revised 2026-10-18). Stage 1 selects each disease's genes by Open Targets' OVERALL
-association score, and that score includes a `genetic_association` datatype built partly from GWAS data (checked
-live: 140 of the top 200 T2DM genes and 152 of the top 200 CAD genes have genetic_association >= 0.3). A GWAS
-Catalog hit on a chain ENDPOINT therefore largely repeats the evidence that selected the endpoint, and is reported
-as "consistent with the selection evidence" (`independent_of_selection: false`), not as independent confirmation.
-Two additions keep a real, non-circular verification:
-  1. BRIDGE genes get the GWAS check too (`bridge_gwas_checks`, both diseases). Bridge genes were found by the
-     OmniPath search and never ranked by Open Targets, so a GWAS hit on a bridge gene is evidence the selection did
-     not use.
-  2. A random-gene baseline (`null_baseline`). Tissue-expression and GWAS hit rates are computed for a seeded random
-     sample of genes drawn from the pool of genes the BFS could have used as bridges (Stage 2's
-     `bfs_stats["candidate_bridge_genes"]`) and compared with the chains' own bridge genes, so "16/18 expressed" or
-     "1 of 3 bridge genes has a GWAS hit" is read against what a comparable random bridge gene would score. The pool
-     shares the chains' topology bias (well-connected genes), which a uniformly random gene would not.
+"""Stage 3 Confirmation: independent checks on every Stage 2 chain, reported per check rather than as one pass/fail verdict.
+  - Tissue expression (GTEx) for every gene on the chain, against the relevant tissues of both diseases.
+  - GWAS Catalog hits for the two endpoint genes (and for each bridge gene, against both diseases).
+  - Edge literature (PubMed and PMC full text) for bridge edges only, i.e. edges whose two ends are both middle genes, so
+    1- and 2-hop chains have none.
+Metabolite middle hops are not checked and are listed in chain_metabolites. A random-gene null baseline gives the hit rates to
+compare the chains' bridge genes against. A missing GWAS hit is not evidence against a chain. Output is one
+Stage3ConfirmationResult per chain.
 """
 import argparse
 import json
@@ -94,28 +22,26 @@ from PipelineB.pubmed_client import EdgeCitation, PubMedClient
 from PipelineB.tissue_client import GTExClient, TissueExpressionResult, check_tissue_expression
 
 
+# GWAS Catalog result for one gene and one disease.
 @dataclass
 class EndpointCrossDbCheck:
     gene_symbol: str
     disease_name: str
     gwas_associations: List[GwasAssociation]
-    # True if crossdb_client.py's GWASCatalogClient gave up on some part of this specific check
-    # (the search itself, or a per-SNP follow-up) after exhausting rate-limit retries -- see
-    # crossdb_client.py's bug-fix #3 note. When True, `confirmed=False` here means "not fully
-    # checked this run", not "checked and found no evidence" -- a real T2DM->AD run hit this
-    # for IRS1, a gene with strong, well-replicated GWAS evidence for T2DM, which is how this
-    # distinction was discovered to matter. Always False for StubGWASCatalogClient (see there).
+    # True if the GWAS client gave up on part of this check after exhausting rate-limit retries; then confirmed=False
+    # means not fully checked, not checked and negative. Always False for the stub.
     possibly_incomplete: bool = False
 
-    # False for a chain endpoint: Stage 1 picked it by an Open Targets score that already includes GWAS-derived
-    # genetic evidence, so a hit is "consistent with the selection evidence", not independent confirmation.
-    # True for a bridge gene (never ranked by Open Targets).
+    # False for a chain endpoint: Stage 1 chose it by an Open Targets score that already includes genetic evidence, so a
+    # hit is consistent with the selection evidence, not independent confirmation. True for a bridge gene.
     independent_of_selection: bool = True
 
+    # Output: whether any GWAS association was found.
     @property
     def confirmed(self) -> bool:
         return bool(self.gwas_associations)
 
+    # Output: the check as a plain dict.
     def to_dict(self) -> dict:
         return {
             "gene_symbol": self.gene_symbol,
@@ -127,34 +53,26 @@ class EndpointCrossDbCheck:
         }
 
 
+# Literature-support check for one bridge edge.
 @dataclass
 class EdgeLiteratureCheck:
-    """One bridge edge's literature-support check -- see module docstring's "Edge-level
-    literature validation" note. Only ever built for an edge whose both ends are bridge/middle
-    genes; a chain with no such edge (1- or 2-hop chains) simply has an empty
-    `edge_literature_checks` list on its Stage3ConfirmationResult."""
 
     gene_a: str
     gene_b: str
-    searched: bool  # always True today (every bridge edge is searched) -- kept as a field, not a
-    # constant, so a future reason to skip a specific edge (e.g. a transient PubMed failure) has
-    # somewhere honest to record "we meant to check this and couldn't" separately from "there was
-    # nothing here to check" (the 1-/2-hop chain case, which never creates this object at all).
+    searched: bool  # Always True today (every bridge edge is searched); kept as a field so a skipped edge can be recorded.
     citations: List[EdgeCitation]
 
+    # Output: True only if at least one citation names both genes together in a checked passage.
     @property
     def supported(self) -> bool:
-        # True only if at least one citation actually confirms both genes named together in a
-        # checked passage -- a citation merely matching the original gene_a AND gene_b PubMed
-        # search is not enough on its own (see pubmed_client.py's EdgeCitation docstring).
         return any(c.both_genes_confirmed for c in self.citations)
 
+    # Output: whether at least one citation reached real full text rather than only an abstract.
     @property
     def any_full_text_checked(self) -> bool:
-        # Whether at least one citation's check reached real full text rather than only an
-        # abstract -- useful context for how thorough a `supported=False` result actually was.
         return any(c.full_text_checked for c in self.citations)
 
+    # Output: the check as a plain dict.
     def to_dict(self) -> dict:
         return {
             "gene_a": self.gene_a,
@@ -166,23 +84,27 @@ class EdgeLiteratureCheck:
         }
 
 
+# All Stage 3 checks for one chain.
 @dataclass
 class Stage3ConfirmationResult:
     tissue_checks: List[TissueExpressionResult]
     endpoint_checks: List[EndpointCrossDbCheck]  # exactly 2: [disease1-endpoint, disease2-endpoint]
     chain_metabolites: List[str]  # metabolite-kind middle hops in this chain; never tissue/cross-db checked
-    edge_literature_checks: List[EdgeLiteratureCheck] = field(default_factory=list)  # bridge edges only; see module docstring
+    edge_literature_checks: List[EdgeLiteratureCheck] = field(default_factory=list)  # bridge edges only
     bridge_gwas_checks: List[EndpointCrossDbCheck] = field(default_factory=list)  # one per bridge gene x disease (independent of selection)
     null_baseline: Optional[dict] = None  # random-gene baseline + chain comparison; same dict on every chain of a run
 
+    # Output: how many tissue checks found the gene expressed.
     @property
     def tissue_expressed_count(self) -> int:
         return sum(1 for t in self.tissue_checks if t.expressed is True)
 
+    # Output: how many tissue checks returned data.
     @property
     def tissue_checked_count(self) -> int:
         return sum(1 for t in self.tissue_checks if t.expressed is not None)
 
+    # Output: the result as a JSON-serializable dict.
     def to_dict(self) -> dict:
         return {
             "tissue_checks": [t.to_dict() for t in self.tissue_checks],
@@ -197,13 +119,9 @@ class Stage3ConfirmationResult:
         }
 
 
+# Split a chain's nodes by role. Input: a chain. Output: {"disease1_endpoint", "disease2_endpoint", "middle" (genes),
+# "middle_metabolites"}; endpoints are always genes, and a single-edge chain has no middle nodes.
 def _chain_gene_roles(chain: ChainCandidate) -> Dict[str, List[str]]:
-    # Input: a chain. Output: {"disease1_endpoint": gene, "disease2_endpoint": gene,
-    # "middle": [gene,...], "middle_metabolites": [name,...]}.
-    # Chain endpoints are always gene-kind by construction (BFS starts and stops at genes --
-    # see stage2_judging.py's module docstring); only middle hops can be metabolite-kind, which
-    # are split out separately since gene-centric checks don't apply to them. A single-edge
-    # chain has no middle nodes at all -- its one gene pair are both endpoints.
     edges = chain.edges
     disease1_endpoint = edges[0].source_gene
     disease2_endpoint = edges[-1].target_gene
@@ -233,12 +151,9 @@ def _chain_gene_roles(chain: ChainCandidate) -> Dict[str, List[str]]:
     }
 
 
+# Run the literature check on bridge edges. Input: a chain, its roles and a PubMed client. Output: one
+# EdgeLiteratureCheck per edge whose two ends are both gene-kind middle genes.
 def _edge_literature_checks(chain: ChainCandidate, roles: Dict[str, List[str]], pubmed_client) -> List[EdgeLiteratureCheck]:
-    # Input: a chain, its already-computed roles (see _chain_gene_roles), a PubMed client.
-    # Output: one EdgeLiteratureCheck per bridge edge -- an edge whose both ends are gene-kind
-    # AND both are bridge/middle genes (neither is the chain's disease1 or disease2 endpoint).
-    # See module docstring's "Edge-level literature validation" note for the scoping rationale
-    # and its real consequence for short chains (zero checks is expected, not a bug).
     bridge_genes = set(roles["middle"])
     checks: List[EdgeLiteratureCheck] = []
     for edge in chain.edges:
@@ -252,11 +167,11 @@ def _edge_literature_checks(chain: ChainCandidate, roles: Dict[str, List[str]], 
     return checks
 
 
+# Input: a gene, a disease, a GWAS client and whether the gene was independent of Stage 1's selection. Output: its
+# EndpointCrossDbCheck (also used for bridge genes).
 def _gwas_check(gene: str, disease: str, gwas_client, independent_of_selection: bool) -> EndpointCrossDbCheck:
-    # Input: a gene, a disease, a GWAS client. Output: its EndpointCrossDbCheck (also used for bridge genes).
     associations = gwas_client.get_gene_disease_associations(gene, disease)
-    # getattr with a default: only GWASCatalogClient/StubGWASCatalogClient are known to define this (see
-    # crossdb_client.py's bug-fix #3 note); don't hard-fail against some other future client that doesn't.
+    # getattr with a default so a client without this attribute does not fail the check.
     return EndpointCrossDbCheck(
         gene_symbol=gene,
         disease_name=disease,
@@ -266,6 +181,8 @@ def _gwas_check(gene: str, disease: str, gwas_client, independent_of_selection: 
     )
 
 
+# Run all Stage 3 checks on one chain. Input: the chain, both disease names and the GTEx, GWAS and PubMed clients.
+# Output: its Stage3ConfirmationResult.
 def _confirm_chain(
     chain: ChainCandidate,
     disease1: str,
@@ -274,10 +191,6 @@ def _confirm_chain(
     gwas_client,
     pubmed_client,
 ) -> Stage3ConfirmationResult:
-    # Input: one chain + both disease names + clients. Output: its Stage3ConfirmationResult
-    # (tissue checks for every gene, cross-db checks for the two endpoint genes only, edge
-    # literature checks for bridge edges only; metabolite middle hops are skipped for all three
-    # and listed in chain_metabolites instead).
     roles = _chain_gene_roles(chain)
     tissue_checks: List[TissueExpressionResult] = []
 
@@ -294,7 +207,7 @@ def _confirm_chain(
     for gene, disease in ((roles["disease1_endpoint"], disease1), (roles["disease2_endpoint"], disease2)):
         endpoint_checks.append(_gwas_check(gene, disease, gwas_client, independent_of_selection=False))
 
-    # Bridge genes (never ranked by Open Targets) are checked against BOTH diseases.
+    # Bridge genes (never ranked by Open Targets) are checked against both diseases.
     bridge_gwas_checks: List[EndpointCrossDbCheck] = []
     for gene in roles["middle"]:
         for disease in (disease1, disease2):
@@ -311,14 +224,19 @@ def _confirm_chain(
     )
 
 
-DEFAULT_NULL_SIZE = 30  # ~6.5 s per live GWAS check x 2 diseases -> roughly 6-7 minutes per pair
+DEFAULT_NULL_SIZE = 30
 NULL_SEED = 20261018
 
 
+# Input: hits and total. Output: hits / total, or None if the total is zero.
 def _rate(hits: int, n: int) -> Optional[float]:
     return (hits / n) if n else None
 
 
+# Measure how often random genes pass the same checks. Input: the pool of possible bridge genes, genes to exclude, both
+# disease names, the GTEx and GWAS clients, sample size and seed. Output: the sampled genes and the hit rates for tissue
+# expression and for GWAS hits per disease; checks that gave up after rate limiting are counted separately, not as
+# negatives.
 def compute_null_baseline(
     pool: List[str],
     exclude: List[str],
@@ -329,11 +247,6 @@ def compute_null_baseline(
     size: int = DEFAULT_NULL_SIZE,
     seed: int = NULL_SEED,
 ) -> dict:
-    # Input: the pool of genes the BFS could have used as bridges, genes to exclude (the chains' own genes), both
-    # disease names, clients, sample size and RNG seed. Output: a dict with the sampled genes and the hit rates a
-    # random bridge-like gene gets: tissue expression across the same tissues bridge genes are checked in (both
-    # diseases' tissues), and GWAS Catalog hits for each disease. Checks that gave up after rate limiting are left out
-    # of the denominators (inconclusive, not negative) and counted separately.
     candidates = sorted(set(pool) - set(exclude))
     sample = random.Random(seed).sample(candidates, min(size, len(candidates)))
     tissues = list(dict.fromkeys(DISEASE_RELEVANT_TISSUES.get(disease1, []) + DISEASE_RELEVANT_TISSUES.get(disease2, [])))
@@ -371,9 +284,9 @@ def compute_null_baseline(
     }
 
 
+# Input: all chains' results and both disease names. Output: the same rates for the chains' distinct bridge genes (a
+# gene shared by several chains counts once), to read against the baseline.
 def _chain_bridge_summary(results: List[Stage3ConfirmationResult], disease1: str, disease2: str) -> dict:
-    # Input: all chains' results. Output: the same rates for the chains' own DISTINCT bridge genes, so they can be read
-    # side by side with the baseline (a gene shared by several chains counts once).
     bridge_genes = sorted({c.gene_symbol for r in results for c in r.bridge_gwas_checks})
     tissue_by_gene_tissue: Dict[Tuple[str, str], Optional[bool]] = {}
     for r in results:
@@ -403,6 +316,9 @@ def _chain_bridge_summary(results: List[Stage3ConfirmationResult], disease1: str
     }
 
 
+# Run Stage 3. Input: the Stage 1 and Stage 2 results, optional clients (defaults to the real ones; tests pass stubs)
+# and the null-baseline size (0 skips it). Output: one Stage3ConfirmationResult per chain in Stage 2's order, empty if
+# Stage 2 found no chain.
 def run_stage3_confirmation(
     stage1_result: Stage1DiscoveryResult,
     stage2_result: Stage2JudgingResult,
@@ -411,9 +327,6 @@ def run_stage3_confirmation(
     pubmed_client: Optional[object] = None,
     null_baseline_size: int = DEFAULT_NULL_SIZE,
 ) -> List[Stage3ConfirmationResult]:
-    # Input: Stage 1 + Stage 2 results, optional clients (all default to real clients;
-    # pass Stub* clients in tests), and null_baseline_size (random genes for the baseline; 0 = skip it).
-    # Output: one Stage3ConfirmationResult per chain, same order. [] if Stage 2 found no chain.
     if not stage2_result.chains:
         return []
 
@@ -437,6 +350,7 @@ def run_stage3_confirmation(
     return results
 
 
+# Command-line entry point: run Stages 1-3 for a disease pair and print the Stage 3 results as JSON.
 def _cli():
     parser = argparse.ArgumentParser(description="Run Stages 1-3 for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
@@ -496,11 +410,10 @@ def _cli():
     )
 
 
+# PubMed stand-in that returns no citations, used by --no-edge-literature.
 class _NoOpPubMedClient:
-    """Used only by `--no-edge-literature` above -- returns no citations for any edge, without
-    making a real PubMed request, so the literature-check step is a true no-op rather than a
-    slower search that's discarded."""
 
+    # Input: two gene symbols and a result limit. Output: an empty list.
     def search_edge_citations(self, gene_a: str, gene_b: str, retmax: int = 3):
         return []
 

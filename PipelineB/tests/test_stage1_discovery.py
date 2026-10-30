@@ -1,3 +1,5 @@
+"""Tests for Stage 1 Discovery (PipelineB/stage1_discovery.py) with stub clients."""
+
 from PipelineB.stage1_discovery import Stage1DiscoveryResult, run_stage1_discovery
 from PipelineB.opentargets_client import GeneAssociation, StubOpenTargetsClient
 from PipelineB.pubmed_client import Citation, StubPubMedClient
@@ -19,6 +21,7 @@ DISEASE2_TARGETS = [
 ]
 
 
+# Build stub Open Targets and PubMed clients for the two diseases.
 def _build_stub_clients():
     ot_client = StubOpenTargetsClient(
         disease_to_efo={DISEASE1: "EFO_T2DM", DISEASE2: "EFO_AD"},
@@ -34,6 +37,7 @@ def _build_stub_clients():
     return ot_client, pubmed_client
 
 
+# Run stage1 discovery end to end with stubs.
 def test_run_stage1_discovery_end_to_end_with_stubs():
     ot_client, pubmed_client = _build_stub_clients()
     result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
@@ -42,6 +46,7 @@ def test_run_stage1_discovery_end_to_end_with_stubs():
     assert result.disease2_efo_id == "EFO_AD"
 
 
+# Run stage1 discovery filters low score targets.
 def test_run_stage1_discovery_filters_low_score_targets():
     ot_client, pubmed_client = _build_stub_clients()
     result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
@@ -54,6 +59,7 @@ def test_run_stage1_discovery_filters_low_score_targets():
     assert "APP" in d2_symbols
 
 
+# Run stage1 discovery cites genes from both diseases.
 def test_run_stage1_discovery_cites_genes_from_both_diseases():
     ot_client, pubmed_client = _build_stub_clients()
     result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
@@ -62,12 +68,12 @@ def test_run_stage1_discovery_cites_genes_from_both_diseases():
     assert result.citations["APP"][0].pmid == "333"
 
 
+# Run stage1 discovery searches shared gene against both diseases.
 def test_run_stage1_discovery_searches_shared_gene_against_both_diseases():
     ot_client, pubmed_client = _build_stub_clients()
     result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
 
-    # INSR is in BOTH diseases' top-N, so (changed 2026-10-15; it used to be skipped on the
-    # disease-2 side) it is searched once against each disease.
+    # INSR is in both diseases' top-N, so it is searched once against each disease.
     insr_calls = [c for c in pubmed_client.calls if c[0] == "INSR"]
     assert [c[1] for c in insr_calls] == [DISEASE1, DISEASE2]
 
@@ -81,6 +87,7 @@ def test_run_stage1_discovery_searches_shared_gene_against_both_diseases():
     assert d2_searched == ["APP", "INSR"]
 
 
+# Run stage1 discovery to dict is JSON serializable.
 def test_run_stage1_discovery_to_dict_is_json_serializable():
     import json
     ot_client, pubmed_client = _build_stub_clients()
@@ -88,6 +95,7 @@ def test_run_stage1_discovery_to_dict_is_json_serializable():
     json.dumps(result.to_dict())
 
 
+# Run stage1 discovery tags every citation with its search.
 def test_run_stage1_discovery_tags_every_citation_with_its_search():
     ot_client, pubmed_client = _build_stub_clients()
     result = run_stage1_discovery(DISEASE1, DISEASE2, ot_client=ot_client, pubmed_client=pubmed_client, min_score=0.1)
@@ -104,6 +112,7 @@ def test_run_stage1_discovery_tags_every_citation_with_its_search():
     assert result.citations["APP"][0].disease_name == DISEASE2
 
 
+# Run stage1 discovery records every search including zero hit ones.
 def test_run_stage1_discovery_records_every_search_including_zero_hit_ones():
     # A gene with no PubMed hits leaves no Citation behind, so without citation_searches there
     # would be no record that it was searched at all.
@@ -136,8 +145,9 @@ def test_run_stage1_discovery_records_every_search_including_zero_hit_ones():
     assert len(result.citation_searches) == 5
 
 
+# Stage1 result without citation searches still works.
 def test_stage1_result_without_citation_searches_still_works():
-    # Results built by hand, or loaded from a run saved before citation_searches existed, omit it.
+    # Results built by hand, or loaded from older saved runs, omit citation_searches.
     result = Stage1DiscoveryResult(
         disease1=DISEASE1, disease2=DISEASE2, disease1_efo_id="EFO_T2DM", disease2_efo_id="EFO_AD",
         disease1_targets=[], disease2_targets=[], citations={"A": [Citation("1", "old-style, no provenance")]},
@@ -148,17 +158,23 @@ def test_stage1_result_without_citation_searches_still_works():
     assert d["citations"]["A"][0]["pmid"] == "1"
 
 
+# Result records data versions and never fails on a version lookup error.
 def test_result_records_data_versions_and_never_fails_on_a_version_lookup_error():
     from PipelineB.stage1_discovery import _data_versions
 
+    # Open Targets stand-in whose version lookup succeeds.
     class _Good:
+        # Output: a fixed version dict.
         def get_data_version(self):
             return {"data_version": "26.09"}
 
+    # Open Targets stand-in whose version lookup fails.
     class _Bad:
+        # Raise to simulate a failed lookup.
         def get_data_version(self):
             raise RuntimeError("down")
 
+    # PubMed stand-in that only carries a sort order.
     class _Pubmed:
         sort = "relevance"
 
@@ -170,8 +186,8 @@ def test_result_records_data_versions_and_never_fails_on_a_version_lookup_error(
     assert "open_targets" not in _data_versions(object(), object())
 
 
+# Stage1 result round trips through to dict and from dict.
 def test_stage1_result_round_trips_through_to_dict_and_from_dict():
-    # added 2026-10-18 so Stages 2-4 can be re-run on a saved Stage 1 output (scripts/run_all --reuse-saved-stage1)
     from PipelineB.stage1_discovery import Stage1DiscoveryResult
     from PipelineB.opentargets_client import GeneAssociation
     from PipelineB.pubmed_client import Citation

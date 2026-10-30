@@ -1,3 +1,5 @@
+"""Tests for Stage 4 (PipelineB/stage4_cohort_check.py): risk ratio, odds ratio and p-value from cohort counts."""
+
 import pytest
 
 from PipelineB.stage4_cohort_check import run_stage4_cohort_check
@@ -7,6 +9,7 @@ DISEASE1 = "Type 2 Diabetes Mellitus"
 DISEASE2 = "Alzheimer's Disease"
 
 
+# Relative risk computed correctly from stub cohort sets.
 def test_relative_risk_computed_correctly_from_stub_cohort_sets():
     # 100 total patients; 40 have T2DM; 20 have AD; 10 have both.
     # base AD rate = 20/100 = 0.2; AD rate within T2DM cohort = 10/40 = 0.25
@@ -29,6 +32,7 @@ def test_relative_risk_computed_correctly_from_stub_cohort_sets():
     assert result.relative_risk == pytest.approx(1.5)
 
 
+# Zero disease2 base rate returns none relative risk not a crash.
 def test_zero_disease2_base_rate_returns_none_relative_risk_not_a_crash():
     all_ids = {"1", "2", "3"}
     stub = StubMimicClient({"__all__": all_ids, DISEASE1: {"1"}, DISEASE2: set()})
@@ -42,12 +46,14 @@ def test_zero_disease2_base_rate_returns_none_relative_risk_not_a_crash():
     assert result.disease2_rate_in_disease1_cohort == 0.0
 
 
+# Missing icd mapping raises value error.
 def test_missing_icd_mapping_raises_value_error():
     stub = StubMimicClient({"__all__": set()})
     with pytest.raises(ValueError, match="No ICD prefix mapping"):
         run_stage4_cohort_check("Some Unmapped Disease", DISEASE2, mimic_client=stub)
 
 
+# To dict is JSON serializable.
 def test_to_dict_is_json_serializable():
     import json
 
@@ -56,8 +62,9 @@ def test_to_dict_is_json_serializable():
     json.dumps(result.to_dict())
 
 
+# Real MIMIC counts reproduce the hand computed statistics.
 def test_real_mimic_counts_reproduce_the_hand_computed_statistics():
-    # Counts from the 2026-10-18 real run (T2DM -> AD); values cross-checked against scipy's chi2_contingency.
+    # Counts from a real T2DM -> AD run; values cross-checked against scipy's chi2_contingency.
     from PipelineB.stage4_cohort_check import _two_by_two_stats
 
     s = _two_by_two_stats(n_total=223291, n1=44005, n2=3234, n_both=841)
@@ -72,6 +79,7 @@ def test_real_mimic_counts_reproduce_the_hand_computed_statistics():
     assert c["odds_ratio"] == pytest.approx(4.074, abs=1e-3)
 
 
+# Null association gives rr one and p one.
 def test_null_association_gives_rr_one_and_p_one():
     from PipelineB.stage4_cohort_check import _two_by_two_stats
 
@@ -81,6 +89,7 @@ def test_null_association_gives_rr_one_and_p_one():
     assert s["p_value"] == pytest.approx(1.0)
 
 
+# Inconsistent counts yield no statistics.
 def test_inconsistent_counts_yield_no_statistics():
     from PipelineB.stage4_cohort_check import _two_by_two_stats
 

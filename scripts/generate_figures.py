@@ -1,13 +1,10 @@
-"""
-Generate thesis figures directly from real saved pipeline outputs.
+"""Generate the thesis figures from real saved pipeline outputs.
 
 Reads: outputs/pipeline_b_t2dm_ad{FIG_RUN_SUFFIX}.json, outputs/pipeline_b_t2dm_cad{FIG_RUN_SUFFIX}.json,
        outputs/model_comparison/*.json, outputs/edge_literature_recall/t2dm_cad.json
-Writes: docs/figures/*.png  (also copied to ../Thesis/figures/)
+Writes: docs/figures/*.png (also copied to ../Thesis/figures/)
 
-No numbers in this script are invented -- every value plotted is read directly
-from the real JSON files already on disk. If a file is missing, this script
-fails loudly rather than filling in a placeholder.
+Every plotted value is read from the saved JSON files; a missing file fails loudly instead of being replaced by a placeholder.
 """
 import json
 import os
@@ -23,7 +20,7 @@ OUT_DIR = os.path.join(HERE, "docs", "figures")
 THESIS_FIG_DIR = os.path.join(HERE, "..", "Thesis", "figures")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- palette (fixed categorical order; see claude dataviz skill) ---
+# Palette (fixed categorical order).
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
 AQUA = "#1baf7a"
@@ -47,20 +44,20 @@ plt.rcParams.update({
     "savefig.facecolor": "white",
 })
 
+# Input: a path relative to this script's folder. Output: the parsed JSON.
 def load(path):
     with open(os.path.join(HERE, path)) as f:
         return json.load(f)
 
 
+# Input: a chain dict. Output: its genes joined by " -> ".
 def gene_chain_str(chain):
     edges = chain["edges"]
     genes = [edges[0]["source_gene"]] + [e["target_gene"] for e in edges]
     return " -> ".join(genes)
 
 
-# =====================================================================
-# Figure 1: Multi-model robustness -- endorsement rate + winning Elo
-# =====================================================================
+# Figure 1: multi-model robustness (endorsement rate and winning Elo).
 MODEL_COLORS = {"gemma4:12b": BLUE, "qwen3:14b": ORANGE, "deepseek-r1:14b": AQUA}
 MODEL_ORDER = ["gemma4:12b", "qwen3:14b", "deepseek-r1:14b"]
 MODEL_LABELS = {"gemma4:12b": "gemma4:12b\n(default)", "qwen3:14b": "qwen3:14b", "deepseek-r1:14b": "deepseek-r1:14b"}
@@ -135,11 +132,9 @@ fig.savefig(os.path.join(OUT_DIR, "fig_multimodel_robustness.png"), dpi=200, bbo
 plt.close(fig)
 print("wrote fig_multimodel_robustness.png")
 
-# =====================================================================
-# Figure 2: GTEx tissue-expression confirmation rate per endorsed chain
-# =====================================================================
-# Which saved Pipeline B run to plot: FIG_RUN_SUFFIX="_nometab" reads outputs/pipeline_b_<pair>_nometab.json
-# (the run reported in the thesis); empty (default) reads the latest main run.
+# Figure 2: GTEx tissue-expression confirmation rate per endorsed chain.
+# Which saved run to plot: FIG_RUN_SUFFIX="_nometab" reads outputs/pipeline_b_<pair>_nometab.json (the run used for the
+# reported results); empty reads the latest main run.
 RUN_SUFFIX = os.environ.get("FIG_RUN_SUFFIX", "")
 ad = load(f"outputs/pipeline_b_t2dm_ad{RUN_SUFFIX}.json")
 cad = load(f"outputs/pipeline_b_t2dm_cad{RUN_SUFFIX}.json")
@@ -172,15 +167,14 @@ fig.savefig(os.path.join(OUT_DIR, "fig_gtex_coverage.png"), dpi=200, bbox_inches
 plt.close(fig)
 print("wrote fig_gtex_coverage.png")
 
-# =====================================================================
-# Figure 3: MIMIC-IV cohort rate vs. general-population base rate
-# =====================================================================
+# Figure 3: MIMIC-IV cohort rate vs. general-population base rate.
 ad4 = ad["stage4"]
 cad4 = cad["stage4"]
 groups = ["T2DM → AD", "T2DM → CAD"]
 from PipelineB.stage4_cohort_check import _two_by_two_stats  # recompute from counts so old saved results work too
 
 
+# Input: a Stage 4 result dict. Output: the disease-2 rate among patients without disease 1.
 def _unexposed_rate(a4):
     return (a4["n_disease2_patients"] - a4["n_both_patients"]) / (a4["n_total_patients"] - a4["n_disease1_patients"])
 
@@ -223,10 +217,8 @@ for fn in ["fig_multimodel_robustness.png", "fig_gtex_coverage.png", "fig_mimic_
     shutil.copy(os.path.join(OUT_DIR, fn), os.path.join(THESIS_FIG_DIR, fn))
 print("copied figures to Thesis/figures/")
 
-# =====================================================================
-# Figure 4: Gold-standard structural coverage (metric 8) -- real KEGG
-# gene sets, per endorsed chain. See scripts/gold_standard_recall.py.
-# =====================================================================
+# Figure 4: gold-standard structural coverage (real KEGG gene sets, per endorsed chain); see
+# scripts/gold_standard_recall.py.
 gs_ad = load("outputs/gold_standard_recall/t2dm_ad.json")
 gs_cad = load("outputs/gold_standard_recall/t2dm_cad.json")
 

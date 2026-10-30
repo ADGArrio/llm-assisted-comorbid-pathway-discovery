@@ -1,36 +1,45 @@
+"""Tests for the OmniPath client (PipelineB/omnipath_client.py) with a stubbed HTTP layer."""
+
 from PipelineB.omnipath_client import Interaction, OmniPathClient, StubOmniPathClient, _interaction_type, _synthesize_edge_id
 
 
+# Interaction type stimulation.
 def test_interaction_type_stimulation():
     assert _interaction_type("1", "0") == "activates"
 
 
+# Interaction type inhibition.
 def test_interaction_type_inhibition():
     assert _interaction_type("0", "1") == "inhibits"
 
 
+# Interaction type unknown when neither flag set.
 def test_interaction_type_unknown_when_neither_flag_set():
     assert _interaction_type("0", "0") == "unknown"
 
 
+# Conflicting flags without consensus are unknown.
 def test_conflicting_flags_without_consensus_are_unknown():
-    # Changed 2026-10-18: a tie used to resolve to "activates" (wrong for 647 of the 1,418 core-network ties).
+    # A tie (both direction flags set) is resolved only by OmniPath's consensus columns, otherwise it is "unknown".
     assert _interaction_type("1", "1") == "unknown"
     assert _interaction_type("True", "True", "False", "False") == "unknown"
     assert _interaction_type("True", "True", "True", "True") == "unknown"
 
 
+# Conflicting flags are resolved by OmniPath consensus.
 def test_conflicting_flags_are_resolved_by_omnipath_consensus():
     assert _interaction_type("True", "True", "True", "False") == "activates"  # e.g. INSR -> IRS2
     assert _interaction_type("True", "True", "False", "True") == "inhibits"
 
 
+# Consensus never overrides a single flag.
 def test_consensus_never_overrides_a_single_flag():
     # Consensus is a tie-breaker only: a clear single flag stays as the resource data says.
     assert _interaction_type("True", "False", "False", "True") == "activates"
     assert _interaction_type("False", "False", "True", "False") == "unknown"
 
 
+# Parse reads curation effort and source count and tie consensus.
 def test_parse_reads_curation_effort_and_source_count_and_tie_consensus():
     text = (
         "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition"
@@ -44,15 +53,19 @@ def test_parse_reads_curation_effort_and_source_count_and_tie_consensus():
     assert first.to_dict()["curation_effort"] == 31 and first.to_dict()["n_sources"] == 3
 
 
+# Query asks OmniPath for evidence fields.
 def test_query_asks_omnipath_for_evidence_fields(monkeypatch):
     seen = {}
 
+    # Minimal stand-in for a requests.Response.
     class _Resp:
         text = ""
 
+        # Mimic requests.Response.raise_for_status.
         def raise_for_status(self):
             pass
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params=None, timeout=None):
         seen.update(params)
         return _Resp()
@@ -62,10 +75,12 @@ def test_query_asks_omnipath_for_evidence_fields(monkeypatch):
     assert seen["fields"] == "sources,curation_effort"
 
 
+# Synthesize edge id is deterministic.
 def test_synthesize_edge_id_is_deterministic():
     assert _synthesize_edge_id("P12345", "Q99999") == "P12345->Q99999"
 
 
+# Parse response skips undirected edges.
 def test_parse_response_skips_undirected_edges():
     tsv = (
         "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n"
@@ -80,17 +95,8 @@ def test_parse_response_skips_undirected_edges():
     assert interactions[0].interaction_type == "activates"
 
 
+# Parse response keeps complex nodes on either end.
 def test_parse_response_keeps_complex_nodes_on_either_end():
-    """Regression test locking in a deliberate decision, 2026-09-14 (see the
-    module docstring's "Complex nodes are kept" note): a filter dropping any
-    interaction touching an OmniPath multi-protein COMPLEX (rendered as a
-    long underscore-joined pseudo gene symbol, e.g. the mTORC1 complex) was
-    tried and then explicitly reverted -- complexes are real, important
-    biology, and skipping them isn't a call to make unilaterally; the
-    unresolved tradeoff (real mechanism vs. unscorable/unconfirmable) is
-    tracked in claude/open_issues_for_committee.md instead. This test exists
-    so a future edit can't silently reintroduce that filter without it being
-    a deliberate, visible change."""
     tsv = (
         "source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n"
         "P1\tP2\tGENEA\tGENEB\t1\t1\t0\n"
@@ -104,29 +110,30 @@ def test_parse_response_keeps_complex_nodes_on_either_end():
     assert {i.target_gene for i in interactions} == {"GENEB", "GENEC", "COMPLEXNAME2"}
 
 
+# Parse response handles empty text.
 def test_parse_response_handles_empty_text():
     client = OmniPathClient()
     assert client._parse_response("") == []
     assert client._parse_response("   ") == []
 
 
+# Get outgoing interactions batches large gene lists.
 def test_get_outgoing_interactions_batches_large_gene_lists(monkeypatch):
-    """Regression test, added 2026-09-14 alongside raising stage2_judging.py's
-    _MAX_FRONTIER_SIZE from 300 to 3000: a single request with thousands of
-    comma-joined gene symbols risks a URL-length failure. get_outgoing_interactions
-    must split a large gene list into multiple _QUERY_BATCH_SIZE-sized requests
-    and concatenate their results, transparently to the caller."""
     from PipelineB.omnipath_client import _QUERY_BATCH_SIZE
 
     calls = []
 
+    # Minimal stand-in for a requests.Response.
     class FakeResponse:
+        # Store the canned data.
         def __init__(self, text):
             self.text = text
 
+        # Mimic requests.Response.raise_for_status.
         def raise_for_status(self):
             pass
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         batch = params["sources"].split(",")
         calls.append(batch)
@@ -148,6 +155,7 @@ def test_get_outgoing_interactions_batches_large_gene_lists(monkeypatch):
     assert len(interactions) == total_genes
 
 
+# Stub returns outgoing edges including targets outside the source set.
 def test_stub_returns_outgoing_edges_including_targets_outside_the_source_set():
     interactions = [
         Interaction("A", "P1", "B", "P2", "activates", "P1->P2"),
@@ -164,17 +172,21 @@ def test_stub_returns_outgoing_edges_including_targets_outside_the_source_set():
     assert client.calls == [["A"]]
 
 
-# --- retry / backoff (added 2026-10-15) ---
+# --- retry and backoff ---
 
+# Build a minimal valid response body with one directed edge.
 def _ok_tsv():
     return ("source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\n"
             "PA\tPX\tA\tX\tTrue\tTrue\tFalse")
 
 
+# Minimal stand-in for a requests.Response.
 class _Resp:
+    # Store the canned data.
     def __init__(self, text="", status=200):
         self.text, self.status_code = text, status
 
+    # Mimic requests.Response.raise_for_status.
     def raise_for_status(self):
         if self.status_code >= 400:
             import requests
@@ -183,10 +195,12 @@ class _Resp:
             raise err
 
 
+# Connection error is retried then succeeds.
 def test_connection_error_is_retried_then_succeeds(monkeypatch):
     import requests
     calls, sleeps = [], []
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         calls.append(1)
         if len(calls) < 3:
@@ -199,6 +213,7 @@ def test_connection_error_is_retried_then_succeeds(monkeypatch):
     assert len(calls) == 3 and sleeps == [1.0, 2.0] and out[0].target_gene == "X"
 
 
+# 503 is retried but a 400 is not.
 def test_503_is_retried_but_a_400_is_not(monkeypatch):
     import pytest
     import requests
@@ -214,11 +229,13 @@ def test_503_is_retried_but_a_400_is_not(monkeypatch):
     assert len(calls) == 1  # a 400 means our request is wrong; retrying cannot help
 
 
+# Gives up after the last attempt and raises instead of returning empty.
 def test_gives_up_after_the_last_attempt_and_raises_instead_of_returning_empty(monkeypatch):
     import pytest
     import requests
     calls = []
 
+    # Stand-in for GET that always raises a connection timeout.
     def always_down(url, params, timeout):
         calls.append(1)
         raise requests.exceptions.Timeout("slow")

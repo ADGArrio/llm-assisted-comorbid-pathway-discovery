@@ -1,54 +1,18 @@
-"""
-Edge-literature-check RECALL metric -- Task 3 from the user's 2026-10-04 request ("create a
-python file that pulls the same literature the edge verification pipeline pulls for our diseases
-and compare the words that are picked up by the pipeline vs the actual words in the literature
-where the interactions are referenced... a gene/interaction recall fraction"). See
-claude/possible_metrics.md for how this fits alongside the pipeline's other metrics.
+"""Edge-literature-check recall and precision: compares the production edge-literature check against an independent, stricter check.
 
-Why this is a separate script and a separate metric, not just re-reading the pipeline's own
-`supported` flag: the production edge-literature check
-(PipelineB/stage3_confirmation.py's `_edge_literature_checks`, backed by
-PipelineB/pubmed_client.py's `search_edge_citations`/`_check_edge_support`) is deliberately
-frugal -- retmax=3 papers per edge, and "supported" means only "both gene symbols appear together
-in the same retrieved paragraph/abstract," with no check that the surrounding text actually
-DESCRIBES an interaction between them. pubmed_client.py's own EdgeCitation docstring says this
-plainly: "co-mention in the same paper isn't automatically evidence of the specific claimed
-edge." That's a real, already-acknowledged limitation -- this script measures it directly with an
-independent check, instead of just asserting it in prose.
+For every bridge edge already checked in a saved run (outputs/pipeline_b_<pair>.json): (1) read the pipeline's own verdict (`supported`);
+(2) re-pull a larger pool of the same literature through PubMedClient.search_edge_citations; (3) scan every sentence for one naming both
+genes and containing a word from a small hand-written interaction vocabulary; (4) call the edge gold-positive if any such sentence exists.
+Recall = (gold-positive and supported) / gold-positive. Precision = (gold-positive and supported) / supported.
 
-What this does, concretely, for every real bridge edge already checked in a real saved pipeline
-run (outputs/pipeline_b_t2dm_ad.json, outputs/pipeline_b_t2dm_cad.json -- both already exist from
-real live runs):
-  1. Reads the pipeline's own real verdict for that edge (`supported: true/false`) straight out
-     of the saved JSON -- the actual EdgeLiteratureCheck a real run already produced, not
-     recomputed here.
-  2. Independently re-pulls a LARGER pool of the SAME literature, via the exact same method and
-     the exact same NCBI endpoints (PubMedClient.search_edge_citations) -- just RECALL_POOL_SIZE
-     papers instead of the production check's 3 -- for the same two gene symbols.
-  3. Scans every sentence of every retrieved passage/abstract in that larger pool for a sentence
-     that names both gene symbols AND contains at least one word from a small, hand-written
-     interaction vocabulary (INTERACTION_VERBS below) -- a simple, inspectable rule, written
-     independently of anything inside the pipeline itself, not an LLM call.
-  4. Calls an edge "gold-positive" if step 3 found at least one such sentence anywhere in the
-     larger pool -- this script's own independent ground truth.
-  5. RECALL = (edges gold-positive AND pipeline-supported) / (edges gold-positive) -- of the
-     edges where a broader, verb-aware search finds real interaction-describing language, what
-     fraction did the production (narrower, verb-blind) check actually catch.
-     PRECISION = (edges gold-positive AND pipeline-supported) / (edges pipeline-supported) -- the
-     mirror question: of the edges the pipeline flagged as supported, how many hold up against
-     the stricter, independent check (does mere co-mention over-count real support).
-
-MUST be run on the user's own machine, not through the Claude device bridge or cloud sandbox --
-same constraint as scripts/compare_llm_models.py: both the E-utilities and BioC-PMC endpoints are
-blocked from that network.
+Must be run on your own machine (the E-utilities and BioC-PMC endpoints are blocked from the cloud sandbox and the device bridge).
 
 Usage:
     python3 -m scripts.edge_literature_recall --pair t2dm_cad
     python3 -m scripts.edge_literature_recall --pair t2dm_ad
     python3 -m scripts.edge_literature_recall            # default: both pairs
 
-Output: outputs/edge_literature_recall/{pair_id}.json (per-edge detail + the recall/precision
-summary) plus a printed summary table.
+Output: outputs/edge_literature_recall/{pair_id}.json (per-edge detail and the summary) plus a printed summary table.
 """
 import argparse
 import json
@@ -62,17 +26,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 RESULT_DIR = OUTPUTS_DIR / "edge_literature_recall"
 
-# The production edge-literature check uses retmax=3 (PipelineB/pubmed_client.py's
-# search_edge_citations default). This script deliberately pulls a bigger pool of the same
-# literature to build an independent gold standard -- a real edge can have supporting language in
-# its 5th or 10th co-mentioning paper even when its top-3 don't mention an interaction explicitly.
+# The production check uses retmax=3; this script pulls a larger pool of the same literature to build an independent
+# gold standard.
 RECALL_POOL_SIZE = 15
 
-# Hand-written, deliberately simple interaction vocabulary -- a sentence naming both genes AND
-# containing one of these word-stems is this script's own, independent definition of "the text is
-# actually describing an interaction," not just mentioning both gene names. Not exhaustive by
-# design; chosen to cover OmniPath's own interaction_type vocabulary (activates/inhibits/unknown)
-# plus the common verbs real papers use for the same biological relationships.
+# Hand-written interaction vocabulary: a sentence naming both genes and containing one of these word stems counts as
+# describing an interaction. Not exhaustive.
 INTERACTION_VERBS = [
     "activat", "inhibit", "phosphorylat", "dephosphorylat", "bind", "interact",
     "regulat", "promot", "suppress", "induc", "modulat", "increas", "decreas",
@@ -83,36 +42,30 @@ INTERACTION_VERBS = [
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
+# Input: a gene symbol. Output: a case-insensitive, word-boundary regex for it.
 def _gene_pattern(gene: str) -> "re.Pattern":
-    # Same word-boundary approach as pubmed_client.py's own _gene_pattern -- avoids a bare
-    # substring match wrongly hitting an unrelated longer token.
     return re.compile(rf"\b{re.escape(gene)}\b", re.IGNORECASE)
 
 
+# Input: one sentence and two gene symbols. Output: True if both symbols and at least one interaction word stem appear
+# in the sentence.
 def _sentence_has_interaction_language(sentence: str, gene_a: str, gene_b: str) -> bool:
-    # Input: one sentence, the two gene symbols. Output: whether this sentence is this script's
-    # own definition of "describes an interaction" -- both gene symbols present AND at least one
-    # interaction-vocabulary word-stem present, all within the same sentence.
     if not (_gene_pattern(gene_a).search(sentence) and _gene_pattern(gene_b).search(sentence)):
         return False
     lowered = sentence.lower()
     return any(verb in lowered for verb in INTERACTION_VERBS)
 
 
+# Re-pull a larger literature pool with the production method. Input: a PubMed client, two gene symbols and the pool
+# size. Output: every retrieved passage (full-text paragraph if a PMC copy exists, else the abstract).
 def _passages_for_pair(client: PubMedClient, gene_a: str, gene_b: str, retmax: int) -> List[str]:
-    # Re-pulls a larger pool via the exact same method/endpoints the production check uses, and
-    # returns every real passage of text actually retrieved (full-text paragraph when a PMC
-    # open-access version exists, else the abstract) -- the raw text this script's own
-    # independent sentence scan runs over.
     edge_citations = client.search_edge_citations(gene_a, gene_b, retmax=retmax)
     return [c.matched_text for c in edge_citations if c.matched_text]
 
 
+# Independent ground truth for one edge. Input: a PubMed client and two gene symbols. Output: the verdict plus the first
+# supporting sentence found.
 def gold_positive(client: PubMedClient, gene_a: str, gene_b: str) -> dict:
-    # Independent ground truth for one edge: pulls a larger literature pool and scans every
-    # sentence of every retrieved passage for real interaction-describing language naming both
-    # genes. Returns the verdict plus the first supporting sentence found, kept for inspection --
-    # a recall number alone isn't very checkable; the actual sentence is.
     passages = _passages_for_pair(client, gene_a, gene_b, RECALL_POOL_SIZE)
     for passage in passages:
         for sentence in _SENTENCE_SPLIT_RE.split(passage):
@@ -125,11 +78,9 @@ def gold_positive(client: PubMedClient, gene_a: str, gene_b: str) -> dict:
     return {"gold_positive": False, "evidence_sentence": None, "passages_scanned": len(passages)}
 
 
+# Read the edge_literature_checks already produced by a saved run. Input: pair id. Output: the checks; a missing file or
+# key gives an empty list.
 def load_pipeline_edge_checks(pair_id: str) -> List[dict]:
-    # Reads the real, already-run edge_literature_checks straight out of a saved pipeline_b
-    # output -- the pipeline's own real verdict for each bridge edge from an actual live run, not
-    # re-derived here. Missing file / missing key both degrade to "nothing to check" rather than
-    # crashing, since an older saved run predating this feature simply has no such checks.
     path = OUTPUTS_DIR / f"pipeline_b_{pair_id}.json"
     if not path.exists():
         raise FileNotFoundError(
@@ -150,11 +101,11 @@ def load_pipeline_edge_checks(pair_id: str) -> List[dict]:
     return checks
 
 
+# Input: pair id and a PubMed client. Output: the per-edge detail and the recall/precision summary.
 def run_for_pair(pair_id: str, client: PubMedClient) -> dict:
     checks = load_pipeline_edge_checks(pair_id)
-    # De-duplicate -- the same bridge edge can appear in more than one candidate chain for the
-    # same disease pair; the pipeline's own verdict for a given gene pair doesn't depend on which
-    # chain it showed up in, so only check it once.
+    # Check each bridge edge once: the same edge can appear in several chains of a pair, and its verdict does not depend
+    # on the chain.
     deduped = {}
     for c in checks:
         key = tuple(sorted((c["gene_a"], c["gene_b"])))
@@ -189,6 +140,7 @@ def run_for_pair(pair_id: str, client: PubMedClient) -> dict:
     }
 
 
+# Command-line entry point: run the recall check for one pair or both and save the results.
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pair", choices=["t2dm_ad", "t2dm_cad", "both"], default="both")

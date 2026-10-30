@@ -8,10 +8,9 @@
     python -m scripts.run_all --reuse-saved-stage1 --no-judge-evidence --out-suffix _noevidence   # ablation
     python -m scripts.run_all --reuse-saved-stage1 --with-metabolites --out-suffix _metab        # opt-in metabolite graph (default is protein-only)
 
-Order per pair: Pipeline A -> Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> save pipeline_b_<pair>.json
--> citation-evidence classifier (reads that file) -> edge-provenance audit -> evidence-floor re-rank. Any existing outputs are
-first COPIED to outputs/archive_<timestamp>/ so nothing from the earlier run is lost.
-A failure in one step is printed and recorded, and the run carries on with what it can still do.
+Order per pair: Pipeline A -> Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> save pipeline_b_<pair>.json -> citation-evidence classifier
+-> edge-provenance audit -> evidence-floor re-rank. Existing outputs are first copied to outputs/archive_<timestamp>/. A failure in one
+step is printed and recorded, and the run carries on with what it can still do.
 """
 import argparse
 import json
@@ -35,8 +34,9 @@ from PipelineB.pubmed_client import PubMedClient
 OUTPUT_DIR = Path("outputs")
 
 
+# Copy (never move or delete) a pair's previous result files into outputs/archive_<stamp>/ before they are overwritten.
+# Input: pair id and timestamp. Output: none.
 def _archive(pair_id: str, stamp: str) -> None:
-    # Copy (never move or delete) this pair's previous result files aside before overwriting them.
     dest = OUTPUT_DIR / f"archive_{stamp}"
     for name in (f"pipeline_a_{pair_id}.json", f"pipeline_b_{pair_id}.json"):
         src = OUTPUT_DIR / name
@@ -51,12 +51,15 @@ def _archive(pair_id: str, stamp: str) -> None:
             shutil.copy2(src, dest / "citation_evidence" / src.name)
 
 
+# Write a dict as indented JSON under outputs/. Input: the data and a file name. Output: none.
 def _save(data, name: str) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     (OUTPUT_DIR / name).write_text(json.dumps(data, indent=2))
     print(f"  saved outputs/{name}")
 
 
+# Run one step, timing it and recording "ok" or the failure in `status` instead of raising. Input: step name, a
+# zero-argument function and the status dict. Output: the function's result, or None on failure.
 def _run_step(name: str, fn, status: dict):
     t0 = time.time()
     print(f"[{name}] starting", flush=True)
@@ -70,6 +73,8 @@ def _run_step(name: str, fn, status: dict):
         return None
 
 
+# Run every step for one disease pair and save the results. Input: pair id, the parsed arguments and the archive
+# timestamp. Output: the pair's status dict.
 def run_pair(pair_id: str, args, stamp: str) -> dict:
     pair = get_pair(pair_id)
     d1, d2 = pair["disease1"], pair["disease2"]
@@ -80,8 +85,8 @@ def run_pair(pair_id: str, args, stamp: str) -> dict:
     saved_b = OUTPUT_DIR / f"pipeline_b_{pair_id}.json"
     reuse = args.reuse_saved_stage1 and saved_b.exists()
     if reuse:
-        # Re-run only Stages 2-4 on the genes and citations of the previous Stage 1 run. Pipeline A and the
-        # citation classifier are left alone, since they describe that same Stage 1 output.
+        # Re-run only Stages 2-4 on the genes and citations of the previous Stage 1 run; Pipeline A and the citation
+        # classifier describe that same Stage 1 output and are left alone.
         print(f"  reusing Stage 1 from {saved_b} (skipping Pipeline A and the classifier)")
         args = argparse.Namespace(**{**vars(args), "skip_classifier": True})
         status["pipeline_a"] = "kept previous"
@@ -93,10 +98,12 @@ def run_pair(pair_id: str, args, stamp: str) -> dict:
         a1 = _run_step("stage1", lambda: run_stage1_discovery(d1, d2, min_score=args.min_score), status)
     a2 = a3 = None
     if a1:
+        # Run Stage 2 with the full hardened options. Output: the Stage 2 result.
         def _stage2():
             try:
                 kw = {"max_hops": args.max_hops} if args.max_hops else {}
-                # the full set of 2026-10-18 options: noise-control pass, edge strength + bridge-gene titles for the judge
+                # Full hardened options: repeat judge pass as a noise control, and edge strength plus bridge-gene titles
+                # shown to the judge.
                 return run_stage2_judging(
                     a1, metalinks_client=MetalinksClient() if args.with_metabolites else None, judge_control_pass=not args.no_judge_control,
                     judge_evidence=not args.no_judge_evidence,
@@ -130,13 +137,14 @@ def run_pair(pair_id: str, args, stamp: str) -> dict:
                                   "--out-dir", str(OUTPUT_DIR / f"provenance_audit{args.out_suffix}")])
             status["provenance_audit"] = "ok" if rc == 0 else f"FAILED (exit {rc})"
         if a2 and a3:
-            # evidence floor: re-order Stage 2's chains by Stage 3's tissue result (code only, no LLM call)
+            # Evidence floor: re-order Stage 2's chains by Stage 3's tissue result (code only, no LLM call).
             rc = subprocess.call([sys.executable, "-m", "PipelineB.evidence_rerank",
                                   "--result", str(OUTPUT_DIR / f"pipeline_b_{pair_id}{args.out_suffix}.json")])
             status["evidence_rerank"] = "ok" if rc == 0 else f"FAILED (exit {rc})"
     return status
 
 
+# Command-line entry point: run each requested pair and print a per-step status summary.
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--pairs", nargs="+", default=[p["id"] for p in DISEASE_PAIRS],

@@ -1,26 +1,14 @@
-"""
-Evidence floor applied to EVERY pre-trim candidate path, not only the ten the trim keeps.
+"""Evidence floor applied to every pre-trim candidate path, not only the ten the trim keeps.
 
-Why: the trim to ten is evidence-blind (longest first, fully-signed first, at most 3 per start gene), the judge
-then endorses a few, and the evidence floor (PipelineB.evidence_rerank) only runs on what survives. That leaves
-open which step lets an unsupported chain through. This script asks it directly: of ALL paths the BFS finds
-within max_hops, what share pass the floor, and do the ten the trim keeps pass at a lower or higher rate than the
-rest?
-
-No LLM. It reuses, unchanged:
-  * Stage 2's BFS (`_bfs_shortest_paths`) and trim (`_trim_candidates`) on the saved Stage 1 gene lists,
-    over a local copy of the OmniPath network (same set-up as scripts/max_hops_analysis.py);
-  * Stage 3's tissue lookups (`GTExClient`, `check_tissue_expression`, `DISEASE_RELEVANT_TISSUES`), with the same
-    role rule as `_confirm_chain` (start gene: disease-1 tissues; end gene: disease-2 tissues; middle genes: both);
-  * the floor itself (`assess_chain`, min_fraction 0.5). Nothing about the rule is changed here.
-
-It is a post hoc diagnostic reported for both pairs whatever it shows. The floor was written after the CAD result
-was known, so this is not an out-of-sample test of the rule.
+Of all paths the BFS finds within max_hops, what share pass the floor, and do the ten the trim keeps pass at a different rate from the rest?
+No LLM. It reuses Stage 2's BFS and trim on the saved Stage 1 gene lists over a local copy of the OmniPath network (as in
+scripts/max_hops_analysis.py), Stage 3's GTEx lookups with the same role rule as `_confirm_chain` (start gene: disease-1 tissues; end gene:
+disease-2 tissues; middle genes: both), and the floor itself (`assess_chain`, min_fraction 0.5) unchanged. A post hoc diagnostic: the
+floor was written after the CAD result was known, so this is not an out-of-sample test of the rule.
 
 Run:  python -m scripts.floor_all_candidates            # both pairs
       python -m scripts.floor_all_candidates --enumerate-only  # BFS + list the GTEx lookups only, no network to GTEx
-Writes outputs/evidence_floor_all_candidates/<pair>.json, summary.json, and a gene-tissue cache
-(gtex_cache.json) so an interrupted run resumes where it stopped.
+Writes outputs/evidence_floor_all_candidates/<pair>.json, summary.json, and a gene-tissue cache (gtex_cache.json) so an interrupted run resumes.
 """
 import argparse
 import json
@@ -46,10 +34,12 @@ MAX_HOPS = a2.DEFAULT_MAX_HOPS
 START = time.time()
 
 
+# Input: a path (list of edges). Output: its genes joined by ">".
 def path_label(path):
     return ">".join([path[0].source_id] + [e.target_id for e in path])
 
 
+# Input: a path. Output: (start gene, end gene, middle genes).
 def path_roles(path):
     start, end = path[0].source_id, path[-1].target_id
     middle = []
@@ -60,8 +50,9 @@ def path_roles(path):
     return start, end, middle
 
 
+# Input: a path and both disease names. Output: the (gene, tissue) pairs this path needs, by the same rule as
+# stage3_confirmation._confirm_chain.
 def needed_lookups(path, d1, d2):
-    # Same rule as stage3_confirmation._confirm_chain: (gene, tissue) pairs this path needs.
     start, end, middle = path_roles(path)
     t1, t2 = DISEASE_RELEVANT_TISSUES[d1], DISEASE_RELEVANT_TISSUES[d2]
     out = [(start, t) for t in t1] + [(end, t) for t in t2]
@@ -70,12 +61,14 @@ def needed_lookups(path, d1, d2):
     return out
 
 
+# Output: the saved gene-tissue lookup cache, or an empty dict.
 def load_cache():
     if os.path.exists(CACHE):
         return json.load(open(CACHE))
     return {}
 
 
+# Write the cache via a temp file and rename. Input: the cache dict.
 def save_cache(cache):
     os.makedirs(OUT, exist_ok=True)
     tmp = CACHE + ".tmp"
@@ -83,6 +76,8 @@ def save_cache(cache):
     os.replace(tmp, CACHE)
 
 
+# Look up every missing (gene, tissue) pair in GTEx, saving the cache as it goes and exiting when the time budget runs
+# out. Input: the needed pairs, the cache and an optional time budget in seconds.
 def fetch_all(pairs_needed, cache, budget=None):
     client = GTExClient()
     todo = [k for k in sorted(pairs_needed) if k not in cache]
@@ -90,7 +85,7 @@ def fetch_all(pairs_needed, cache, budget=None):
     t0 = time.time()
     for i, k in enumerate(todo, 1):
         gene, tissue = k.split("|")
-        cache[k] = client.get_median_expression(gene, tissue)  # None = no record / unresolved / rate-limited
+        cache[k] = client.get_median_expression(gene, tissue)  # None = no record, unresolved or rate-limited
         if budget and time.time() - START > budget:
             save_cache(cache)
             print(f'budget reached; {len(todo) - i} lookups left; run again to resume', flush=True)
@@ -102,6 +97,7 @@ def fetch_all(pairs_needed, cache, budget=None):
     save_cache(cache)
 
 
+# Input: a path, both disease names and the cache. Output: tissue-check dicts for the path built from cached values.
 def tissue_checks_for(path, d1, d2, cache):
     rows = []
     for gene, tissue in needed_lookups(path, d1, d2):
@@ -111,6 +107,8 @@ def tissue_checks_for(path, d1, d2, cache):
     return rows
 
 
+# Run the BFS for a pair and apply the trim. Input: pair id and the interactions. Output: (pair, all paths, a
+# kept-by-trim flag per path, the kept paths).
 def enumerate_paths(pair_id, interactions):
     pair = get_pair(pair_id)
     saved = json.load(open(os.path.join(HERE, "outputs", f"pipeline_b_{pair_id}.json")))["stage1"]
@@ -123,6 +121,8 @@ def enumerate_paths(pair_id, interactions):
     return pair, paths, [id(p) in kept_ids for p in paths], kept
 
 
+# Apply the floor to every path. Input: the pair, its paths, the kept flags and the cache. Output: one row per path with
+# hops, signing, trim status and the floor result.
 def analyse(pair, paths, is_kept, cache):
     d1, d2 = pair["disease1"], pair["disease2"]
     rows = []
@@ -140,7 +140,10 @@ def analyse(pair, paths, is_kept, cache):
     return rows
 
 
+# Input: the per-path rows. Output: pass counts and rates overall and split by kept or not kept, hop count and fully
+# signed or not.
 def summarise(rows):
+    # Input: a list of rows. Output: their counts and pass rate.
     def block(rs):
         n = len(rs)
         return {"n": n, "pass": sum(r["passes"] for r in rs), "fail": sum(not r["passes"] for r in rs),
@@ -154,6 +157,7 @@ def summarise(rows):
             "has_unknown_edge": block([r for r in rows if not r["fully_signed"]])}
 
 
+# Command-line entry point: enumerate paths, fetch the GTEx lookups, apply the floor and save the results.
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--budget", type=float, default=None, help="stop fetching after this many seconds (re-run to resume)")
@@ -176,7 +180,7 @@ def main():
         return
     cache = load_cache()
     fetch_all(need, cache, args.budget)
-    # one retry pass for lookups that came back empty (no record is real; a dropped request is not)
+    # One retry pass for lookups that came back empty (no record is real; a dropped request is not).
     empty = [k for k in need if cache.get(k) is None]
     print(f"empty after first pass: {len(empty)}; retrying once", flush=True)
     client = GTExClient()

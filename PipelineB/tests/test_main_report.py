@@ -1,10 +1,12 @@
-"""The readable report must label the model's free text as unverified commentary and show the code-generated
-evidence line; draws in the debate log must not be printed as wins."""
+"""Tests for the readable Stage 2 report: model text is labelled as unverified commentary, the code-built evidence line is shown, and debate draws
+are not printed as wins.
+"""
 from common.report_format import _format_chain_evidence, _format_debate_log
 
 EVIDENCE = {"n_edges": 3, "n_edges_with_unknown_direction": 1, "weakest_edge_curation_effort": 2}
 
 
+# Build a one-edge chain dict, with any extra fields overridden.
 def _chain(**extra):
     edge = {"source_gene": "A", "target_gene": "B", "interaction_type": "activates", "source_kind": "gene", "target_kind": "gene"}
     chain = {"edges": [edge], "rationale": "A drives B.", "has_unconfirmed_direction": False, "elo_rating": None}
@@ -12,6 +14,7 @@ def _chain(**extra):
     return chain
 
 
+# Evidence line states database facts and flags off path genes.
 def test_evidence_line_states_database_facts_and_flags_off_path_genes():
     line = _format_chain_evidence(_chain(evidence=EVIDENCE, judge_votes=2, rationale_off_path_genes=["INSR"]))
     assert "direction curated for 2 of 3 edge(s)" in line
@@ -19,10 +22,12 @@ def test_evidence_line_states_database_facts_and_flags_off_path_genes():
     assert "INSR" in line
 
 
+# Results saved before the evidence block print no evidence line.
 def test_results_saved_before_the_evidence_block_print_no_evidence_line():
     assert _format_chain_evidence(_chain()) == ""
 
 
+# Draw is not reported as a win.
 def test_draw_is_not_reported_as_a_win():
     log = [{"winner_index": 0, "loser_index": 1, "rationale": "x", "draw": True},
            {"winner_index": 1, "loser_index": 0, "rationale": "y", "draw": False}]

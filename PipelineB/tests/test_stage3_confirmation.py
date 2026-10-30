@@ -1,3 +1,5 @@
+"""Tests for Stage 3 Confirmation (PipelineB/stage3_confirmation.py) with stub clients."""
+
 import json
 
 from PipelineB.stage1_discovery import Stage1DiscoveryResult
@@ -12,6 +14,7 @@ DISEASE1 = "Type 2 Diabetes Mellitus"
 DISEASE2 = "Alzheimer's Disease"
 
 
+# Build a Stage 1 result for the two diseases.
 def _stage1_result():
     return Stage1DiscoveryResult(
         disease1=DISEASE1,
@@ -24,17 +27,20 @@ def _stage1_result():
     )
 
 
+# Build a one-edge chain from INSR to APP.
 def _single_edge_chain():
     edge = ChainEdge("INSR", "P06213", "APP", "P05067", "activates", "P06213->P05067", 0.7, 0.6)
     return ChainCandidate(edges=[edge], rationale="test rationale")
 
 
+# Build a two-edge chain with one bridge gene.
 def _two_hop_chain():
     edge1 = ChainEdge("INSR", "P06213", "MID", "PM", "activates", "P06213->PM", 0.7, None)
     edge2 = ChainEdge("MID", "PM", "APP", "P05067", "inhibits", "PM->P05067", None, 0.6)
     return ChainCandidate(edges=[edge1, edge2], rationale="bridge rationale")
 
 
+# Build a chain whose middle hop is a metabolite.
 def _metabolite_bridge_chain():
     # INSR --produces--> Cholesterol (metabolite middle hop) --activates--> APP.
     # Endpoints are still real genes (INSR, APP); only the middle node is metabolite-kind.
@@ -69,21 +75,22 @@ def _metabolite_bridge_chain():
     return ChainCandidate(edges=[edge1, edge2], rationale="metabolite bridge rationale")
 
 
+# Build a three-edge chain with two bridge genes.
 def _three_hop_chain():
-    # INSR (disease1 endpoint) -> PRKCA (bridge) -> ARRB1 (bridge) -> APP (disease2 endpoint).
-    # Modeled on the real T2DM->CAD Pathway 2 chain (INSR->PRKCA->ARRB1->PDE4D) -- two bridge
-    # genes, so exactly one edge (PRKCA-ARRB1) has both ends being bridge genes. See
-    # stage3_confirmation.py's module docstring, "Edge-level literature validation" note.
+    # INSR (disease-1 endpoint) -> PRKCA (bridge) -> ARRB1 (bridge) -> APP (disease-2 endpoint): two bridge genes, so
+    # exactly one edge (PRKCA-ARRB1) has both ends being bridge genes.
     edge1 = ChainEdge("INSR", "P06213", "PRKCA", "P_PRKCA", "activates", "INSR->PRKCA", 0.7, None)
     edge2 = ChainEdge("PRKCA", "P_PRKCA", "ARRB1", "P_ARRB1", "activates", "PRKCA->ARRB1", None, None)
     edge3 = ChainEdge("ARRB1", "P_ARRB1", "APP", "P05067", "activates", "ARRB1->APP", None, 0.6)
     return ChainCandidate(edges=[edge1, edge2, edge3], rationale="three-hop bridge rationale")
 
 
+# Wrap chains in a Stage 2 result.
 def _stage2_result(chains):
     return Stage2JudgingResult(disease1=DISEASE1, disease2=DISEASE2, chains=chains, candidate_path_count=len(chains), shared_genes=[])
 
 
+# Empty chains returns empty list.
 def test_empty_chains_returns_empty_list():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([])
@@ -93,6 +100,7 @@ def test_empty_chains_returns_empty_list():
     assert result == []
 
 
+# Single edge chain checks both endpoints against own disease tissues.
 def test_single_edge_chain_checks_both_endpoints_against_own_disease_tissues():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -116,6 +124,7 @@ def test_single_edge_chain_checks_both_endpoints_against_own_disease_tissues():
     assert confirmation.endpoint_checks[1].disease_name == DISEASE2
 
 
+# Multi hop chain checks middle gene against both diseases tissues.
 def test_multi_hop_chain_checks_middle_gene_against_both_diseases_tissues():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_two_hop_chain()])
@@ -133,6 +142,7 @@ def test_multi_hop_chain_checks_middle_gene_against_both_diseases_tissues():
     assert endpoint_genes == {"INSR", "APP"}
 
 
+# Metabolite middle hop excluded from tissue checks and listed in chain metabolites.
 def test_metabolite_middle_hop_excluded_from_tissue_checks_and_listed_in_chain_metabolites():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_metabolite_bridge_chain()])
@@ -154,6 +164,7 @@ def test_metabolite_middle_hop_excluded_from_tissue_checks_and_listed_in_chain_m
     assert endpoint_genes == {"INSR", "APP"}
 
 
+# Endpoint confirmed true when GWAS has evidence.
 def test_endpoint_confirmed_true_when_gwas_has_evidence():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -166,6 +177,7 @@ def test_endpoint_confirmed_true_when_gwas_has_evidence():
     assert insr_check.confirmed is True
 
 
+# Endpoint not confirmed when no GWAS evidence.
 def test_endpoint_not_confirmed_when_no_gwas_evidence():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -176,6 +188,7 @@ def test_endpoint_not_confirmed_when_no_gwas_evidence():
     assert all(not e.confirmed for e in results[0].endpoint_checks)
 
 
+# GWAS client called for both endpoints.
 def test_gwas_client_called_for_both_endpoints():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -187,11 +200,8 @@ def test_gwas_client_called_for_both_endpoints():
     assert len(gwas.calls) == 2  # both endpoints checked
 
 
+# Endpoint check flags possibly incomplete from GWAS client.
 def test_endpoint_check_flags_possibly_incomplete_from_gwas_client():
-    """Regression test for crossdb_client.py's bug-fix #3: an endpoint check whose GWAS Catalog
-    lookup was rate-limited before it could finish must be flagged possibly_incomplete=True, so
-    'no hit' downstream (main.py's readable report, the saved JSON) isn't misread as a confirmed
-    negative -- see stage3_confirmation.py's EndpointCrossDbCheck docstring."""
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
     gwas = StubGWASCatalogClient({})
@@ -203,6 +213,7 @@ def test_endpoint_check_flags_possibly_incomplete_from_gwas_client():
     assert all(e.confirmed is False for e in results[0].endpoint_checks)  # still no evidence -- just not final
 
 
+# Endpoint check possibly incomplete defaults to false.
 def test_endpoint_check_possibly_incomplete_defaults_to_false():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -213,6 +224,7 @@ def test_endpoint_check_possibly_incomplete_defaults_to_false():
     assert all(e.possibly_incomplete is False for e in results[0].endpoint_checks)
 
 
+# To dict is JSON serializable.
 def test_to_dict_is_json_serializable():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
@@ -222,15 +234,11 @@ def test_to_dict_is_json_serializable():
     json.dumps(results[0].to_dict())
 
 
-# --- Edge-level literature validation (added 2026-09-27) ---
-# See module docstring's "Edge-level literature validation" note and
-# claude/committee_feedback_round2_coscientist.md section 3a.
+# --- Edge-level literature validation ---
 
 
+# Single edge chain gets no literature checks no bridge edges exist.
 def test_single_edge_chain_gets_no_literature_checks_no_bridge_edges_exist():
-    """A 1-hop chain has no edge with both ends being bridge genes (its one edge's both ends ARE
-    the two endpoints) -- zero literature checks is the correct, expected scoping outcome, not a
-    bug. See the module docstring's stated real consequence of this scoping decision."""
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_single_edge_chain()])
     pubmed = StubPubMedClient(citations_by_gene={})
@@ -243,10 +251,8 @@ def test_single_edge_chain_gets_no_literature_checks_no_bridge_edges_exist():
     assert pubmed.edge_calls == []  # no PubMed query made at all
 
 
+# Two hop chain gets no literature checks every edge touches an endpoint.
 def test_two_hop_chain_gets_no_literature_checks_every_edge_touches_an_endpoint():
-    """A 2-hop chain has exactly one bridge gene (MID) -- both its edges touch an endpoint
-    (INSR-MID, MID-APP), so neither edge has BOTH ends being bridge genes. Still zero checks,
-    same scoping rationale as the 1-hop case above."""
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_two_hop_chain()])
     pubmed = StubPubMedClient(citations_by_gene={})
@@ -259,10 +265,8 @@ def test_two_hop_chain_gets_no_literature_checks_every_edge_touches_an_endpoint(
     assert pubmed.edge_calls == []
 
 
+# Three hop chain checks exactly the one bridge to bridge edge.
 def test_three_hop_chain_checks_exactly_the_one_bridge_to_bridge_edge():
-    """INSR->PRKCA->ARRB1->APP: PRKCA and ARRB1 are both bridge genes, so the PRKCA-ARRB1 edge
-    (and only that edge) gets a literature check -- INSR-PRKCA and ARRB1-APP each touch an
-    endpoint and are skipped, per the confirmed scoping decision."""
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_three_hop_chain()])
     edge_citation = EdgeCitation(
@@ -284,6 +288,7 @@ def test_three_hop_chain_checks_exactly_the_one_bridge_to_bridge_edge():
     assert pubmed.edge_calls == [("PRKCA", "ARRB1", 3)]
 
 
+# Edge literature check not supported when no confirming citation.
 def test_edge_literature_check_not_supported_when_no_confirming_citation():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_three_hop_chain()])
@@ -301,9 +306,8 @@ def test_edge_literature_check_not_supported_when_no_confirming_citation():
     assert results[0].edge_literature_checks[0].any_full_text_checked is False
 
 
+# Metabolite involved edges are skipped from literature checks.
 def test_metabolite_involved_edges_are_skipped_from_literature_checks():
-    """An edge with a metabolite end has no gene-pair literature search to run, even if the gene
-    end happens to be a bridge gene -- see _edge_literature_checks' gene-kind check."""
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_metabolite_bridge_chain()])
     pubmed = StubPubMedClient(citations_by_gene={})
@@ -316,6 +320,7 @@ def test_metabolite_involved_edges_are_skipped_from_literature_checks():
     assert pubmed.edge_calls == []
 
 
+# Edge literature check to dict is JSON serializable.
 def test_edge_literature_check_to_dict_is_json_serializable():
     stage1_result = _stage1_result()
     stage2_result = _stage2_result([_three_hop_chain()])
@@ -331,12 +336,14 @@ def test_edge_literature_check_to_dict_is_json_serializable():
     json.dumps(results[0].to_dict())
 
 
-# ---- 2026-10-18: independence of the evidence -------------------------------------------------------------------
+# --- Independence of the evidence ---
 
+# Build a one-association GWAS result for a gene.
 def _gwas_hit(gene, trait="trait"):
     return [GwasAssociation(gene, trait, "EFO_1", 1e-9, "GCST1")]
 
 
+# Endpoint GWAS checks are flagged as not independent of selection.
 def test_endpoint_gwas_checks_are_flagged_as_not_independent_of_selection():
     result = run_stage3_confirmation(
         _stage1_result(), _stage2_result([_two_hop_chain()]),
@@ -347,6 +354,7 @@ def test_endpoint_gwas_checks_are_flagged_as_not_independent_of_selection():
     assert all(e["independent_of_selection"] is False for e in result.to_dict()["endpoint_checks"])
 
 
+# Bridge genes are GWAS checked against both diseases and flagged independent.
 def test_bridge_genes_are_gwas_checked_against_both_diseases_and_flagged_independent():
     gwas = StubGWASCatalogClient({("PRKCA", DISEASE2): _gwas_hit("PRKCA")})
     result = run_stage3_confirmation(
@@ -361,6 +369,7 @@ def test_bridge_genes_are_gwas_checked_against_both_diseases_and_flagged_indepen
     assert ("PRKCA", DISEASE1) in gwas.calls and ("ARRB1", DISEASE2) in gwas.calls
 
 
+# Single edge chain has no bridge GWAS checks.
 def test_single_edge_chain_has_no_bridge_gwas_checks():
     result = run_stage3_confirmation(
         _stage1_result(), _stage2_result([_single_edge_chain()]),
@@ -369,12 +378,14 @@ def test_single_edge_chain_has_no_bridge_gwas_checks():
     assert result.bridge_gwas_checks == []
 
 
+# Build a Stage 2 result whose bfs_stats carries a pool of candidate bridge genes.
 def _stage2_with_pool(chains, pool):
     r = _stage2_result(chains)
     r.bfs_stats = {"candidate_bridge_genes": pool}
     return r
 
 
+# Null baseline samples from the pool excluding chain genes and computes rates.
 def test_null_baseline_samples_from_the_pool_excluding_chain_genes_and_computes_rates():
     pool = ["PRKCA", "ARRB1"] + [f"G{i}" for i in range(10)]
     # every pool gene expressed in every tissue except G0..G4, which have no GTEx record at all
@@ -396,6 +407,7 @@ def test_null_baseline_samples_from_the_pool_excluding_chain_genes_and_computes_
     assert null["chains"]["bridge_genes"] == ["ARRB1", "PRKCA"]
 
 
+# Null baseline is reproducible and skippable.
 def test_null_baseline_is_reproducible_and_skippable():
     pool = [f"G{i}" for i in range(50)]
     kwargs = dict(gtex_client=StubGTExClient({}), gwas_client=StubGWASCatalogClient({}), pubmed_client=StubPubMedClient({}))
@@ -406,6 +418,7 @@ def test_null_baseline_is_reproducible_and_skippable():
     assert skipped.null_baseline is None
 
 
+# No baseline when stage2 result has no bridge pool.
 def test_no_baseline_when_stage2_result_has_no_bridge_pool():
     r = run_stage3_confirmation(
         _stage1_result(), _stage2_result([_two_hop_chain()]),
@@ -414,8 +427,11 @@ def test_no_baseline_when_stage2_result_has_no_bridge_pool():
     assert r.null_baseline is None
 
 
+# Rate limited null checks are inconclusive not negative.
 def test_rate_limited_null_checks_are_inconclusive_not_negative():
+    # GWAS stub that reports gene G0 as rate-limited.
     class Limited(StubGWASCatalogClient):
+        # Flag the lookup as rate-limited for G0 and return no associations.
         def get_gene_disease_associations(self, gene_symbol, disease_name):
             self.last_check_rate_limited = gene_symbol == "G0"
             return []
@@ -429,6 +445,7 @@ def test_rate_limited_null_checks_are_inconclusive_not_negative():
     assert r.null_baseline["gwas"][DISEASE1]["genes_checked"] == 1
 
 
+# Result with baseline is JSON serializable.
 def test_result_with_baseline_is_json_serializable():
     r = run_stage3_confirmation(
         _stage1_result(), _stage2_with_pool([_three_hop_chain()], ["A", "B", "C"]),

@@ -1,11 +1,5 @@
-"""
-Stage 1 -- Open Targets Platform client.
-
-Service: Open Targets GraphQL API v4 (https://api.platform.opentargets.org/api/v4/graphql), no key needed.
-Data: GraphQL JSON. search{} resolves a disease name to an EFO/MONDO id; disease(efoId){associatedTargets}
-  returns gene rows (approvedSymbol, Ensembl id, UniProt ids, association score).
-Used by: PipelineB.stage1_discovery (disease -> candidate gene lists).
-
+"""Stage 1 Open Targets Platform client (GraphQL API v4, no key needed). Resolves a disease name to an EFO/MONDO id and
+returns the genes associated with it (symbol, Ensembl id, UniProt id, association score).
 """
 import os
 from dataclasses import dataclass
@@ -50,6 +44,7 @@ query diseaseTargets($efoId: String!, $size: Int!) {
 """
 
 
+# One gene associated with a disease, with its Open Targets association score.
 @dataclass
 class GeneAssociation:
     gene_symbol: str
@@ -57,6 +52,7 @@ class GeneAssociation:
     uniprot_id: Optional[str]
     disease_assoc_score: float
 
+    # Output: the record as a plain dict.
     def to_dict(self) -> dict:
         return {
             "gene_symbol": self.gene_symbol,
@@ -66,8 +62,9 @@ class GeneAssociation:
         }
 
 
+# Choose the preferred UniProt id for a target. Input: its proteinIds list ({id, source} dicts). Output: the UniProt id,
+# or None.
 def _pick_uniprot_id(protein_ids: List[dict]) -> Optional[str]:
-    # Input: the target's proteinIds list ({id, source} dicts). Output: preferred UniProt id, or None.
     if not protein_ids:
         return None
     for p in protein_ids:
@@ -84,13 +81,16 @@ query { meta { apiVersion { x y z } dataVersion { year month iteration } } }
 """
 
 
+# Queries the Open Targets GraphQL endpoint.
 class OpenTargetsClient:
+    # Input: optional endpoint URL and request timeout. Output: none.
     def __init__(self, base_url: str = None, timeout: int = 60):
         self.base_url = base_url or os.environ.get("OPEN_TARGETS_BASE_URL", DEFAULT_BASE_URL)
         self.timeout = timeout
 
+    # Send one GraphQL request. Input: query string and variables dict. Output: the response's "data" object; raises on
+    # GraphQL errors.
     def _post(self, query: str, variables: dict) -> dict:
-        # Input: GraphQL query string + variables dict. Output: the response's "data" object, or raises on GraphQL errors.
         resp = requests.post(
             self.base_url,
             json={"query": query, "variables": variables},
@@ -102,10 +102,9 @@ class OpenTargetsClient:
             raise RuntimeError(f"Open Targets GraphQL error: {payload['errors']}")
         return payload["data"]
 
+    # Ask which Open Targets release is answering. Output: {"api_version": ..., "data_version": ...}.
     def get_data_version(self) -> dict:
-        # Output: {"api_version": "26.9.0", "data_version": "26.09"} -- which Open Targets release answered. The
-        # scores Stage 1 returns change between releases, so a saved run is only reproducible with this recorded
-        # (added 2026-10-18; verified live: data release 26.09).
+        # Which Open Targets release answered; scores change between releases, so a saved run records it.
         meta = self._post(_META_QUERY, {})["meta"]
         api = meta["apiVersion"]
         data = meta["dataVersion"]
@@ -115,22 +114,23 @@ class OpenTargetsClient:
             "data_version": f"{data['year']}.{data['month']}{iteration}",
         }
 
+    # Resolve a disease name to an id. Input: free-text disease name. Output: the best-matching EFO/MONDO id; raises if
+    # there is no disease hit.
     def search_disease(self, disease_name: str) -> str:
-        # Input: free-text disease name. Output: best-matching EFO/MONDO id. Raises if no disease hit is found.
         data = self._post(_SEARCH_QUERY, {"q": disease_name})
         hits = [h for h in data["search"]["hits"] if h["entity"] == "disease"]
         if not hits:
             raise ValueError(f"No disease found in Open Targets search for {disease_name!r}")
         return hits[0]["id"]  # hits are already ranked by relevance
 
+    # Fetch a disease's associated genes. Input: EFO/MONDO id, minimum association score and maximum rows. Output:
+    # GeneAssociation list for genes scoring at least the minimum.
     def get_associated_targets(
         self,
         efo_id: str,
         min_score: float = 0.1,
         size: int = 200,
     ) -> List[GeneAssociation]:
-        # Input: EFO/MONDO id, minimum association score, max rows to fetch.
-        # Output: GeneAssociation list for genes scoring >= min_score.
         data = self._post(_ASSOCIATED_TARGETS_QUERY, {"efoId": efo_id, "size": size})
         disease = data.get("disease")
         if disease is None:
@@ -154,24 +154,28 @@ class OpenTargetsClient:
         return results
 
 
+# Test double returning fixed responses with no network call.
 class StubOpenTargetsClient:
-    """Fixed, injectable responses for offline tests -- no network call."""
 
+    # Input: a disease-name to EFO-id map and an EFO-id to gene-list map. Output: none.
     def __init__(self, disease_to_efo: dict, efo_to_targets: dict):
         self.disease_to_efo = disease_to_efo
         self.efo_to_targets = efo_to_targets
         self.search_calls = []
         self.target_calls = []
 
+    # Output: a fixed version dict.
     def get_data_version(self) -> dict:
         return {"api_version": "stub", "data_version": "stub"}
 
+    # Input: disease name. Output: its mapped EFO id; raises if unmapped.
     def search_disease(self, disease_name: str) -> str:
         self.search_calls.append(disease_name)
         if disease_name not in self.disease_to_efo:
             raise ValueError(f"No disease found in Open Targets search for {disease_name!r}")
         return self.disease_to_efo[disease_name]
 
+    # Input: EFO id, minimum score and size. Output: the mapped genes scoring at least the minimum.
     def get_associated_targets(self, efo_id: str, min_score: float = 0.1, size: int = 200) -> List[GeneAssociation]:
         self.target_calls.append((efo_id, min_score, size))
         rows = self.efo_to_targets.get(efo_id, [])

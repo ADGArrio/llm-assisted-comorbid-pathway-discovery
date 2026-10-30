@@ -1,30 +1,10 @@
-"""
-Stage 4 -- Cohort Check (MIMIC-IV).
+"""Stage 4 Cohort Check (MIMIC-IV): checks whether the two diseases co-occur in real patients, once per disease pair.
+Turns MimicClient's per-disease patient sets into the risk ratio P(d2|d1) / P(d2|not d1) with a 95% CI and chi-square
+p-value, plus an odds ratio and the observed/expected lift. The ratios are unadjusted (no age, sex or risk-factor matching)
+and descriptive only.
 
-Service: none directly -- orchestrates mimic_client.py (local file reads).
-Data: MimicClient.compute_cohort_sets() output (per-disease subject_id
-sets); this module turns that into rate/relative-risk numbers.
-Used by: the top-level pipeline, once per disease pair (not per chain --
-MIMIC-IV diagnosis codes can't confirm a specific protein-protein edge,
-only whether the two diagnoses co-occur in real patients).
-
-Statistics (fixed 2026-10-18): `relative_risk` is the TRUE risk ratio -- P(disease2 | disease1) divided by
-P(disease2 | NOT disease1) -- with a 95% CI (log method) and a chi-square p-value; `odds_ratio` (Woolf 95% CI) is
-reported alongside. The earlier "relative risk" divided by the disease-2 rate over EVERYONE (disease-1 patients
-included), which is a lift, not a risk ratio, and understated the effect (T2DM->CAD: 2.05 vs a true 2.77); it is
-kept as `observed_over_expected`.
-
-This is a crude, unadjusted co-occurrence ratio: no age/sex matching, no
-adjustment for shared risk factors, no causal claim -- descriptive
-evidence for or against the comorbidity premise only.
-
-Getting MIMIC-IV data locally: only two files are needed
-(hosp/diagnoses_icd.csv.gz, hosp/d_icd_diagnoses.csv.gz). A recursive
-`wget -r` mirror of the full PhysioNet project is known to take many
-hours regardless of bandwidth, because it has to crawl directory index
-pages for hundreds of thousands of files first (see
-https://github.com/MIT-LCP/mimic-code/issues/600). Download just the two
-files directly by URL instead (non-recursive), which takes minutes.
+Only two files are needed locally (hosp/diagnoses_icd.csv.gz and hosp/d_icd_diagnoses.csv.gz); download them directly by
+URL rather than mirroring the whole PhysioNet project.
 """
 import argparse
 import json
@@ -36,6 +16,7 @@ from common.config import DISEASE_ICD_PREFIXES, DISEASE_PAIRS, get_pair
 from PipelineB.mimic_client import MimicClient
 
 
+# Stage 4 output: cohort sizes, the disease-2 rate in the disease-1 cohort, and the association statistics.
 @dataclass
 class MimicCohortResult:
     disease1: str
@@ -53,6 +34,7 @@ class MimicCohortResult:
     p_value: Optional[float] = None  # chi-square test (1 df, no continuity correction) of d1 x d2 independence
     observed_over_expected: Optional[float] = None  # P(d2|d1) / P(d2 overall) -- the old "relative_risk" (a lift)
 
+    # Output: the result as a JSON-serializable dict.
     def to_dict(self) -> dict:
         return {
             "disease1": self.disease1,
@@ -72,9 +54,9 @@ class MimicCohortResult:
         }
 
 
+# Compute association statistics from a 2x2 table. Input: counts (everyone, disease 1, disease 2, both). Output: risk
+# ratio and odds ratio with 95% CIs and a chi-square p-value; each is None when its cells make it undefined.
 def _two_by_two_stats(n_total: int, n1: int, n2: int, n_both: int) -> dict:
-    # Input: counts (everyone, disease-1, disease-2, both). Output: risk ratio / odds ratio with 95% CIs, chi-square
-    # p-value; each is None when its table cell(s) make it undefined (e.g. nobody has both diseases).
     a = n_both                    # d1 and d2
     b = n1 - n_both               # d1 only
     c = n2 - n_both               # d2 only
@@ -100,9 +82,9 @@ def _two_by_two_stats(n_total: int, n1: int, n2: int, n_both: int) -> dict:
     return out
 
 
+# Run Stage 4. Input: two disease names and an optional client (defaults to MimicClient(), which needs MIMIC_DATA_DIR in
+# .env; tests pass a stub). Output: a MimicCohortResult.
 def run_stage4_cohort_check(disease1: str, disease2: str, mimic_client: Optional[object] = None) -> MimicCohortResult:
-    # Input: two disease names, optional client (defaults to real MimicClient(), needs
-    # MIMIC_DATA_DIR in .env; pass StubMimicClient in tests). Output: MimicCohortResult.
     prefixes1 = DISEASE_ICD_PREFIXES.get(disease1)
     prefixes2 = DISEASE_ICD_PREFIXES.get(disease2)
     if not prefixes1:
@@ -142,6 +124,7 @@ def run_stage4_cohort_check(disease1: str, disease2: str, mimic_client: Optional
     )
 
 
+# Command-line entry point: run the stage for a disease pair chosen by id or by name and print the result as JSON.
 def _cli():
     parser = argparse.ArgumentParser(description="Run Stage 4 (Cohort Check) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")

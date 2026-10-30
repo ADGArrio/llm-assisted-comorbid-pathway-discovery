@@ -1,3 +1,5 @@
+"""Tests for the GTEx client (PipelineB/tissue_client.py) with a stubbed HTTP layer."""
+
 import json
 
 import pytest
@@ -5,17 +7,16 @@ import pytest
 from PipelineB.tissue_client import EXPRESSION_THRESHOLD, GTExClient, StubGTExClient, check_tissue_expression
 
 
+# Autouse fixture: record time.sleep calls instead of sleeping, so pacing and backoff tests run instantly.
 @pytest.fixture(autouse=True)
 def _no_real_sleeping(monkeypatch):
-    # GTExClient._get paces every request and backs off on 429 with real time.sleep() calls
-    # (see tissue_client.py's rate-limit-hardening note) -- fine for a real run, but every test
-    # in this file would otherwise burn real wall-clock time for no reason. Record calls instead
-    # so backoff-timing tests can still assert on them.
+    # Record sleeps instead of waiting, so backoff-timing tests can still assert on them.
     sleeps = []
     monkeypatch.setattr("PipelineB.tissue_client.time.sleep", lambda seconds: sleeps.append(seconds))
     return sleeps
 
 
+# GTEx expression above threshold marks expressed.
 def test_gtex_expression_above_threshold_marks_expressed():
     gtex = StubGTExClient({"INSR|Pancreas": EXPRESSION_THRESHOLD + 5.0})
 
@@ -27,6 +28,7 @@ def test_gtex_expression_above_threshold_marks_expressed():
     assert gtex.calls == [("INSR", "Pancreas")]
 
 
+# GTEx expression below threshold marks not expressed.
 def test_gtex_expression_below_threshold_marks_not_expressed():
     gtex = StubGTExClient({"APOE|Brain_Cortex": 0.05})
 
@@ -37,6 +39,7 @@ def test_gtex_expression_below_threshold_marks_not_expressed():
     assert result.value == 0.05
 
 
+# No GTEx data reports no data.
 def test_no_gtex_data_reports_no_data():
     gtex = StubGTExClient({})
 
@@ -48,40 +51,39 @@ def test_no_gtex_data_reports_no_data():
     assert "No GTEx record" in result.note
 
 
+# To dict is JSON serializable.
 def test_to_dict_is_json_serializable():
     gtex = StubGTExClient({"INSR|Pancreas": 5.0})
     result = check_tissue_expression("INSR", "Pancreas", gtex)
     json.dumps(result.to_dict())
 
 
+# Minimal stand-in for a requests.Response.
 class _FakeResponse:
+    # Store the canned data.
     def __init__(self, payload, status_code=200, headers=None, text=""):
         self._payload = payload
         self.status_code = status_code
         self.headers = headers or {}
         self.text = text
 
+    # Mimic requests.Response.raise_for_status.
     def raise_for_status(self):
         if self.status_code >= 400:
             import requests
 
             raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
 
+    # Return the canned JSON body.
     def json(self):
         return self._payload
 
 
+# GTEx client resolves gene symbol to gencode id before querying expression.
 def test_gtex_client_resolves_gene_symbol_to_gencode_id_before_querying_expression(monkeypatch):
-    """Regression test for the 2026-09-14 bug fixes (see tissue_client.py's module docstring):
-    medianGeneExpression requires a versioned gencodeId, not a plain gene symbol -- GTExClient
-    must resolve the symbol via /reference/gene first, then pass the resolved id -- not the
-    symbol itself -- to /expression/medianGeneExpression. Both requests must use GTEx's actual
-    (singular) query param names -- geneId/gencodeId/tissueSiteDetailId -- per bug-fix #4: a
-    live 422 confirmed the plural forms (geneIds/gencodeIds/tissueSiteDetailIds, briefly used in
-    bug-fix #2 based on a misreading of a third-party R client's docs) are rejected by the real
-    API with "field required: geneId", and the singular forms succeed."""
     calls = []
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         calls.append((url, params))
         if url.endswith("/reference/gene"):
@@ -103,11 +105,11 @@ def test_gtex_client_resolves_gene_symbol_to_gencode_id_before_querying_expressi
     assert len(calls) == 2
 
 
+# GTEx client caches gencode id resolution across tissues.
 def test_gtex_client_caches_gencode_id_resolution_across_tissues(monkeypatch):
-    """The same gene is looked up once per relevant tissue (stage3_confirmation.py) -- resolving
-    its gencodeId should only cost one /reference/gene request, not one per tissue."""
     resolve_calls = []
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         if url.endswith("/reference/gene"):
             resolve_calls.append(params["geneId"])
@@ -123,15 +125,11 @@ def test_gtex_client_caches_gencode_id_resolution_across_tissues(monkeypatch):
     assert resolve_calls == ["IRS1"]  # resolved once, reused for the second tissue
 
 
+# GTEx client defaults to GTEx v8 dataset.
 def test_gtex_client_defaults_to_gtex_v8_dataset(monkeypatch):
-    """Regression test for bug-fix #4 (see tissue_client.py's module docstring): datasetId
-    "gtex_v10" silently returns 200 {"data": []} for every query on the live API -- confirmed via
-    a live diagnostic -- which was the actual root cause of this module's persistent 0/18 bug
-    across three prior "fixes" that were all chasing the wrong thing (param name casing/plurality).
-    "gtex_v8" is confirmed to return real data for the same query, so it must stay the default;
-    this test exists so a future edit can't silently regress back to "gtex_v10"."""
     seen_dataset_ids = []
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         if url.endswith("/reference/gene"):
             return _FakeResponse({"data": [{"geneSymbol": "IRS1", "gencodeId": "ENSG00000169213.12"}]})
@@ -146,7 +144,9 @@ def test_gtex_client_defaults_to_gtex_v8_dataset(monkeypatch):
     assert seen_dataset_ids == ["gtex_v8"]
 
 
+# GTEx client returns none when gene symbol does not resolve.
 def test_gtex_client_returns_none_when_gene_symbol_does_not_resolve(monkeypatch):
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         assert url.endswith("/reference/gene")
         return _FakeResponse({"data": []})
@@ -157,15 +157,14 @@ def test_gtex_client_returns_none_when_gene_symbol_does_not_resolve(monkeypatch)
     assert client.get_median_expression("NOTAREALGENE", "Pancreas") is None
 
 
+# GTEx client retries 429 and succeeds.
 def test_gtex_client_retries_429_and_succeeds(monkeypatch):
-    """Regression test for the 2026-09-14 rate-limit hardening (see tissue_client.py's module
-    docstring): a single transient 429 must not fail the request -- retry and use the next
-    response, exactly like crossdb_client.py's GWASCatalogClient."""
     responses = [
         _FakeResponse({}, status_code=429),
         _FakeResponse({"data": [{"geneSymbol": "INSR", "gencodeId": "ENSG00000171105.16"}]}),
     ]
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         return responses.pop(0)
 
@@ -176,10 +175,8 @@ def test_gtex_client_retries_429_and_succeeds(monkeypatch):
     assert responses == []
 
 
+# GTEx client degrades to none after exhausting retries.
 def test_gtex_client_degrades_to_none_after_exhausting_retries(monkeypatch):
-    """If GTEx is still rate-limiting after every retry, the whole pipeline must not crash --
-    the gene/tissue check is treated as 'no data this time', same as crossdb_client.py's
-    equivalent fix (which was itself a response to a real 429 crash)."""
     monkeypatch.setattr(
         "PipelineB.tissue_client.requests.get", lambda url, params, timeout: _FakeResponse({}, status_code=429)
     )
@@ -188,6 +185,7 @@ def test_gtex_client_degrades_to_none_after_exhausting_retries(monkeypatch):
     assert client.get_median_expression("INSR", "Pancreas") is None
 
 
+# GTEx client honors retry after header.
 def test_gtex_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
     responses = [
         _FakeResponse({}, status_code=429, headers={"Retry-After": "5"}),
@@ -202,11 +200,8 @@ def test_gtex_client_honors_retry_after_header(monkeypatch, _no_real_sleeping):
     assert 5.0 in _no_real_sleeping  # waited the server-specified Retry-After, not the default backoff
 
 
+# GTEx client degrades gracefully on non 429 HTTP error.
 def test_gtex_client_degrades_gracefully_on_non_429_http_error(monkeypatch, capsys):
-    """Regression test for bug-fix #3 (see tissue_client.py's module docstring): a real run hit
-    a genuine 422 from /reference/gene. A broken request for one gene must not crash the whole
-    pipeline -- it should degrade to 'unresolved this run' and print the response body (so the
-    failure is diagnosable from a normal run's console output), not raise."""
     monkeypatch.setattr(
         "PipelineB.tissue_client.requests.get",
         lambda url, params, timeout: _FakeResponse({}, status_code=422, text='{"detail":[{"loc":["query","geneIds"],"msg":"field required"}]}'),
@@ -221,10 +216,10 @@ def test_gtex_client_degrades_gracefully_on_non_429_http_error(monkeypatch, caps
     assert "geneIds" in printed  # the response body made it into the printed warning
 
 
+# GTEx client get median expression degrades gracefully on non 429 HTTP error.
 def test_gtex_client_get_median_expression_degrades_gracefully_on_non_429_http_error(monkeypatch):
-    """Same as above, but for the second request (medianGeneExpression) -- a gene that resolves
-    fine but then fails on the expression lookup must also degrade, not crash."""
 
+    # Stand-in for the real GET request, returning canned data.
     def fake_get(url, params, timeout):
         if url.endswith("/reference/gene"):
             return _FakeResponse({"data": [{"geneSymbol": "IRS1", "gencodeId": "ENSG00000169213.12"}]})

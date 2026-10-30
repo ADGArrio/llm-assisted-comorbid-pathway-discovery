@@ -6,7 +6,7 @@
 Questions answered, each with counts a reader can check:
  1. How often does the debate's top chain fail the floor, and how often would the step abstain?
  2. Does the floor make the recommended chain more stable from run to run?
- 3. Chains that pass vs fail, on evidence the rule did NOT use (bridge-gene GWAS hits, edge literature).
+ 3. Chains that pass vs fail, on evidence the rule did not use (bridge-gene GWAS hits, edge literature).
  4. How often does the same floor reject random bridge-gene sets (live GTEx for the baseline genes)?
 Every run file is read once; byte-identical copies (archives of an unchanged file) are counted once.
 """
@@ -23,8 +23,8 @@ OUT = Path("outputs")
 DEST = OUT / "evidence_rerank"
 
 
+# Output: one dict per distinct saved run that has chains and Stage 3 results.
 def load_runs():
-    # Input: none. Output: one dict per distinct saved run that has chains and Stage 3 results.
     files = sorted(OUT.glob("pipeline_b_t2dm_*.json")) + sorted(OUT.glob("archive_*/pipeline_b_t2dm_*.json"))
     seen, runs = set(), []
     for f in files:
@@ -47,21 +47,22 @@ def load_runs():
     return runs
 
 
+# Input: the runs of one pair. Output: the distinct top chains and the modal share before and after the floor.
 def stability(runs):
-    # Input: runs of one pair. Output: distinct top chains and the modal share before and after the floor.
     before = Counter(chain_label(r["data"]["stage2"]["chains"][0]) for r in runs)
     after = Counter()
     for r in runs:
         rr = r["rerank"]
         after["NO CHAIN (abstains)" if rr["abstains"] else rr["chains"][0]["label"]] += 1
     n = len(runs)
+    # Input: a Counter of top chains. Output: run count, distinct chains, modal share and counts.
     def stats(c):
         return {"runs": n, "distinct": len(c), "modal_share": round(max(c.values()) / n, 3) if n else None, "counts": dict(c.most_common())}
     return {"before": stats(before), "after": stats(after)}
 
 
+# Input: all runs. Output: per unique chain, whether it passes the floor and what held-out evidence it has.
 def held_out(runs):
-    # Input: all runs. Output: per unique chain, whether it passes and what held-out evidence it has.
     unique = {}
     for r in runs:
         d = r["data"]
@@ -90,14 +91,16 @@ def held_out(runs):
     return {"unique_chains": list(unique.values()), "groups": groups}
 
 
+# Input: a chain label (genes joined by ">"). Output: the genes between the endpoints.
 def middle_genes(label):
     parts = label.split(">")
     return parts[1:-1]
 
 
+# Input: the runs, a pair and the number of simulations. Output: live GTEx results for the pair's random baseline genes,
+# then how often random bridge-gene sets of each observed size contain a gene expressed in none of the bridge tissues,
+# against the pipeline's own chains.
 def null_floor(runs, pair, n_sim=20000):
-    # Input: runs, pair. Output: live GTEx for the pair's random baseline genes, then how often random bridge-gene sets
-    # of each observed size contain a gene expressed in none of the bridge tissues, against the pipeline's own chains.
     from PipelineB.tissue_client import GTExClient, check_tissue_expression
     final = [r for r in runs if r["pair"] == pair and r["file"].endswith(f"{pair}_nometab.json")]
     if not final:
@@ -114,7 +117,7 @@ def null_floor(runs, pair, n_sim=20000):
         cache.write_text(json.dumps(per_gene))
     absent = [g for g, f in per_gene.items() if any(x is not None for x in f) and not any(x for x in f if x is not None)]
     usable = [g for g, f in per_gene.items() if any(x is not None for x in f)]
-    # observed: pipeline chains' middle (bridge) genes, same clause
+    # observed: the pipeline chains' middle (bridge) genes, same clause
     obs = []
     for r in runs:
         if r["pair"] != pair:
@@ -137,6 +140,7 @@ def null_floor(runs, pair, n_sim=20000):
             "pipeline_chain_bridge_sizes": dict(sizes)}
 
 
+# Command-line entry point: run the analysis and save the results.
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--null-live", action="store_true")

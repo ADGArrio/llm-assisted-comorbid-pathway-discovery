@@ -1,17 +1,5 @@
-"""
-Swappable LLM client.
-
-Service: any OpenAI-compatible /v1/chat/completions endpoint -- local
-Ollama by default (LLM_BASE_URL=http://localhost:11434, no key needed),
-or any hosted model via .env (LLM_BASE_URL/LLM_MODEL/LLM_API_KEY).
-Data: request/response are the standard OpenAI chat-completions JSON shape.
-Used by: PipelineA.pipeline_a (narrative generation) and PipelineB.stage2_judging (chain selection).
-
-KNOWN ISSUE (gemma4 via Ollama): a "thinking" model can put its reasoning
-in a separate `reasoning` field and leave `content` empty. We send
-"reasoning_effort": "none" to ask the server to skip that, and raise
-instead of silently returning "" if content is still empty. Details:
-https://github.com/ollama/ollama/issues/15288, /15293, /15635.
+"""Swappable LLM client for any OpenAI-compatible /v1/chat/completions endpoint: local Ollama by default, or a hosted model
+configured through .env (LLM_BASE_URL, LLM_MODEL, LLM_API_KEY). Also provides a stub client for tests.
 """
 import os
 from typing import List
@@ -19,21 +7,21 @@ from typing import List
 import requests
 
 
+# Client for one chat-completions endpoint.
 class LLMClient:
+    # Set up the client. Input: optional model, base URL, API key and timeout, otherwise read from .env. Output: none.
     def __init__(self, model: str = None, base_url: str = None, api_key: str = None, timeout: int = 300):
-        # Input: optional overrides, else read from .env (LLM_MODEL/LLM_BASE_URL/LLM_API_KEY).
         self.model = model or os.environ.get("LLM_MODEL", "gemma4:12b")
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "http://localhost:11434")).rstrip("/")
         self.api_key = api_key or os.environ.get("LLM_API_KEY")
         self.timeout = timeout
-        # finish_reason of the most recent reply ("stop" = finished; "length" = cut off because the output budget or the
-        # model's context window ran out -- Ollama's default context is small, and a long prompt leaves almost no room
-        # for the reply). Callers record it so a truncated reply is visible instead of looking like a model verdict.
+        # finish_reason of the most recent reply ("stop" = finished, "length" = cut off by the output budget or context
+        # window), so callers can record a truncated reply.
         self.last_finish_reason = None
 
+    # Send one prompt and return the reply. Input: prompt text and sampling temperature. Output: the model's reply text;
+    # raises RuntimeError if the server returns empty content.
     def generate(self, prompt: str, temperature: float = 0.3) -> str:
-        # Input: prompt text + sampling temperature. Output: the model's response text.
-        # Raises RuntimeError if the server returns empty content (see KNOWN ISSUE above).
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -42,7 +30,7 @@ class LLMClient:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "reasoning_effort": "none",  # ask the server to skip its thinking pass; ignored by servers that don't support it
+            "reasoning_effort": "none",  # Ask the server to skip its thinking pass; servers that do not support it ignore this.
         }
         resp = requests.post(
             f"{self.base_url}/v1/chat/completions",
@@ -81,31 +69,23 @@ class LLMClient:
         return content
 
 
+# Test double that returns fixed or queued replies without any network call.
 class StubLLMClient:
-    """Fixed or queued responses, no network call. For tests.
 
-    Added `responses` 2026-09-27, alongside Stage 2's pairwise debate tournament (see
-    stage2_judging.py's module docstring): a test that exercises more than one LLM call per run
-    (the independent judge filter, then one or more debates) needs a different response
-    for each call, which a single `fixed_response` can't provide. `responses` is consumed in
-    order, one per `generate()` call; `fixed_response` (unchanged) still works exactly as before
-    for every existing single/repeated-response test."""
-
+    # Input: either fixed_response (returned on every call) or responses (an ordered queue, one entry consumed per
+    # call); at least one is required. Output: none.
     def __init__(self, fixed_response: str = None, responses: List[str] = None):
-        # Input: either fixed_response (returned on every call) or responses (an ordered queue,
-        # one entry consumed per call) -- at least one is required.
         if fixed_response is None and responses is None:
             raise ValueError("StubLLMClient needs fixed_response or responses.")
         self.fixed_response = fixed_response
         self._responses = list(responses) if responses is not None else None
         self.last_prompt = None
         self.last_finish_reason = None
-        self.prompts: List[str] = []  # every prompt seen, in call order -- useful when a test needs to
-        # inspect more than just the most recent one (e.g. asserting on a specific debate's prompt).
+        self.prompts: List[str] = []  # Every prompt seen, in call order, for test assertions.
 
+    # Record the prompt and return the next reply. Input: prompt text (temperature is ignored). Output: the next queued
+    # reply if responses was given, else the fixed one.
     def generate(self, prompt: str, temperature: float = 0.3) -> str:
-        # Input: prompt (recorded for test assertions). Output: the next queued response if
-        # `responses` was given, else the fixed one.
         self.last_prompt = prompt
         self.prompts.append(prompt)
         if self._responses is not None:

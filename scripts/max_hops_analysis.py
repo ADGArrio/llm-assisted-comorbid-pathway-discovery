@@ -1,31 +1,22 @@
-"""
-Why max_hops = 5?  Measures what each extra hop buys and costs, against a degree-matched random baseline.
-(Added 2026-10-15.  The previous justification -- "5 sits inside the 4-6 hop small-world diameter" in
-the Stage 2 BFS and prompt recalibration note -- was an argument, not a measurement.)
+"""Why max_hops = 5? Measures what each extra hop buys and costs, against a degree-matched random baseline.
 
-It runs Stage 2's OWN breadth-first search (`PipelineB.stage2_judging._bfs_shortest_paths`, no LLM) on the
-saved Stage 1 gene lists, to depth `--max-depth` (default 10), over a local copy of the OmniPath network
-(one download, ~13 s) so the search -- and a random baseline -- can be repeated quickly and identically.
-Because the search is layered, "max_hops = h" is exactly "the paths found at depth <= h".
+Runs Stage 2's own breadth-first search (`PipelineB.stage2_judging._bfs_shortest_paths`, no LLM) on the saved Stage 1 gene lists, to depth
+`--max-depth` (default 10), over a local copy of the OmniPath network so the search and a random baseline can be repeated quickly and
+identically. Because the search is layered, "max_hops = h" is exactly "the paths found at depth <= h".
 
-Per hop count it reports
+Per hop count it reports:
   * yield:   new candidate paths found at exactly that depth (and cumulative; goal genes reached);
-  * signal:  the same count for DEGREE-MATCHED random gene sets (each observed start gene is replaced by a
-             random gene of similar out-degree, each goal gene by one of similar in-degree) -- so the ratio
-             observed / random asks whether the two diseases' genes are connected more closely than
-             equally-connected random genes are, at that depth, rather than just through hubs;
-  * quality: share of new paths in which every edge has a curated direction (no "unknown" edge);
-  * cost:    genes queried in that BFS layer (the pipeline caps a layer at 3000), edges returned;
-  * what the final candidates look like: the pipeline keeps the `max_paths` (10) LONGEST paths after the
-             search, so a larger max_hops directly makes the candidates longer and less often fully signed.
+  * signal:  the same count for degree-matched random gene sets (each start gene replaced by a random gene of similar out-degree, each goal
+             gene by one of similar in-degree), so observed / random asks whether the two diseases' genes are connected more closely than
+             equally connected random genes;
+  * quality: share of new paths in which every edge has a curated direction;
+  * cost:    genes queried in that BFS layer and edges returned;
+  * candidates: what the pipeline would hand to the LLM at each hop limit (it keeps the max_paths longest paths).
 
 Run:  python -m scripts.max_hops_analysis            # both pairs, 100 random replicates, writes figures
       python -m scripts.max_hops_analysis --replicates 20 --no-figures
-Writes outputs/max_hops_analysis/<pair>.json, outputs/max_hops_analysis/summary.json and
-docs/figures/fig_maxhops_*.png (copied to ../Thesis/figures/).
-
-Scope notes: protein-only (no MetalinksDB metabolites) and the core OmniPath dataset, as the table in
-the Stage 2 code walkthrough; today's OmniPath release (recorded in the output).
+Writes outputs/max_hops_analysis/<pair>.json, outputs/max_hops_analysis/summary.json and docs/figures/fig_maxhops_*.png (copied to ../Thesis/figures/).
+Protein-only (no MetalinksDB) and the core OmniPath dataset; today's OmniPath release is recorded in the output.
 """
 import argparse
 import bisect
@@ -46,16 +37,18 @@ DEFAULT_PAIRS = ["t2dm_ad", "t2dm_cad"]
 FRONTIER_CAP = 3000  # mirrors PipelineB.stage2_judging._MAX_FRONTIER_SIZE (re-read at run time, see run_pair)
 
 
+# Serves get_outgoing_interactions from a list in memory, with OmniPathClient's interface, so Stage 2's real BFS can run
+# on it repeatedly without HTTP.
 class InMemoryOmniPath:
-    """Serves get_outgoing_interactions from a list already in memory -- same interface as OmniPathClient,
-    so Stage 2's real BFS can run on it unchanged, thousands of times, without HTTP."""
 
+    # Input: the interactions and a dataset label. Output: none.
     def __init__(self, interactions, datasets="omnipath"):
         self.datasets = datasets
         self._by_source = defaultdict(list)
         for i in interactions:
             self._by_source[i.source_gene].append(i)
 
+    # Input: source gene symbols. Output: every stored interaction leaving them.
     def get_outgoing_interactions(self, source_genes):
         out = []
         for g in sorted(set(source_genes)):
@@ -63,8 +56,9 @@ class InMemoryOmniPath:
         return out
 
 
+# Download the whole directed network in one request and parse it with the pipeline's own parser. Input: OmniPath
+# dataset selection. Output: the interactions.
 def load_full_network(datasets: str = "omnipath"):
-    # One request for the whole directed network, parsed with the pipeline's own parser.
     import requests
     from PipelineB.omnipath_client import DEFAULT_BASE_URL, OmniPathClient
 
@@ -73,8 +67,9 @@ def load_full_network(datasets: str = "omnipath"):
     return OmniPathClient()._parse_response(resp.text)
 
 
+# Run Stage 2's real search with trimming disabled. Input: a client, start genes, goal genes and the depth limit.
+# Output: (paths, stats).
 def run_bfs(client, start_genes: Sequence[str], goal_genes: set, max_depth: int):
-    # Stage 2's real search, trim disabled, returning (paths, stats).
     from PipelineB import stage2_judging as a2
 
     stats: dict = {}
@@ -82,12 +77,14 @@ def run_bfs(client, start_genes: Sequence[str], goal_genes: set, max_depth: int)
     return paths, stats
 
 
+# Input: a path. Output: whether any edge has an unknown direction.
 def _has_unknown(path) -> bool:
     return any(e.interaction_type == "unknown" for e in path)
 
 
+# Input: all untrimmed BFS paths, the BFS stats, the depth limit and the path limit. Output: lists indexed by hop count
+# 1..max_depth (yield, quality, cost and the candidate set at that hop limit).
 def per_depth_table(paths, stats: dict, max_depth: int, max_paths: int = 10) -> dict:
-    # Input: all BFS paths (untrimmed), the BFS stats, depth. Output: lists indexed by hop count 1..max_depth.
     from PipelineB import stage2_judging as a2
 
     by_len = defaultdict(list)
@@ -100,10 +97,9 @@ def per_depth_table(paths, stats: dict, max_depth: int, max_paths: int = 10) -> 
         new = by_len.get(h, [])
         cumulative += len(new)
         signed = sum(1 for p in new if not _has_unknown(p))
-        # What the pipeline would hand to the LLM if max_hops were h: the shipped trim rule (Stage 2's own
-        # _trim_candidates: longest first, fully-signed first among equal lengths, at most DEFAULT_MAX_PER_START_GENE
-        # per start gene) applied to the paths of length <= h. `legacy` = the pre-2026-10-18 rule (longest first only),
-        # kept for comparison of how many distinct start genes survive.
+        # The candidates the pipeline would hand to the LLM at hop limit h: Stage 2's own trim rule applied to the paths
+        # of length <= h. `legacy` is the older longest-first-only rule, kept to compare how many distinct start genes
+        # survive.
         available = [p for p in paths if len(p) <= h]
         kept = a2._trim_candidates(available, max_paths, a2.DEFAULT_MAX_PER_START_GENE)
         legacy_sorted = sorted(available, key=lambda p: -len(p))[:max_paths]  # the exact old rule, for the comparison
@@ -128,12 +124,14 @@ def per_depth_table(paths, stats: dict, max_depth: int, max_paths: int = 10) -> 
             "total_paths": len(paths)}
 
 
+# Input: a node degree. Output: its log2 bucket (0, 1, 2-3, 4-7, ...).
 def _bin(degree: int) -> int:
     return int(math.log2(degree + 1))  # 0, 1, 2-3, 4-7, ... (log2 buckets)
 
 
+# Input: the interactions. Output: (out_pools, in_pools, out_deg, in_deg): gene lists per log2 degree bucket over every
+# gene in the network.
 def degree_pools(interactions):
-    # Returns (out_pools, in_pools, out_deg, in_deg): gene lists per log2 degree bucket, over every gene in the network.
     out_deg, in_deg = Counter(), Counter()
     genes = set()
     for i in interactions:
@@ -148,9 +146,10 @@ def degree_pools(interactions):
     return out_pools, in_pools, out_deg, in_deg
 
 
+# For each observed gene pick a random network gene from the same degree bucket (distinct picks where the bucket allows;
+# a gene absent from the network counts as degree 0). Input: observed genes, the pools, degree counts and an RNG.
+# Output: the sampled genes.
 def sample_matched(observed: Sequence[str], pools: Dict[int, List[str]], degree: Counter, rng: random.Random) -> List[str]:
-    # For each observed gene pick a random network gene from the same degree bucket (distinct picks where the
-    # bucket allows; a gene absent from the network counts as degree 0).
     chosen: List[str] = []
     taken: set = set()
     for g in observed:
@@ -162,9 +161,10 @@ def sample_matched(observed: Sequence[str], pools: Dict[int, List[str]], degree:
     return chosen
 
 
+# Run the real BFS on random degree-matched start and goal sets. Input: the interactions, observed start and goal genes,
+# number of replicates, depth limit and seed. Output: per hop count, the mean and the 2.5 and 97.5 percentiles of new
+# paths found at that depth.
 def null_new_paths(interactions, start_genes, goal_genes, replicates: int, max_depth: int, seed: int = 0) -> dict:
-    # Runs the real BFS on `replicates` degree-matched random start/goal sets. Returns, per hop count, the mean and the
-    # 2.5/97.5 percentiles of the number of NEW paths found at that depth.
     out_pools, in_pools, out_deg, in_deg = degree_pools(interactions)
     client = InMemoryOmniPath(interactions)
     rng = random.Random(seed)
@@ -185,13 +185,16 @@ def null_new_paths(interactions, start_genes, goal_genes, replicates: int, max_d
     return summary
 
 
+# Input: the observed count and the null counts. Output: the one-sided fraction of null replicates with at least as many
+# new paths, with +1 smoothing.
 def empirical_p(observed: int, null_values: Sequence[int]) -> float:
-    # One-sided: fraction of null replicates with at least as many new paths as observed (with +1 smoothing).
     ordered = sorted(null_values)
     at_least = len(ordered) - bisect.bisect_left(ordered, observed)
     return round((at_least + 1) / (len(ordered) + 1), 3)
 
 
+# Analyse one disease pair. Input: pair id, the interactions, replicates, depth limit and seed. Output: the per-hop
+# table with the random baseline.
 def run_pair(pair_id: str, interactions, replicates: int, max_depth: int, seed: int = 0) -> dict:
     from PipelineB import stage2_judging as a2
 
@@ -216,7 +219,7 @@ def run_pair(pair_id: str, interactions, replicates: int, max_depth: int, seed: 
     }
 
 
-# --------------------------------------------------------------------------- figures
+# Draw the max_hops figures. Input: per-pair results and the output folders. Output: none.
 def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     import matplotlib
     matplotlib.use("Agg")
@@ -235,6 +238,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     default_h = results[pairs[0]]["default_max_hops"]
     width = 0.27
 
+    # Apply the shared axis style. Input: the axes, y-label and title. Output: none.
     def style(ax, ylabel, title):
         ax.set_xticks(hops)
         ax.set_xlabel("Hop count (path length)")
@@ -244,16 +248,18 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
         ax.grid(axis="y")
         ax.grid(axis="x", visible=False)
 
+    # Draw a dotted line and label at the shipped max_hops. Input: the axes. Output: none.
     def mark_default(ax):
         ax.axvline(default_h + 0.5, color=INK, linestyle=":", linewidth=1)
         # Label sits just above the axes (blended transform) so it can never collide with a bar.
         ax.text(default_h + 0.5, 1.01, f"shipped max_hops = {default_h}", fontsize=7.5, va="bottom", ha="center", color=MUTED,
                 transform=ax.get_xaxis_transform())
 
+    # Input: a pair id and a hop count. Output: that pair's results row for that hop.
     def row(p, h):
         return next(r for r in results[p]["rows"] if r["hops"] == h)
 
-    # ---- Figure 1: yield and signal
+    # Figure 1: yield and signal.
     fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
@@ -281,7 +287,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     fig.legend(handles, lab, loc="upper center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 1.0))
     save(fig, "fig_maxhops_yield.png", out_dirs)
 
-    # ---- Figure 2: quality and cost
+    # Figure 2: quality and cost.
     fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
@@ -309,7 +315,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     fig.legend(handles, lab, loc="upper center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 1.0))
     save(fig, "fig_maxhops_quality_cost.png", out_dirs)
 
-    # ---- Figure 3: what the 10 candidates handed to the LLM look like, by hop budget
+    # Figure 3: what the 10 candidates handed to the LLM look like, by hop budget.
     fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.3))
     ax = axes[0]
     for k, p in enumerate(pairs):
@@ -335,6 +341,7 @@ def make_figures(results: Dict[str, dict], out_dirs: Sequence[str]):
     save(fig, "fig_maxhops_candidates.png", out_dirs)
 
 
+# Save a figure to every output folder and close it. Input: the figure, a file name and the folders.
 def save(fig, name: str, out_dirs: Sequence[str]):
     import matplotlib.pyplot as plt
     first = None
@@ -350,6 +357,7 @@ def save(fig, name: str, out_dirs: Sequence[str]):
     print("wrote", name)
 
 
+# Command-line entry point: run the analysis for the requested pairs, write the JSON and, unless disabled, the figures.
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--pairs", nargs="+", default=DEFAULT_PAIRS)

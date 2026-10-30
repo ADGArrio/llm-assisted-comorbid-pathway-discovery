@@ -1,18 +1,9 @@
-"""Evidence-aware re-ranking: let Stage 3's tissue-expression result decide which of Stage 2's chains survive.
+"""Evidence floor: Stage 3's tissue-expression result decides which of Stage 2's chains survive, by a rule written in code.
 
-Stage 2 ranks its chains by debate before any independent evidence is collected, and Stage 3's results never feed
-back. This step closes that loop with a rule written in code, not a second LLM call:
-
-    A chain FAILS the evidence floor if
-      (a) any gene on it was checked in at least one tissue and is expressed in none of the tissues checked
-          for it (GTEx median below the threshold Stage 3 already used), or
-      (b) fewer than `min_fraction` (default 0.5) of its tissue checks with data came back expressed.
-
-    Chains that pass keep their debate order; chains that fail move below them, also in debate order. No chain is
-    dropped from the record. If every chain fails, `abstains` is True and no chain is recommended.
-
-The two thresholds were fixed before the rule was run on any saved result. The rule uses tissue expression only,
-so any evidence used to judge it afterwards (bridge-gene GWAS hits, edge literature) is held out from the rule.
+A chain FAILS the floor if (a) any gene on it was checked in at least one tissue and is expressed in none of the tissues
+checked for it, or (b) fewer than `min_fraction` (default 0.5) of its tissue checks with data came back expressed.
+Chains that pass keep their debate order; failing chains move below them, also in debate order. No chain is dropped.
+If every chain fails, `abstains` is True and no chain is recommended.
 
     python -m PipelineB.evidence_rerank --result outputs/pipeline_b_t2dm_cad_nometab.json
 """
@@ -24,8 +15,9 @@ from typing import Dict, List, Optional
 DEFAULT_MIN_FRACTION = 0.5
 
 
+# Count tissue checks per gene. Input: one chain's tissue_checks (dicts). Output: {gene: {"checked": checks with data,
+# "expressed": checks expressed}}.
 def gene_tissue_summary(tissue_checks: List[dict]) -> Dict[str, dict]:
-    # Input: one chain's tissue_checks (dicts). Output: {gene: {"checked": n with data, "expressed": n expressed}}.
     out: Dict[str, dict] = {}
     for t in tissue_checks:
         g = out.setdefault(t["gene_symbol"], {"checked": 0, "expressed": 0})
@@ -35,8 +27,9 @@ def gene_tissue_summary(tissue_checks: List[dict]) -> Dict[str, dict]:
     return out
 
 
+# Apply the evidence floor to one chain. Input: its Stage 3 result (dict) and the minimum expressed fraction. Output: a
+# dict with whether it passes and the reasons it does not.
 def assess_chain(stage3_chain: dict, min_fraction: float = DEFAULT_MIN_FRACTION) -> dict:
-    # Input: one chain's Stage 3 result (dict form). Output: whether it passes the evidence floor, and why not.
     genes = gene_tissue_summary(stage3_chain.get("tissue_checks", []))
     absent = sorted(g for g, s in genes.items() if s["checked"] > 0 and s["expressed"] == 0)
     unchecked = sorted(g for g, s in genes.items() if s["checked"] == 0)
@@ -60,9 +53,10 @@ def assess_chain(stage3_chain: dict, min_fraction: float = DEFAULT_MIN_FRACTION)
     }
 
 
+# Reorder chains by the evidence floor. Input: Stage 2's chains in debate order, Stage 3's per-chain results in the same
+# order, and the minimum fraction. Output: the new order, per-chain assessments, and whether the top chain changed or
+# the step abstains.
 def rerank(chains: List[dict], stage3: List[dict], min_fraction: float = DEFAULT_MIN_FRACTION) -> dict:
-    # Input: Stage 2's chains in debate order and Stage 3's per-chain results (same order, dict form).
-    # Output: the new order, per-chain assessments, and whether the top chain changed or the step abstains.
     if len(chains) != len(stage3):
         raise ValueError(f"{len(chains)} chains but {len(stage3)} Stage 3 results")
     assessments = [assess_chain(a, min_fraction) for a in stage3]
@@ -89,14 +83,15 @@ def rerank(chains: List[dict], stage3: List[dict], min_fraction: float = DEFAULT
     }
 
 
+# Input: a chain dict. Output: its genes joined by ">" (the label used in result tables).
 def chain_label(chain: dict) -> str:
-    # Input: a chain dict. Output: its genes joined by '>' (the label used in the thesis tables).
     edges = chain["edges"]
     return ">".join([edges[0]["source_gene"]] + [e["target_gene"] for e in edges])
 
 
+# Apply the floor to a saved result file. Input: a saved pipeline_b_<pair>.json as a dict and the minimum fraction.
+# Output: the rerank dict, or None if it has no chains.
 def rerank_saved(result: dict, min_fraction: float = DEFAULT_MIN_FRACTION) -> Optional[dict]:
-    # Input: a saved pipeline_b_<pair>.json (dict). Output: the rerank dict, or None when it has no chains.
     a2 = result.get("stage2")
     a3 = result.get("stage3") or []
     if not a2 or not a2.get("chains") or not a3:
@@ -107,6 +102,7 @@ def rerank_saved(result: dict, min_fraction: float = DEFAULT_MIN_FRACTION) -> Op
     return out
 
 
+# Render a rerank result as plain text. Input: the rerank dict. Output: the text.
 def _format(out: dict) -> str:
     lines = [f"Evidence floor: {out['n_pass']}/{out['n_chains']} chains pass"
              + ("  -> NO chain recommended" if out["abstains"] else "")]
@@ -119,6 +115,7 @@ def _format(out: dict) -> str:
     return "\n".join(lines)
 
 
+# Command-line entry point: read a saved result, print the evidence-floor outcome and save it as JSON.
 def _cli():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--result", required=True, help="a saved outputs/pipeline_b_<pair>*.json")

@@ -1,17 +1,7 @@
-"""
-Stage 1 -- Discovery.
-
-Service: none directly -- orchestrates OpenTargetsClient and PubMedClient
-via LangGraph. discover_disease1/discover_disease2 (Open Targets lookups)
-fan out from START and run concurrently; cite_genes (PubMed lookups) joins
-after both finish, since it needs their gene lists.
-Data: see opentargets_client.py / pubmed_client.py for each service's
-own data shape. This module's output is Stage1DiscoveryResult: two gene
-lists (one per disease), a gene->citations dict (every Citation tagged with
-the gene/disease search that found it), and citation_searches (one record per
-PubMed search actually run, including searches that returned nothing).
-A gene ranked in BOTH diseases' top-N is searched once per disease.
-Used by: PipelineB.stage2_judging (candidate gene pools + citations).
+"""Stage 1 Discovery: finds each disease's top Open Targets genes and their PubMed citations, orchestrated with LangGraph.
+The two Open Targets lookups run concurrently, then cite_genes searches PubMed for each disease's top genes (a gene ranked
+in both diseases is searched once per disease). Output is a Stage1DiscoveryResult: two gene lists, a gene -> citations
+dict and one record per PubMed search run.
 
 Usage:
     python -m PipelineB.stage1_discovery --pair t2dm_ad
@@ -33,6 +23,7 @@ DEFAULT_MAX_GENES_TO_CITE = 10
 DEFAULT_CITATIONS_PER_GENE = 2
 
 
+# LangGraph state passed between the Stage 1 nodes.
 class Stage1State(TypedDict, total=False):
     disease1: str
     disease2: str
@@ -44,6 +35,7 @@ class Stage1State(TypedDict, total=False):
     citation_searches: List[dict]
 
 
+# Stage 1 output: both diseases' EFO ids and gene lists, citations by gene, the PubMed search log and data versions.
 @dataclass
 class Stage1DiscoveryResult:
     disease1: str
@@ -53,15 +45,14 @@ class Stage1DiscoveryResult:
     disease1_targets: List[GeneAssociation]
     disease2_targets: List[GeneAssociation]
     citations: Dict[str, List[Citation]]
-    # One record per PubMed search run: which gene, which disease, the exact query, how many
-    # papers came back and how many matched in total. Includes zero-hit searches, which leave
-    # no Citation object behind. Defaults to [] so results built by hand or loaded from a run
-    # saved before 2026-10-15 still work.
+    # One record per PubMed search run (gene, disease, exact query, papers returned and total matches), including
+    # zero-hit searches. Defaults to [] for hand-built or older saved results.
     citation_searches: List[dict] = field(default_factory=list)
-    # Which data releases produced this result (Open Targets release, PubMed sort order, retrieval time), added
-    # 2026-10-18 so a saved run can be tied to the database versions that answered it. {} on older saved runs.
+    # Data releases that produced this result (Open Targets release, PubMed sort order, retrieval time); {} on older
+    # saved runs.
     data_versions: dict = field(default_factory=dict)
 
+    # Output: the result as a JSON-serializable dict.
     def to_dict(self) -> dict:
         return {
             "disease1": self.disease1,
@@ -75,10 +66,10 @@ class Stage1DiscoveryResult:
             "data_versions": self.data_versions,
         }
 
+    # Rebuild a result from a saved pipeline_b_<pair>.json "stage1" block, so Stages 2-4 can re-run on an earlier Stage
+    # 1. Input: that dict. Output: a Stage1DiscoveryResult.
     @classmethod
     def from_dict(cls, d: dict) -> "Stage1DiscoveryResult":
-        # Inverse of to_dict(): rebuild a result from a saved pipeline_b_<pair>.json's "stage1" block, so Stages
-        # 2-4 can be re-run on exactly the genes and citations of an earlier Stage 1 run (added 2026-10-18).
         fields = set(Citation.__dataclass_fields__)
         return cls(
             disease1=d["disease1"],
@@ -94,6 +85,7 @@ class Stage1DiscoveryResult:
         )
 
 
+# Build the Stage 1 LangGraph. Input: the clients and tuning parameters. Output: a compiled graph.
 def _build_graph(
     ot_client,
     pubmed_client,
@@ -101,34 +93,34 @@ def _build_graph(
     max_genes_to_cite: int,
     citations_per_gene: int,
 ):
-    # Input: clients + tuning params. Output: a compiled LangGraph graph (see module docstring for shape).
+    # Graph node: resolve disease 1 to an EFO id and fetch its associated genes. Input: graph state. Output: state
+    # update.
     def discover_disease1(state: Stage1State) -> dict:
-        efo_id = ot_client.search_disease(state["disease1"]) # returns Experimental Factor Ontology (EFO) ID
-        # Open Targets’ search actually returns up to 5 hits, each with an ID, a name, and a relevance score. 
-        # The function throws away everything except the first hit’s ID, on the assumption that the top hit is the right disease. 
-        # It does not check the name. It raises an error if no disease is found.
-        targets = ot_client.get_associated_targets(efo_id, min_score=min_score) # returns list of GeneAssociation objects
-        # returns a list of GeneAssociation objects, each containing the gene symbol, Ensembl ID, uniprot ID, and disease association score (range: 0.0 - 1.0, where 1.0 is the highest association).
+        efo_id = ot_client.search_disease(state["disease1"])  # Experimental Factor Ontology (EFO) id
+        # Takes the id of the top-ranked Open Targets hit without checking its name; raises if there is no hit.
+        targets = ot_client.get_associated_targets(efo_id, min_score=min_score)
+        # Each GeneAssociation holds the gene symbol, Ensembl id, UniProt id and a disease association score (0.0-1.0).
         return {"disease1_efo_id": efo_id, "disease1_targets": targets} # Stage 2 matches proteins by uniprot id.
 
+    # Graph node: the same lookup for disease 2. Input: graph state. Output: state update.
     def discover_disease2(state: Stage1State) -> dict:
         efo_id = ot_client.search_disease(state["disease2"])
         targets = ot_client.get_associated_targets(efo_id, min_score=min_score)
         return {"disease2_efo_id": efo_id, "disease2_targets": targets}
 
-    def cite_genes(state: Stage1State) -> dict: # Score Used: disease association score
+    # Graph node: take each disease's top genes by association score and search PubMed for citations. Input: graph
+    # state. Output: the citations by gene and the search log.
+    def cite_genes(state: Stage1State) -> dict:
         citations: Dict[str, List[Citation]] = {}
         searches: List[dict] = []
-        # Select the top genes based on their disease association score.
+        # Select the top genes by disease association score.
 
+        # Input: a disease's gene list. Output: the highest-scoring genes, up to the citation limit.
         def top_genes(targets: List[GeneAssociation]) -> List[GeneAssociation]:
             return sorted(targets, key=lambda t: t.disease_assoc_score, reverse=True)[:max_genes_to_cite]
 
-        # Every gene in a disease's top-N is searched against THAT disease. A gene in both diseases'
-        # top-N is therefore searched twice (once per disease) and ends up with citations from both
-        # searches under its one key, each Citation tagged with the disease that search used.
-        # (Before 2026-10-15 such a gene was skipped on the disease-2 side, so its disease-2
-        # literature was never looked up, and disease 2 lost a slot instead of backfilling.)
+        # Every gene in a disease's top-N is searched against that disease, so a gene in both lists is searched twice
+        # and carries citations from both searches under one key.
         for disease_key, efo_key, targets_key in (
             ("disease1", "disease1_efo_id", "disease1_targets"),
             ("disease2", "disease2_efo_id", "disease2_targets"),
@@ -166,6 +158,8 @@ def _build_graph(
     return graph.compile()
 
 
+# Run Stage 1. Input: two disease names, optional clients (defaults to the real ones; tests pass stubs) and tuning
+# parameters. Output: a Stage1DiscoveryResult.
 def run_stage1_discovery(
     disease1: str,
     disease2: str,
@@ -175,8 +169,6 @@ def run_stage1_discovery(
     max_genes_to_cite: int = DEFAULT_MAX_GENES_TO_CITE,
     citations_per_gene: int = DEFAULT_CITATIONS_PER_GENE,
 ) -> Stage1DiscoveryResult:
-    # Input: two disease names, optional clients (default to real OpenTargetsClient/PubMedClient;
-    # pass Stub* clients in tests), tuning params. Output: Stage1DiscoveryResult.
     ot_client = ot_client or OpenTargetsClient()
     pubmed_client = pubmed_client or PubMedClient()
 
@@ -196,9 +188,9 @@ def run_stage1_discovery(
     )
 
 
+# Record which data releases answered. Output: retrieval time, Open Targets version (or the error string if the lookup
+# failed) and PubMed sort order.
 def _data_versions(ot_client, pubmed_client) -> dict:
-    # Output: {"retrieved_at_utc", "open_targets": {...}, "pubmed_sort"}. Looking up the version must never
-    # break a run (it is metadata), so a failure is recorded as an error string instead of raised.
     versions: dict = {"retrieved_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     getter = getattr(ot_client, "get_data_version", None)
     if getter is not None:
@@ -210,6 +202,7 @@ def _data_versions(ot_client, pubmed_client) -> dict:
     return versions
 
 
+# Command-line entry point: run the stage for a disease pair chosen by id or by name and print the result as JSON.
 def _cli():
     parser = argparse.ArgumentParser(description="Run Stage 1 (Discovery) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")

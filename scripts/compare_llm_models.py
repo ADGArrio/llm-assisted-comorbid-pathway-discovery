@@ -1,26 +1,18 @@
-"""Multi-model comparison on the HARDENED pipeline.
+"""Multi-model comparison on the hardened pipeline: runs Stages 2 and 3 and the evidence floor once per run, per model, per disease pair,
+on the same Stage 1 output (the one saved in outputs/pipeline_b_<pair>.json).
 
-Runs Stages 2 and 3 and the evidence floor once per run, per model, per disease pair, on the same Stage 1 output
-(the one saved in outputs/pipeline_b_<pair>.json, so every model sees the candidates the final gemma4 runs saw).
-Stage 2 uses the full hardened settings: two-order judge plus the repeat (noise-control) pass, edge strength and
-bridge-gene PubMed titles shown to the judge, and a two-order debate. Stage 3 runs without the random-gene baseline
-(that baseline does not depend on the language model). The evidence floor is applied to every run.
-
-MUST be run on the machine where Ollama runs: the language-model calls go to LLM_BASE_URL (default
-http://localhost:11434), which the cloud sandbox and the device-bridge shell cannot reach.
-
-Each model is first copied to a 16,384-token-context version (`<tag>-16k`, via `ollama create`), because the default
-context truncates judge replies on the larger prompts (the same reason the final gemma4 runs use gemma4-16k).
+Stage 2 uses the full hardened settings (two-order judge plus the repeat control pass, edge strength and bridge-gene titles shown to the
+judge, and a two-order debate); Stage 3 runs without the random-gene baseline; the evidence floor is applied to every run. Each model is
+first copied to a 16,384-token-context version (`<tag>-16k`, via `ollama create`) because the default context truncates judge replies.
+Must be run on the machine where Ollama runs (LLM_BASE_URL, default http://localhost:11434).
 
     python3 -m scripts.compare_llm_models                                   # all three models, 3 runs each, both pairs
     python3 -m scripts.compare_llm_models --pairs t2dm_ad --models qwen3:14b --runs 1      # quick test
 
-Gemma4 is included by default so that all three models are run under exactly the same harness and settings.
-
 Output, in outputs/model_comparison_hardened/:
     <pair>__<model>__run<k>.json     one saved pipeline_b-style result per run (stage1, stage2, stage3)
     summary.json                     one row per (pair, model) and one row per run
-    multimodel_table.tex             LaTeX table fragment the thesis \\input's
+    multimodel_table.tex             LaTeX table fragment the thesis \input's
     run_log.txt                      printed summary
 """
 import argparse
@@ -47,13 +39,14 @@ PAIRS = ["t2dm_ad", "t2dm_cad"]
 PAIR_LABEL = {"t2dm_ad": "T2DM to AD", "t2dm_cad": "T2DM to CAD"}
 
 
+# Input: a model tag such as "deepseek-r1:14b". Output: a filesystem-safe version.
 def _safe_tag(model: str) -> str:
-    # Input: a model tag such as "deepseek-r1:14b". Output: a filesystem-safe version.
     return re.sub(r"[^A-Za-z0-9_.-]", "_", model)
 
 
+# Input: an Ollama model tag and a context size. Output: the tag of a copy with that context window (created if
+# missing).
 def make_16k_copy(model: str, ctx: int = 16384) -> str:
-    # Input: an Ollama model tag. Output: the tag of a copy with a `ctx`-token context window (created if missing).
     name = f"{model.replace(':', '-')}-{ctx // 1024}k"
     with tempfile.TemporaryDirectory() as d:
         mf = Path(d) / "Modelfile"
@@ -64,16 +57,17 @@ def make_16k_copy(model: str, ctx: int = 16384) -> str:
     return name
 
 
+# Free the model's memory before the next one loads; a failure is only a warning. Input: model tag. Output: none.
 def unload(model: str) -> None:
-    # Free the model's memory before the next one loads; a failure here is only a warning.
     try:
         subprocess.run(["ollama", "stop", model], check=False, capture_output=True, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         print(f"  (warning: could not unload {model}: {e})")
 
 
+# Load the saved Stage 1 output so every model judges the same candidates; Stage 1 is run only if none is saved. Input:
+# pair id and the two disease names. Output: a Stage1DiscoveryResult.
 def load_stage1(pair_id: str, disease1: str, disease2: str) -> Stage1DiscoveryResult:
-    # The saved Stage 1 output, so every model judges the same candidates; Stage 1 is run only if none is saved.
     saved = ROOT / "outputs" / f"pipeline_b_{pair_id}.json"
     if saved.exists():
         return Stage1DiscoveryResult.from_dict(json.loads(saved.read_text())["stage1"])
@@ -81,8 +75,8 @@ def load_stage1(pair_id: str, disease1: str, disease2: str) -> Stage1DiscoveryRe
     return run_stage1_discovery(disease1, disease2)
 
 
+# Input: one pipeline_b-style result dict. Output: the numbers the comparison reports for that run.
 def summarise_run(result: dict) -> dict:
-    # Input: one pipeline_b-style result dict. Output: the numbers the comparison reports for that run.
     a2 = result.get("stage2")
     row = {"endorsed": 0, "candidates": 0, "fwd": None, "rev": None, "rpt": None, "disagree_order": None,
            "disagree_noise": None, "top_label": None, "floor_top_label": None, "chains": 0, "chains_pass_floor": 0,
@@ -112,8 +106,8 @@ def summarise_run(result: dict) -> dict:
     return row
 
 
+# Input: the per-run rows for one (pair, model). Output: stability numbers across those runs.
 def summarise_model(rows: list) -> dict:
-    # Input: the per-run rows for one (pair, model). Output: stability numbers across those runs.
     n = len(rows)
     endorsed = [r["endorsed"] for r in rows]
     tops = [r["top_label"] or "(none)" for r in rows]
@@ -136,19 +130,19 @@ def summarise_model(rows: list) -> dict:
     }
 
 
-
 RUN_FILE_RE = re.compile(r"^(?P<pair>t2dm_[a-z]+)__(?P<tag>.+)__run(?P<k>\d+)\.json$")
 FAIL_FILE_RE = re.compile(r"^(?P<pair>t2dm_[a-z]+)__(?P<tag>.+)__run(?P<k>\d+)\.FAILED\.txt$")
 
 
+# Input: a file tag such as "deepseek-r1_14b" (the model with ':' replaced by '_'). Output: the model name
+# "deepseek-r1:14b".
 def _model_from_tag(tag: str) -> str:
-    # "deepseek-r1_14b" -> "deepseek-r1:14b" (the tag is the model with ':' replaced by '_')
     return tag.rsplit("_", 1)[0] + ":" + tag.rsplit("_", 1)[1] if "_" in tag else tag
 
 
+# Rebuild the per-run rows from every saved run file in the output folder, so results from separate invocations are
+# combined; failed runs are listed separately. Output: the rows and the failed-run records.
 def collect_rows_from_disk() -> dict:
-    # Rebuilds the per-run rows from every saved run file in the output folder, so that results from separate
-    # invocations (one pair at a time, or one model at a time) are combined. Failed runs are listed separately.
     rows_by, failed_by = {}, {}
     for f in sorted(OUTPUT_DIR.glob("*.json")):
         m = RUN_FILE_RE.match(f.name)
@@ -166,8 +160,9 @@ def collect_rows_from_disk() -> dict:
     return rows_by, failed_by
 
 
+# Input: {(pair, model): summary} and the failed runs. Output: a LaTeX table fragment (a tabular inside a table
+# environment).
 def latex_table(per_model: dict, failed: dict = None) -> str:
-    # Input: {(pair, model): summary}. Output: a LaTeX table fragment (tabular inside a table environment).
     lines = [
         r"\begin{table}[h]", r"\centering", r"\footnotesize", r"\setlength{\tabcolsep}{3pt}",
         r"\caption{Hardened pipeline run with each language model on the same Stage~1 output. ``Endorsed'' is the number of "
@@ -199,8 +194,9 @@ def latex_table(per_model: dict, failed: dict = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Run one hardened Stage 2 + Stage 3 run with a model, save it and return the pipeline_b-style result dict. Input: the
+# Stage 1 result, model name, pair id, file tag, run number k, timeout and label.
 def run_once(a1, model_name: str, pair_id: str, tag: str, k: int, timeout: int = 300, label: str = "") -> dict:
-    # One hardened Stage 2 + Stage 3 run with `model_name`. Saves and returns the pipeline_b-style result dict.
     client = LLMClient(model=model_name, timeout=timeout)
     try:
         a2 = run_stage2_judging(a1, metalinks_client=None, llm_client=client, judge_control_pass=True,
@@ -216,6 +212,7 @@ def run_once(a1, model_name: str, pair_id: str, tag: str, k: int, timeout: int =
     return result
 
 
+# Command-line entry point: run the requested models, pairs and runs, then write the summary files.
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--pairs", nargs="+", default=PAIRS, choices=PAIRS)
@@ -261,8 +258,8 @@ def main():
     write_summary()
 
 
+# Combine every saved run in the output folder (including earlier invocations) into the summary files.
 def write_summary() -> None:
-    # Combines every saved run in the output folder (including those from earlier invocations) into the summary files.
     rows_by, failed_by = collect_rows_from_disk()
     per_model = {k: summarise_model(v) for k, v in sorted(rows_by.items())}
     all_rows = [r for v in rows_by.values() for r in v]
@@ -284,6 +281,7 @@ def write_summary() -> None:
     print(f"\nsaved -> {OUTPUT_DIR}")
 
 
+# Rebuild the summary files from the saved runs without running any model (the --summary-only option).
 def summary_only() -> None:
     write_summary()
 

@@ -1,6 +1,6 @@
-"""Tests for scripts/classify_citations.py. Stub LLM only: these check the plumbing (prompt, parsing,
-quote-grounding, retries, bookkeeping), NOT whether a real model labels papers correctly -- that is
-what the hand-labeled validation sample is for."""
+"""Tests for scripts/classify_citations.py with a stub LLM: they check the plumbing (prompt, parsing, quote grounding, retries,
+bookkeeping), not whether a real model labels papers correctly (that is what the hand-labelled validation sample is for).
+"""
 import csv
 import json
 
@@ -34,6 +34,7 @@ ABSTRACT = (
 RECORD = {"gene_symbol": "INSR", "disease_name": "Alzheimer's Disease", "pmid": "111", "title": TITLE}
 
 
+# Build a JSON model reply with the given label, quote and focus flags.
 def _reply(label="mechanism", quote="INSR knockdown in primary neurons reduced AKT phosphorylation by 60%.",
            focus=True, disease_focus=True):
     return json.dumps({"evidence_type": label, "quote": quote, "gene_is_focus": focus,
@@ -42,6 +43,7 @@ def _reply(label="mechanism", quote="INSR knockdown in primary neurons reduced A
 
 # --- prompt ---
 
+# Prompt contains gene disease text and every label.
 def test_prompt_contains_gene_disease_text_and_every_label():
     p = build_prompt("INSR", "Alzheimer's Disease", TITLE, ABSTRACT)
     assert "Gene: INSR" in p and "Disease: Alzheimer's Disease" in p
@@ -52,6 +54,7 @@ def test_prompt_contains_gene_disease_text_and_every_label():
 
 # --- parse_response ---
 
+# Parse valid JSON.
 def test_parse_valid_json():
     assert parse_response(_reply()) == {
         "evidence_type": "mechanism",
@@ -61,10 +64,12 @@ def test_parse_valid_json():
     }
 
 
+# Parse tolerates code fence and preamble.
 def test_parse_tolerates_code_fence_and_preamble():
     assert parse_response("Sure!\n```json\n" + _reply("review", "x", False) + "\n```")["evidence_type"] == "review"
 
 
+# Parse rejects malformed.
 @pytest.mark.parametrize("bad", [
     "", "no json here", "{not json}", "[1, 2]",
     json.dumps({"evidence_type": "causal", "quote": "q", "gene_is_focus": True}),   # label not in the set
@@ -79,23 +84,28 @@ def test_parse_rejects_malformed(bad):
 
 # --- quote grounding / gene presence ---
 
+# Quote grounded ignores case whitespace and trailing period.
 def test_quote_grounded_ignores_case_whitespace_and_trailing_period():
     assert quote_is_grounded("insr knockdown  in primary neurons\nreduced AKT phosphorylation by 60%", TITLE, ABSTRACT)
 
 
+# Quote grounded handles curly quotes and dashes.
 def test_quote_grounded_handles_curly_quotes_and_dashes():
     assert quote_is_grounded("type-2 \"risk\"", "", "A type–2 “risk” factor")
 
 
+# Quote not grounded when invented or empty.
 def test_quote_not_grounded_when_invented_or_empty():
     assert not quote_is_grounded("INSR activates mTOR in microglia", TITLE, ABSTRACT)
     assert not quote_is_grounded("", TITLE, ABSTRACT)
 
 
+# Quote can come from title.
 def test_quote_can_come_from_title():
     assert quote_is_grounded("INSR knockdown impairs insulin signalling", TITLE, ABSTRACT)
 
 
+# Gene in text is whole token.
 def test_gene_in_text_is_whole_token():
     assert gene_in_text("INSR", TITLE, ABSTRACT)
     assert not gene_in_text("INS", TITLE, ABSTRACT)  # INS must not match inside INSR
@@ -104,6 +114,7 @@ def test_gene_in_text_is_whole_token():
 
 # --- classify_paper ---
 
+# Classify good response is verified and not flagged.
 def test_classify_good_response_is_verified_and_not_flagged():
     out = classify_paper(StubLLMClient(fixed_response=_reply()), RECORD, ABSTRACT)
     assert out["evidence_type"] == "mechanism" and out["quote_verified"] is True
@@ -111,18 +122,21 @@ def test_classify_good_response_is_verified_and_not_flagged():
     assert out["pmid"] == "111" and out["disease_name"] == "Alzheimer's Disease"  # record fields kept
 
 
+# Classify flags hallucinated quote but keeps label.
 def test_classify_flags_hallucinated_quote_but_keeps_label():
     out = classify_paper(StubLLMClient(fixed_response=_reply(quote="INSR was knocked out in mice")), RECORD, ABSTRACT)
     assert out["evidence_type"] == "mechanism"
     assert out["quote_verified"] is False and out["needs_review"] is True
 
 
+# Classify retries once after unparseable reply.
 def test_classify_retries_once_after_unparseable_reply():
     stub = StubLLMClient(responses=["I think it is a mechanism paper.", _reply()])
     out = classify_paper(stub, RECORD, ABSTRACT)
     assert out["evidence_type"] == "mechanism" and out["n_attempts"] == 2 and len(stub.prompts) == 2
 
 
+# Classify gives parse failed after all attempts.
 def test_classify_gives_parse_failed_after_all_attempts():
     stub = StubLLMClient(fixed_response="nope")
     out = classify_paper(stub, RECORD, ABSTRACT)
@@ -130,6 +144,7 @@ def test_classify_gives_parse_failed_after_all_attempts():
     assert out["n_attempts"] == 2 and out["error"]
 
 
+# Classify without abstract skips the LLM.
 def test_classify_without_abstract_skips_the_llm():
     stub = StubLLMClient(fixed_response=_reply())
     out = classify_paper(stub, RECORD, None)
@@ -137,10 +152,13 @@ def test_classify_without_abstract_skips_the_llm():
     assert stub.prompts == []
 
 
+# Classify uses temperature zero.
 def test_classify_uses_temperature_zero():
     seen = []
 
+    # LLM stand-in that records the temperature it is called with.
     class Spy:
+        # Record the temperature and return a valid reply.
         def generate(self, prompt, temperature=0.3):
             seen.append(temperature)
             return _reply()
@@ -151,7 +169,9 @@ def test_classify_uses_temperature_zero():
 
 # --- load_citation_records ---
 
+# Build a saved pipeline_b-style dict with Stage 1 gene lists and the given citations.
 def _saved(citations, d1_genes=("INSR", "TCF7L2"), d2_genes=("APP", "APOE")):
+    # Build scored target dicts for a list of genes.
     def targets(genes):
         return [{"gene_symbol": g, "disease_assoc_score": 0.9 - i * 0.1} for i, g in enumerate(genes)]
     return {"stage1": {"disease1": "Type 2 Diabetes Mellitus", "disease2": "Alzheimer's Disease",
@@ -159,17 +179,20 @@ def _saved(citations, d1_genes=("INSR", "TCF7L2"), d2_genes=("APP", "APOE")):
                        "citations": citations}}
 
 
+# Old format citations get disease from top genes.
 def test_old_format_citations_get_disease_from_top_genes():
     recs = load_citation_records(_saved({"INSR": [{"pmid": "1", "title": "t"}], "APP": [{"pmid": "2", "title": "u"}]}))
     assert {(r["gene_symbol"], r["disease_name"]) for r in recs} == {
         ("INSR", "Type 2 Diabetes Mellitus"), ("APP", "Alzheimer's Disease")}
 
 
+# Old format shared gene is marked ambiguous not guessed.
 def test_old_format_shared_gene_is_marked_ambiguous_not_guessed():
     recs = load_citation_records(_saved({"INSR": [{"pmid": "1", "title": "t"}]}, d2_genes=("INSR", "APP")))
     assert recs[0]["disease_name"].startswith("ambiguous")
 
 
+# New format citation keeps its own disease.
 def test_new_format_citation_keeps_its_own_disease():
     recs = load_citation_records(_saved({"INSR": [
         {"pmid": "1", "title": "t", "disease_name": "Alzheimer's Disease", "search_rank": 1, "pubtype": ["Review"]}]}))
@@ -178,6 +201,7 @@ def test_new_format_citation_keeps_its_own_disease():
 
 # --- summarize / review sample / run ---
 
+# Build a small list of classified records covering a mechanism paper and an incidental mention.
 def _classified():
     mech = classify_paper(StubLLMClient(fixed_response=_reply()), RECORD, ABSTRACT)
     inc = classify_paper(StubLLMClient(fixed_response=_reply("incidental_mention", "Insulin resistance is common in Alzheimer's disease.", False)),
@@ -186,6 +210,7 @@ def _classified():
     return [mech, inc, none]
 
 
+# Summarize counts by label and disease.
 def test_summarize_counts_by_label_and_disease():
     s = summarize(_classified())
     assert s["n_papers"] == 3 and s["overall"]["mechanism"] == 1 and s["overall"]["incidental_mention"] == 1
@@ -194,10 +219,12 @@ def test_summarize_counts_by_label_and_disease():
     assert s["n_needs_review"] == 1 and s["fraction_mechanism"] == round(1 / 3, 3)
 
 
+# Summarize empty does not divide by zero.
 def test_summarize_empty_does_not_divide_by_zero():
     assert summarize([])["fraction_mechanism"] is None
 
 
+# Review sample csv has no model label and is reproducible.
 def test_review_sample_csv_has_no_model_label_and_is_reproducible(tmp_path):
     papers = _classified()
     a, b = tmp_path / "a.csv", tmp_path / "b.csv"
@@ -208,15 +235,19 @@ def test_review_sample_csv_has_no_model_label_and_is_reproducible(tmp_path):
     assert len(rows) == 2 and "evidence_type" not in rows[0] and rows[0]["your_label"] == ""
 
 
+# PubMed stand-in that serves fixed abstracts and records the PMIDs it was asked for.
 class _FakePubMed:
+    # Store the canned data.
     def __init__(self, abstracts):
         self.abstracts, self.asked = abstracts, None
 
+    # Record the requested PMIDs and return the fixed abstracts.
     def fetch_abstracts(self, pmids):
         self.asked = list(pmids)
         return self.abstracts
 
 
+# Run end to end writes JSON.
 def test_run_end_to_end_writes_json(tmp_path):
     src = tmp_path / "pipeline_b_x.json"
     src.write_text(json.dumps(_saved({"INSR": [{"pmid": "111", "title": TITLE}, {"pmid": "999", "title": "no abs"}]})))
@@ -227,6 +258,7 @@ def test_run_end_to_end_writes_json(tmp_path):
     assert payload["papers"][0]["abstract"] == ABSTRACT
 
 
+# Run limit caps papers.
 def test_run_limit_caps_papers(tmp_path):
     src = tmp_path / "s.json"
     src.write_text(json.dumps(_saved({"INSR": [{"pmid": str(i), "title": "t"} for i in range(5)]})))
@@ -235,6 +267,7 @@ def test_run_limit_caps_papers(tmp_path):
     assert len(payload["papers"]) == 2 and pm.asked == ["0", "1"]
 
 
+# Summarize counts papers where the disease is not the focus.
 def test_summarize_counts_papers_where_the_disease_is_not_the_focus():
     off = classify_paper(StubLLMClient(fixed_response=_reply("genetic_association", disease_focus=False)), RECORD, ABSTRACT)
     on = classify_paper(StubLLMClient(fixed_response=_reply()), RECORD, ABSTRACT)
@@ -242,18 +275,21 @@ def test_summarize_counts_papers_where_the_disease_is_not_the_focus():
     assert summarize([off, on, skipped])["n_disease_not_the_focus"] == 1
 
 
+# Clinical study is an accepted label.
 def test_clinical_study_is_an_accepted_label():
     assert parse_response(_reply("clinical_study"))["evidence_type"] == "clinical_study"
 
 
-# --- progress / checkpointing / resume (added 2026-10-15 after a slow live run) ---
+# --- progress, checkpointing and resume ---
 
+# Write a saved pipeline file with two papers for INSR and return its path.
 def _two_paper_source(tmp_path):
     src = tmp_path / "s.json"
     src.write_text(json.dumps(_saved({"INSR": [{"pmid": "1", "title": "t"}, {"pmid": "2", "title": "u"}]})))
     return src
 
 
+# Run calls progress once per paper.
 def test_run_calls_progress_once_per_paper(tmp_path):
     seen = []
     run(str(_two_paper_source(tmp_path)), str(tmp_path / "o.json"), StubLLMClient(fixed_response=_reply()),
@@ -261,6 +297,7 @@ def test_run_calls_progress_once_per_paper(tmp_path):
     assert seen == [(1, 2, False), (2, 2, False)]
 
 
+# Run saves after every paper so an interrupted run keeps its work.
 def test_run_saves_after_every_paper_so_an_interrupted_run_keeps_its_work(tmp_path):
     out = tmp_path / "o.json"
     stub = StubLLMClient(responses=[_reply()])  # 2nd generate() call raises (queue exhausted), like a crash/Ctrl-C
@@ -270,6 +307,7 @@ def test_run_saves_after_every_paper_so_an_interrupted_run_keeps_its_work(tmp_pa
     assert [p["pmid"] for p in saved["papers"]] == ["1"] and saved["complete"] is False
 
 
+# Run marks complete when finished.
 def test_run_marks_complete_when_finished(tmp_path):
     out = tmp_path / "o.json"
     run(str(_two_paper_source(tmp_path)), str(out), StubLLMClient(fixed_response=_reply()),
@@ -277,6 +315,7 @@ def test_run_marks_complete_when_finished(tmp_path):
     assert json.loads(out.read_text())["complete"] is True
 
 
+# Resume skips finished papers and does not call the LLM for them.
 def test_resume_skips_finished_papers_and_does_not_call_the_llm_for_them(tmp_path):
     src, out = _two_paper_source(tmp_path), tmp_path / "o.json"
     with pytest.raises(Exception):  # first run dies after paper 1
@@ -288,6 +327,7 @@ def test_resume_skips_finished_papers_and_does_not_call_the_llm_for_them(tmp_pat
     assert payload["complete"] is True
 
 
+# Resume retries a parse failed paper.
 def test_resume_retries_a_parse_failed_paper(tmp_path):
     src, out = _two_paper_source(tmp_path), tmp_path / "o.json"
     run(str(src), str(out), StubLLMClient(fixed_response="garbage"), _FakePubMed({"1": ABSTRACT, "2": ABSTRACT}))
@@ -296,6 +336,7 @@ def test_resume_retries_a_parse_failed_paper(tmp_path):
     assert payload["summary"]["overall"]["mechanism"] == 2
 
 
+# Without resume an existing file is overwritten.
 def test_without_resume_an_existing_file_is_overwritten(tmp_path):
     src, out = _two_paper_source(tmp_path), tmp_path / "o.json"
     run(str(src), str(out), StubLLMClient(fixed_response=_reply()), _FakePubMed({"1": ABSTRACT, "2": ABSTRACT}))
@@ -304,28 +345,33 @@ def test_without_resume_an_existing_file_is_overwritten(tmp_path):
     assert len(stub.prompts) == 2 and payload["summary"]["overall"]["review"] == 2
 
 
-# --- ellipsis-tolerant quote check, pair-support rule, regrade (added 2026-10-15 after the first full run) ---
+# --- ellipsis-tolerant quote check, pair-support rule, regrade ---
 
+# Quote with ellipsis is grounded when every fragment is found in order.
 def test_quote_with_ellipsis_is_grounded_when_every_fragment_is_found_in_order():
     q = "BACKGROUND: Insulin resistance is common ... INSR knockdown in primary neurons reduced AKT phosphorylation"
     assert quote_is_grounded(q, TITLE, ABSTRACT)
     assert quote_is_grounded(q.replace("...", "\u2026"), TITLE, ABSTRACT)  # the single-character ellipsis too
 
 
+# Quote with ellipsis fails when a fragment is invented or out of order.
 def test_quote_with_ellipsis_fails_when_a_fragment_is_invented_or_out_of_order():
     assert not quote_is_grounded("Insulin resistance is common ... INSR activates mTOR in microglia", TITLE, ABSTRACT)
     assert not quote_is_grounded("INSR knockdown in primary neurons ... Insulin resistance is common", TITLE, ABSTRACT)
 
 
+# Quote with ellipsis rejects tiny fragments that match anything.
 def test_quote_with_ellipsis_rejects_tiny_fragments_that_match_anything():
     assert not quote_is_grounded("INSR knockdown in primary neurons ... a ... phosphorylation by 60%", TITLE, ABSTRACT)
 
 
+# Build a classified record with the given label and focus flags.
 def _paper(label, gene_focus=True, disease_focus=True, gene="INSR", disease="Alzheimer's Disease"):
     return {"gene_symbol": gene, "disease_name": disease, "evidence_type": label, "gene_is_focus": gene_focus,
             "disease_is_focus": disease_focus, "needs_review": False, "gene_in_text": True}
 
 
+# Supports pair requires disease focus and a non incidental label.
 def test_supports_pair_requires_disease_focus_and_a_non_incidental_label():
     assert supports_pair(_paper("genetic_association", gene_focus=False))
     assert not supports_pair(_paper("genetic_association", disease_focus=False))
@@ -334,11 +380,13 @@ def test_supports_pair_requires_disease_focus_and_a_non_incidental_label():
     assert not supports_pair(_paper("parse_failed", gene_focus=None, disease_focus=None))
 
 
+# Supports pair strict version also needs the gene to be the focus.
 def test_supports_pair_strict_version_also_needs_the_gene_to_be_the_focus():
     assert supports_pair(_paper("mechanism"), require_gene_focus=True)
     assert not supports_pair(_paper("mechanism", gene_focus=False), require_gene_focus=True)
 
 
+# Gene focused mechanism needs all three conditions.
 def test_gene_focused_mechanism_needs_all_three_conditions():
     assert is_gene_focused_mechanism(_paper("mechanism"))
     assert not is_gene_focused_mechanism(_paper("mechanism", gene_focus=False))
@@ -346,6 +394,7 @@ def test_gene_focused_mechanism_needs_all_three_conditions():
     assert not is_gene_focused_mechanism(_paper("genetic_association"))
 
 
+# Summarize pair level and gene level counts.
 def test_summarize_pair_level_and_gene_level_counts():
     papers = [
         _paper("mechanism", gene="APP"),                          # APP: gene-focused mechanism
@@ -364,6 +413,7 @@ def test_summarize_pair_level_and_gene_level_counts():
     assert s["fraction_mechanism"] == 0.6 and s["fraction_mechanism_gene_focus"] == 0.2
 
 
+# Regrade saved rechecks quotes without calling the LLM.
 def test_regrade_saved_rechecks_quotes_without_calling_the_llm(tmp_path):
     ellipsis_quote = "BACKGROUND: Insulin resistance is common ... INSR knockdown in primary neurons"
     old = classify_paper(StubLLMClient(fixed_response=_reply(quote=ellipsis_quote)), RECORD,
@@ -379,8 +429,9 @@ def test_regrade_saved_rechecks_quotes_without_calling_the_llm(tmp_path):
     assert json.loads(path.read_text())["regraded"] is True
 
 
-# --- compound_study label + prompt versioning (added 2026-10-15) ---
+# --- compound_study label and prompt versioning ---
 
+# Compound study is a label and the prompt explains it.
 def test_compound_study_is_a_label_and_the_prompt_explains_it():
     assert parse_response(_reply("compound_study"))["evidence_type"] == "compound_study"
     p = build_prompt("ACHE", "Alzheimer's Disease", "t", "a")
@@ -389,16 +440,19 @@ def test_compound_study_is_a_label_and_the_prompt_explains_it():
     assert "compound_study" in ALL_LABELS
 
 
+# Mechanism definition no longer includes drugs.
 def test_mechanism_definition_no_longer_includes_drugs():
     assert "drug acting through the gene" not in EVIDENCE_TYPES["mechanism"]
 
 
+# Compound study counts as supporting the pair only when the disease is the focus.
 def test_compound_study_counts_as_supporting_the_pair_only_when_the_disease_is_the_focus():
     assert supports_pair(_paper("compound_study"))
     assert not supports_pair(_paper("compound_study", disease_focus=False))
     assert not is_gene_focused_mechanism(_paper("compound_study"))
 
 
+# Output records the prompt version.
 def test_output_records_the_prompt_version(tmp_path):
     out = tmp_path / "o.json"
     run(str(_two_paper_source(tmp_path)), str(out), StubLLMClient(fixed_response=_reply()),
@@ -406,6 +460,7 @@ def test_output_records_the_prompt_version(tmp_path):
     assert json.loads(out.read_text())["prompt_version"] == PROMPT_VERSION
 
 
+# Resume refuses to mix labels from a different prompt version.
 def test_resume_refuses_to_mix_labels_from_a_different_prompt_version(tmp_path):
     src, out = _two_paper_source(tmp_path), tmp_path / "o.json"
     run(str(src), str(out), StubLLMClient(fixed_response=_reply()), _FakePubMed({"1": ABSTRACT, "2": ABSTRACT}))
@@ -416,6 +471,7 @@ def test_resume_refuses_to_mix_labels_from_a_different_prompt_version(tmp_path):
         run(str(src), str(out), StubLLMClient(fixed_response=_reply()), _FakePubMed({}), resume=True)
 
 
+# Resume treats a file without a version as v1.
 def test_resume_treats_a_file_without_a_version_as_v1(tmp_path):
     src, out = _two_paper_source(tmp_path), tmp_path / "o.json"
     run(str(src), str(out), StubLLMClient(fixed_response=_reply()), _FakePubMed({"1": ABSTRACT, "2": ABSTRACT}))
@@ -426,11 +482,12 @@ def test_resume_treats_a_file_without_a_version_as_v1(tmp_path):
         run(str(src), str(out), StubLLMClient(fixed_response=_reply()), _FakePubMed({}), resume=True)
 
 
-# --- v3: review beats compound_study (added 2026-10-18) ---
+# --- v3: a review beats compound_study ---
 
+# Prompt v3 tells the model a drug review is a review.
 def test_prompt_v3_tells_the_model_a_drug_review_is_a_review():
     p = build_prompt("ADAM10", "Alzheimer's Disease", "t", "a")
     assert PROMPT_VERSION == "v3-review-beats-compound"
     assert "review is a review even when a drug or compound is its subject" in p
-    # the review check must come before the compound_study rule in the Rules list
+    # The review check must come before the compound_study rule in the Rules list.
     assert p.index("choose review, even when a drug") < p.index("choose compound_study, even when it also reports")

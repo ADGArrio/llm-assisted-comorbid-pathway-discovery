@@ -1,21 +1,16 @@
-"""
-Pipeline A -- Orphaned LLM (ungrounded baseline).
-
-Service: LLMClient (common/llm_client.py) -- one call, no retrieval, no tools.
-Data: two disease names in; free-text narrative out.
-Used by: standalone CLI, and as the control arm compared against Pipeline B.
+"""Pipeline A, the ungrounded baseline: one LLM call with no retrieval or tools turns two disease names into a free-text mechanism narrative.
 
 Usage:
     python -m PipelineA.pipeline_a --pair t2dm_ad
-    python -m PipelineA.pipeline_a --disease1 "Type 2 Diabetes Mellitus" --disease2 "Alzheimer's Disease"  
+    python -m PipelineA.pipeline_a --disease1 "Type 2 Diabetes Mellitus" --disease2 "Alzheimer's Disease"
 """
 import argparse
 import json
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-from common.config import DISEASE_PAIRS, get_pair # This is where the two pairs live. It also holds the GTEx tissue lists and the MIMIC ICD mappings
-from common.llm_client import LLMClient # LLMClient is the interface to the LLM. It has a generate() method that takes a prompt and returns a string.
+from common.config import DISEASE_PAIRS, get_pair
+from common.llm_client import LLMClient
 
 PROMPT_TEMPLATE = """You are a biomedical researcher. Explain the most likely molecular \
 mechanism connecting these two diseases:
@@ -32,25 +27,28 @@ natural-language summary of the overall mechanism.
 Use your own knowledge only. Do not say you need to look anything up."""
 
 
+# Result of one Pipeline A run: the two disease names and the narrative.
 @dataclass
 class PipelineAResult:
     disease1: str
     disease2: str
     narrative: str
 
+    # Output: the result as a plain dict.
     def to_dict(self) -> dict:
         return asdict(self)
 
 
+# Run Pipeline A once. Input: two disease names and an optional LLM client (defaults to LLMClient()). Output: a
+# PipelineAResult holding the raw narrative.
 def run_pipeline_a(disease1: str, disease2: str, client: Optional[object] = None) -> PipelineAResult:
-    # Input: two disease names, optional LLM client (defaults to real LLMClient(); pass StubLLMClient in tests).
-    # Output: PipelineAResult with the raw narrative.
     client = client or LLMClient()
     prompt = PROMPT_TEMPLATE.format(disease1=disease1, disease2=disease2)
     narrative = client.generate(prompt, temperature=0.3)
     return PipelineAResult(disease1=disease1, disease2=disease2, narrative=narrative)
 
 
+# Command-line entry point: pick a pair by id or by name, run Pipeline A and print the result as JSON.
 def _cli():
     parser = argparse.ArgumentParser(description="Run Pipeline A (Orphaned LLM) for one disease pair.")
     parser.add_argument("--pair", choices=[p["id"] for p in DISEASE_PAIRS], help="Disease pair id from common/config.py")
